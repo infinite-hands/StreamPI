@@ -11,6 +11,7 @@ from typing_extensions import override
 
 PI05_BASE_PARAMS = "gs://openpi-assets/checkpoints/pi05_base/params"
 BAGGING_REPO_ID = "local/yam_bagging_three"
+FIRSTTRY_REPO_ID = "local/yam_fullcorpus_teleop_firsttry_20260914"  # the studio's full-corpus train split, 1127 episodes
 BAGGING_PROMPT = "place one part in the bag"
 # T = 5 frames of temporal context, the setting behind every real-robot result in the paper.
 HIST_HORIZON = 5
@@ -93,4 +94,6 @@ def get_ih_yam_configs():
     return [
         stream_config("pi05_yam_stream5_bagging", BAGGING_REPO_ID, BAGGING_PROMPT, lora=True),
         stream_config("pi05_yam_stream5_bagging_full", BAGGING_REPO_ID, BAGGING_PROMPT, lora=False),
+        stream_config("pi05_yam_stream5_firsttry", FIRSTTRY_REPO_ID, BAGGING_PROMPT, lora=True),
+        stream_config("pi05_yam_stream5_firsttry_full", FIRSTTRY_REPO_ID, BAGGING_PROMPT, lora=False),
     ]
