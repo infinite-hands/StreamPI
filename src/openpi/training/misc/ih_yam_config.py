@@ -55,6 +55,10 @@ def get_ih_yam_configs():
             return dataclasses.replace(
                 super().create(assets_dirs, model_config),
                 model_transforms=ModelTransformFactory(default_prompt=self.default_prompt)(model_config),
+                # pi0.5's own default (the AgileX base config forces z-score). The YAM left gripper never
+                # moves in the corpus, so its std is ~1e-3 and z-scoring turns its noise into a loss of
+                # tens of thousands; the quantile band is floored by the stats writer instead.
+                use_quantile_norm=True,
             )
 
     def stream_config(name: str, repo_id: str, prompt: str, *, lora: bool):
