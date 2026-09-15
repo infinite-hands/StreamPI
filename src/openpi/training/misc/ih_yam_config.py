@@ -79,6 +79,9 @@ def get_ih_yam_configs():
                 ),
             ),
             weight_loader=weight_loaders.CheckpointWeightLoader(PI05_BASE_PARAMS),
+            # The fork's TrainConfig defaults to fsdp_devices=4 (its multi-node regime); these run
+            # on one H100, and make_mesh refuses a device count the FSDP count does not divide.
+            fsdp_devices=1,
             # T=5 multiplies the image tokens by five; these batch sizes are single-H100 starting
             # points, not measured ceilings.
             batch_size=16 if lora else 32,
