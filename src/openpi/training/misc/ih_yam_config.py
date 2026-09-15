@@ -90,7 +90,10 @@ def get_ih_yam_configs():
             fsdp_devices=1 if lora else 4,
             # T=5 multiplies the image tokens by five; LoRA's batch is a single-H100 starting point.
             batch_size=16 if lora else 32,
-            num_workers=8,
+            # One sample decodes three cameras x T=5 history frames, ~150 ms each: at eight workers the
+            # loader fed ~54 frames/s and the trainer waited on it (8.95 s/step, 5-17 s swings). The
+            # compute profile pins 32 CPUs; leave a few for the main process and JAX.
+            num_workers=24,
             num_train_steps=20_000,
             lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=20_000),
             save_interval=1_000,
