@@ -83,11 +83,12 @@ def get_ih_yam_configs():
                 ),
             ),
             weight_loader=weight_loaders.CheckpointWeightLoader(PI05_BASE_PARAMS),
-            # The fork's TrainConfig defaults to fsdp_devices=4 (its multi-node regime); these run
-            # on one H100, and make_mesh refuses a device count the FSDP count does not divide.
-            fsdp_devices=1,
-            # T=5 multiplies the image tokens by five; these batch sizes are single-H100 starting
-            # points, not measured ceilings.
+            # LoRA fits one H100 (make_mesh refuses a device count the FSDP count does not divide).
+            # The FULL fine-tune does not: at batch 32 with T=5 it ran out of memory on one 80 GB
+            # H100 (a 24 GB allocation on top of ~53 GB of fp32 params + grads + Adam state), so it
+            # shards over the fork's default four devices, the paper's regime.
+            fsdp_devices=1 if lora else 4,
+            # T=5 multiplies the image tokens by five; LoRA's batch is a single-H100 starting point.
             batch_size=16 if lora else 32,
             num_workers=8,
             num_train_steps=20_000,
