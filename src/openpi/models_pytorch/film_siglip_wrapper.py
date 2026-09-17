@@ -15,10 +15,12 @@ action expert.
 import torch
 import torch.nn as nn
 
-from openpi.models_pytorch.transformers_replace.models.siglip.modeling_siglip import (
-    SiglipEncoder,
-    SiglipEncoderLayer,
-)
+# NOT from openpi.models_pytorch.transformers_replace.models.siglip.modeling_siglip: that tree is a
+# patch staged to be `cp -r`'d over the installed transformers package (see PI0Pytorch.__init__'s own
+# check), and its relative imports (`from ...activations import ACT2FN`) only resolve once it is
+# physically sitting inside transformers/ -- importing it from its source location here breaks at
+# that relative import. transformers.models.siglip.modeling_siglip is the same file post-patch.
+from transformers.models.siglip.modeling_siglip import SiglipEncoder, SiglipEncoderLayer
 
 
 class FiLMedSiglipEncoderLayer(nn.Module):

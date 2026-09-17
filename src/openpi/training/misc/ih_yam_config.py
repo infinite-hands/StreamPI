@@ -102,9 +102,27 @@ def get_ih_yam_configs():
             ema_decay=None if lora else 0.99,
         )
 
+    def film_smoke_config(name: str, repo_id: str, prompt: str):
+        # Smoke test for FiLM SigLIP conditioning (film_siglip_wrapper.py): proves the wiring on the
+        # real full-corpus data (same repo_id as pi05_yam_stream5_firsttry) at a fraction of the
+        # steps/save cadence of a real run. LoRA + single H100, matching the cheapest config this
+        # model already fits on. Not a training recipe to serve from -- num_train_steps is far too
+        # low, and there is no held-out eval here, only a loss-moves / gradients-flow check.
+        base = stream_config(name, repo_id, prompt, lora=True)
+        smoke_model = dataclasses.replace(base.model, use_film_conditioning=True)
+        return dataclasses.replace(
+            base,
+            model=smoke_model,
+            num_train_steps=100,
+            save_interval=50,
+            keep_period=50,
+            freeze_filter=smoke_model.get_freeze_filter(),
+        )
+
     return [
         stream_config("pi05_yam_stream5_bagging", BAGGING_REPO_ID, BAGGING_PROMPT, lora=True),
         stream_config("pi05_yam_stream5_bagging_full", BAGGING_REPO_ID, BAGGING_PROMPT, lora=False),
         stream_config("pi05_yam_stream5_firsttry", FIRSTTRY_REPO_ID, BAGGING_PROMPT, lora=True),
         stream_config("pi05_yam_stream5_firsttry_full", FIRSTTRY_REPO_ID, BAGGING_PROMPT, lora=False),
+        film_smoke_config("pi05_yam_stream5_firsttry_film_smoke", FIRSTTRY_REPO_ID, BAGGING_PROMPT),
     ]
