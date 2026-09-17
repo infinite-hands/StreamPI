@@ -229,17 +229,20 @@ class PaliGemmaModel(PaliGemmaPreTrainedModel):
 
         return causal_mask
 
-    def get_image_features(self, pixel_values: torch.FloatTensor):
+    def get_image_features(self, pixel_values: torch.FloatTensor, average_language_embedding: Optional[torch.Tensor] = None):
         """
         Obtains image last hidden states from the vision tower and apply multimodal projection.
 
         Args:
             pixel_values (`torch.FloatTensor]` of shape `(batch_size, channels, height, width)`)
                The tensors corresponding to the input images.
+            average_language_embedding (`torch.Tensor`, *optional*): mean-pooled language embedding for
+               the current frame's instruction, used for FiLM conditioning when the vision tower's
+               encoder has been wrapped via `apply_film_to_siglip`. Ignored by an unwrapped encoder.
         Returns:
             image_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`).
         """
-        image_outputs = self.vision_tower(pixel_values)
+        image_outputs = self.vision_tower(pixel_values, average_language_embedding=average_language_embedding)
         selected_image_feature = image_outputs.last_hidden_state
         image_features = self.multi_modal_projector(selected_image_feature)
         return image_features

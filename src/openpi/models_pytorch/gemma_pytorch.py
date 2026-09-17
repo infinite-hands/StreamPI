@@ -82,8 +82,8 @@ class PaliGemmaWithExpertModel(nn.Module):
             if any(selector in name for selector in params_to_keep_float32):
                 param.data = param.data.to(dtype=torch.float32)
 
-    def embed_image(self, image: torch.Tensor):
-        return self.paligemma.model.get_image_features(image)
+    def embed_image(self, image: torch.Tensor, average_language_embedding: torch.Tensor | None = None):
+        return self.paligemma.model.get_image_features(image, average_language_embedding=average_language_embedding)
 
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.paligemma.language_model.embed_tokens(tokens)

@@ -8,6 +8,7 @@ import torch.nn.functional as F  # noqa: N812
 
 import openpi.models.gemma as _gemma
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
+from openpi.models_pytorch.film_siglip_wrapper import apply_film_to_siglip
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 
 
@@ -96,6 +97,12 @@ class PI0Pytorch(nn.Module):
             use_adarms=[False, True] if self.pi05 else [False, False],
             precision=config.dtype,
         )
+
+        if getattr(config, "use_film_conditioning", False):
+            apply_film_to_siglip(
+                self.paligemma_with_expert.paligemma.model.vision_tower.vision_model,
+                lang_dim=paligemma_config.width,
+            )
 
         self.action_in_proj = nn.Linear(32, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, 32)
@@ -193,11 +200,25 @@ class PI0Pytorch(nn.Module):
         pad_masks = []
         att_masks = []
 
+        # Process language tokens first so their mean-pooled embedding is available to
+        # condition image embedding via FiLM (see film_siglip_wrapper.py). This is a pure
+        # reorder relative to upstream pi0_pytorch.py -- the frame's instruction is already
+        # fully known before its images are embedded, so no new dependency is introduced.
+        def lang_embed_func(lang_tokens):
+            lang_emb = self.paligemma_with_expert.embed_language_tokens(lang_tokens)
+            lang_emb_dim = lang_emb.shape[-1]
+            return lang_emb * math.sqrt(lang_emb_dim)
+
+        lang_emb = self._apply_checkpoint(lang_embed_func, lang_tokens)
+
+        lang_mask_f = lang_masks[..., None].to(lang_emb.dtype)
+        average_language_embedding = (lang_emb * lang_mask_f).sum(dim=1) / lang_mask_f.sum(dim=1).clamp(min=1.0)
+
         # Process images
         for img, img_mask in zip(images, img_masks, strict=True):
 
             def image_embed_func(img):
-                return self.paligemma_with_expert.embed_image(img)
+                return self.paligemma_with_expert.embed_image(img, average_language_embedding=average_language_embedding)
 
             img_emb = self._apply_checkpoint(image_embed_func, img)
 
@@ -208,14 +229,6 @@ class PI0Pytorch(nn.Module):
 
             # Create attention masks so that image tokens attend to each other
             att_masks += [0] * num_img_embs
-
-        # Process language tokens
-        def lang_embed_func(lang_tokens):
-            lang_emb = self.paligemma_with_expert.embed_language_tokens(lang_tokens)
-            lang_emb_dim = lang_emb.shape[-1]
-            return lang_emb * math.sqrt(lang_emb_dim)
-
-        lang_emb = self._apply_checkpoint(lang_embed_func, lang_tokens)
 
         embs.append(lang_emb)
         pad_masks.append(lang_masks)

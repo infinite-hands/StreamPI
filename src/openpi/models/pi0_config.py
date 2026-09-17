@@ -31,6 +31,11 @@ class Pi0Config(_model.BaseModelConfig):
     # - the action expert uses adaRMSNorm to inject the flow matching timestep
     pi05: bool = False
     hist_horizon: int = 1
+    # FiLM-conditions the SigLIP vision tower on each frame's mean-pooled language embedding
+    # (ported from OpenVLA-OFT's film_vit_wrapper.py), on top of StreamPI's existing per-frame
+    # instruction re-anchoring. Orthogonal to hist_horizon: this only affects a single frame's
+    # own embed_prefix call, not cross-frame attention. PyTorch model path only.
+    use_film_conditioning: bool = False
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 

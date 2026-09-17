@@ -766,6 +766,7 @@ class SiglipVisionTransformer(nn.Module):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         interpolate_pos_encoding: Optional[bool] = False,
+        average_language_embedding: Optional[torch.Tensor] = None,
     ) -> BaseModelOutputWithPooling:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -777,10 +778,14 @@ class SiglipVisionTransformer(nn.Module):
         if len(self.encoder.layers) > 0 and self.encoder.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16:
             hidden_states = hidden_states.to(torch.bfloat16)
 
+        encoder_kwargs = {}
+        if average_language_embedding is not None:
+            encoder_kwargs["average_language_embedding"] = average_language_embedding.to(hidden_states.dtype)
         encoder_outputs: BaseModelOutput = self.encoder(
             inputs_embeds=hidden_states,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
+            **encoder_kwargs,
         )
 
         last_hidden_state = encoder_outputs.last_hidden_state
@@ -848,6 +853,7 @@ class SiglipVisionModel(SiglipPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         interpolate_pos_encoding: bool = False,
+        average_language_embedding: Optional[torch.Tensor] = None,
     ) -> BaseModelOutputWithPooling:
         r"""
         Examples:
@@ -875,6 +881,7 @@ class SiglipVisionModel(SiglipPreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             interpolate_pos_encoding=interpolate_pos_encoding,
+            average_language_embedding=average_language_embedding,
         )
 
 
