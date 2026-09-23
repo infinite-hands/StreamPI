@@ -16,9 +16,20 @@ BAGGING_PROMPT = "place one part in the bag"
 # T = 5 frames of temporal context, the setting behind every real-robot result in the paper.
 HIST_HORIZON = 5
 # Control frames between two policy calls at the YAM cell's 30 Hz. The deploy loop MUST call the
-# policy every HIST_INTERVAL frames (its chunk_play), or the served KV-cache history is spaced
-# differently from the history the model was trained on.
+# policy every hist_interval frames (its chunk_play), or the served KV-cache history is spaced
+# differently from the history the model was trained on. This is therefore a per-config fact, not a
+# global one: a checkpoint carries the cadence it was trained at, and the config name is what says
+# which. The two coexist so they can be compared without rebuilding the image.
 HIST_INTERVAL = 10
+# The cadence is also the inference budget: the loop only ever executes rows 0..hist_interval-1 of
+# each chunk, so at 30 Hz a value of 10 is a 333 ms budget against a measured 300-600 ms StreamPI
+# round trip -- the cell executes only the tail of many chunks. 20 frames is 667 ms. ACTION_HORIZON
+# is the ceiling (the loop cannot execute rows the model did not predict); 20 leaves 10 rows of
+# margin for RTC. In exchange the history reaches (HIST_HORIZON - 1) * 20 = 80 frames back rather
+# than 40, so the same five frames span 2.67 s instead of 1.33 s and the policy sees a fresh
+# observation half as often. Model shape is untouched -- HIST_HORIZON and ACTION_HORIZON set the
+# token count and KV-cache size -- so fsdp_devices and batch_size below are unchanged.
+HIST_INTERVAL_WIDE = 20
 ACTION_HORIZON = 30
 # The YAM LeRobot layout: three cameras, 14-dim state/action [L j0..5, L grip, R j0..5, R grip].
 YAM_REPACK = _transforms.Group(
@@ -61,7 +72,8 @@ def get_ih_yam_configs():
                 use_quantile_norm=True,
             )
 
-    def stream_config(name: str, repo_id: str, prompt: str, *, lora: bool):
+    def stream_config(name: str, repo_id: str, prompt: str, *, lora: bool,
+                      hist_interval: int = HIST_INTERVAL):
         model = pi0_config.Pi0Config(
             pi05=True,
             action_horizon=ACTION_HORIZON,
@@ -78,7 +90,7 @@ def get_ih_yam_configs():
                 base_config=DataConfig(
                     prompt_from_task=False,
                     hist_horizon=HIST_HORIZON,
-                    hist_interval=HIST_INTERVAL,
+                    hist_interval=hist_interval,
                     enable_jitter=True,
                 ),
             ),
@@ -107,4 +119,13 @@ def get_ih_yam_configs():
         stream_config("pi05_yam_stream5_bagging_full", BAGGING_REPO_ID, BAGGING_PROMPT, lora=False),
         stream_config("pi05_yam_stream5_firsttry", FIRSTTRY_REPO_ID, BAGGING_PROMPT, lora=True),
         stream_config("pi05_yam_stream5_firsttry_full", FIRSTTRY_REPO_ID, BAGGING_PROMPT, lora=False),
+        # The same four at the wider cadence; `_i20` is the only thing that differs.
+        stream_config("pi05_yam_stream5_i20_bagging", BAGGING_REPO_ID, BAGGING_PROMPT, lora=True,
+                      hist_interval=HIST_INTERVAL_WIDE),
+        stream_config("pi05_yam_stream5_i20_bagging_full", BAGGING_REPO_ID, BAGGING_PROMPT, lora=False,
+                      hist_interval=HIST_INTERVAL_WIDE),
+        stream_config("pi05_yam_stream5_i20_firsttry", FIRSTTRY_REPO_ID, BAGGING_PROMPT, lora=True,
+                      hist_interval=HIST_INTERVAL_WIDE),
+        stream_config("pi05_yam_stream5_i20_firsttry_full", FIRSTTRY_REPO_ID, BAGGING_PROMPT, lora=False,
+                      hist_interval=HIST_INTERVAL_WIDE),
     ]
