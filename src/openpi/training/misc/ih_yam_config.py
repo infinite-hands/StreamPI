@@ -12,7 +12,28 @@ from typing_extensions import override
 PI05_BASE_PARAMS = "gs://openpi-assets/checkpoints/pi05_base/params"
 BAGGING_REPO_ID = "local/yam_bagging_three"
 FIRSTTRY_REPO_ID = "local/yam_fullcorpus_teleop_firsttry_20260914"  # the studio's full-corpus train split, 1127 episodes
+# 483 REAL (not mirrored) native left-arm teleop episodes, --leaders left: the right arm's real
+# gravity-comp trajectory is recorded, not a mirrored/synthetic one.
+BAGGING_LEFT_REAL_REPO_ID = "local/yam_bagging_left_real_20260924"
 BAGGING_PROMPT = "place one part in the bag"
+# Driven/held/pad weights for a single-arm dataset on this 14-of-32-dim bimanual embodiment (see
+# Pi0Config.action_dim_weights). Duplicated from infinite-hands/VLA-Precision's identical constants
+# rather than imported -- these are two independently-evolving forks with no dependency between them.
+DRIVEN_ARM_WEIGHT = 1.0
+HELD_ARM_WEIGHT = 0.07  # not 0: holding position is a real instruction, not nothing
+PAD_WEIGHT = 0.0
+LEFT_ARM_DIMS = tuple(range(7))    # [L j0..5, L grip]
+RIGHT_ARM_DIMS = tuple(range(7, 14))  # [R j0..5, R grip]
+
+
+def single_arm_weights(driven: str, action_dim: int) -> tuple[float, ...]:
+    """Per-dimension action loss weights for a corpus in which only `driven` moves."""
+    if driven not in ("left", "right"):
+        raise ValueError(f"driven arm must be 'left' or 'right', got {driven!r}")
+    left = DRIVEN_ARM_WEIGHT if driven == "left" else HELD_ARM_WEIGHT
+    right = HELD_ARM_WEIGHT if driven == "left" else DRIVEN_ARM_WEIGHT
+    weights = [left] * 7 + [right] * 7
+    return tuple(weights + [PAD_WEIGHT] * (action_dim - len(weights)))
 # T = 5 frames of temporal context, the setting behind every real-robot result in the paper.
 HIST_HORIZON = 5
 # Control frames between two policy calls at the YAM cell's 30 Hz. The deploy loop MUST call the
@@ -73,13 +94,17 @@ def get_ih_yam_configs():
             )
 
     def stream_config(name: str, repo_id: str, prompt: str, *, lora: bool,
-                      hist_interval: int = HIST_INTERVAL):
+                      hist_interval: int = HIST_INTERVAL,
+                      active_image_keys: frozenset[str] | None = None,
+                      active_state_dims: tuple[int, ...] | None = None,
+                      action_dim_weights: tuple[float, ...] | None = None):
         model = pi0_config.Pi0Config(
             pi05=True,
             action_horizon=ACTION_HORIZON,
             hist_horizon=HIST_HORIZON,
             paligemma_variant="gemma_2b_lora" if lora else "gemma_2b",
             action_expert_variant="gemma_300m_lora" if lora else "gemma_300m",
+            action_dim_weights=action_dim_weights,
         )
         return TrainConfig(
             name=name,
@@ -87,6 +112,8 @@ def get_ih_yam_configs():
             data=LeRobotYamStreamDataConfig(
                 repo_id=repo_id,
                 default_prompt=prompt,
+                active_image_keys=active_image_keys,
+                active_state_dims=active_state_dims,
                 base_config=DataConfig(
                     prompt_from_task=False,
                     hist_horizon=HIST_HORIZON,
@@ -128,4 +155,11 @@ def get_ih_yam_configs():
                       hist_interval=HIST_INTERVAL_WIDE),
         stream_config("pi05_yam_stream5_i20_firsttry_full", FIRSTTRY_REPO_ID, BAGGING_PROMPT, lora=False,
                       hist_interval=HIST_INTERVAL_WIDE),
+        # Real (not mirrored) native left-arm teleop, wrist-camera-only, right arm's action loss
+        # down-weighted AND its state zeroed (both train and serve time, via active_state_dims).
+        stream_config("pi05_yam_stream5_i20_bagging_left_real", BAGGING_LEFT_REAL_REPO_ID, BAGGING_PROMPT,
+                      lora=True, hist_interval=HIST_INTERVAL_WIDE,
+                      active_image_keys=frozenset({"left_wrist_0_rgb"}),
+                      active_state_dims=LEFT_ARM_DIMS,
+                      action_dim_weights=single_arm_weights("left", 32)),
     ]

@@ -547,6 +547,10 @@ class LeRobotAgilexDataConfig(DataConfigFactory):
     # If provided, will be injected into the input data if the "prompt" key is not present.
     default_prompt: str | None = None
     use_ee6d: bool = False
+    # None (default): every image real, every state dim real -- exact no-op, byte-identical to
+    # every existing config. Else: forwarded straight to AgilexInputs, see its own docstrings.
+    active_image_keys: frozenset[str] | None = None
+    active_state_dims: tuple[int, ...] | None = None
 
     # Repack transforms.
     repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
@@ -574,7 +578,11 @@ class LeRobotAgilexDataConfig(DataConfigFactory):
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         data_transforms = _transforms.Group(
-            inputs=[agilex_policy.AgilexInputs(use_ee6d=self.use_ee6d)],
+            inputs=[agilex_policy.AgilexInputs(
+                use_ee6d=self.use_ee6d,
+                active_image_keys=self.active_image_keys,
+                active_state_dims=self.active_state_dims,
+            )],
             outputs=[agilex_policy.AgilexOutputs(use_ee6d=self.use_ee6d)],
         )
         if self.use_delta_joint_actions:

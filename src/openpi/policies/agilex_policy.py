@@ -230,6 +230,18 @@ class AgilexInputs(transforms.DataTransformFn):
 
     use_ee6d: bool = False
 
+    # None (default): every image real, exact no-op for every existing config. Else: openpi image
+    # keys to keep real; every other key is masked AND zeroed, mirroring VLA-Precision's
+    # DualURInputs.active_image_keys -- applied here, not client-side, so a single-arm recipe's
+    # served checkpoint always sees what it was trained on regardless of what the caller sends.
+    active_image_keys: frozenset[str] | None = None
+    # None (default): state passed through unmodified, exact no-op for every existing config. Else:
+    # state dim indices to keep real (in whatever representation actually reaches `inputs["state"]`
+    # -- raw 14-dim joint state when use_ee6d=False, the joint indices this recipe uses); every
+    # other dim is zeroed. For a real single-arm corpus, this discards the non-driven arm's state at
+    # both train and serve time, the same way active_image_keys discards unwanted cameras.
+    active_state_dims: tuple[int, ...] | None = None
+
     def __call__(self, data: dict) -> dict:
         data = _decode_agilex(data)
 
@@ -260,6 +272,12 @@ class AgilexInputs(transforms.DataTransformFn):
                 images[dest] = np.zeros_like(base_image)
                 image_masks[dest] = np.False_
 
+        if self.active_image_keys is not None:
+            for key in images:
+                if key not in self.active_image_keys:
+                    images[key] = np.zeros_like(images[key])
+                    image_masks[key] = np.False_
+
         state = np.asarray(data["state"])
         if self.use_ee6d:
             if len(state.shape) == 1:
@@ -271,6 +289,11 @@ class AgilexInputs(transforms.DataTransformFn):
                 state = ee6d_state
             else:
                 raise ValueError(f"Expected state to have shape (14,) or (N, 14), got {state.shape}")
+
+        if self.active_state_dims is not None:
+            keep = np.zeros(state.shape[-1], dtype=bool)
+            keep[list(self.active_state_dims)] = True
+            state = np.where(keep, state, 0.0)
 
         inputs = {
             "image": images,
