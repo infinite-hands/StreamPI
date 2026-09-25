@@ -20,7 +20,11 @@ BAGGING_PROMPT = "place one part in the bag"
 # Pi0Config.action_dim_weights). Duplicated from infinite-hands/VLA-Precision's identical constants
 # rather than imported -- these are two independently-evolving forks with no dependency between them.
 DRIVEN_ARM_WEIGHT = 1.0
-HELD_ARM_WEIGHT = 0.07  # not 0: holding position is a real instruction, not nothing
+# 0, not VLA-Precision's 0.07: that held arm was pinned to a constant, this one is a real arm in
+# gravity comp. Its delta band is +/-0.0004 rad, so the ~0.1% of windows where it drifted normalize
+# to 400-2,200 and carried 95% of the weighted target energy at 0.07 (measured over all 483 episodes
+# of yam_bagging_left_real_20260924). Served, that same band keeps its untrained output a hold.
+HELD_ARM_WEIGHT = 0.0
 PAD_WEIGHT = 0.0
 LEFT_ARM_DIMS = tuple(range(7))    # [L j0..5, L grip]
 RIGHT_ARM_DIMS = tuple(range(7, 14))  # [R j0..5, R grip]
@@ -157,8 +161,8 @@ def get_ih_yam_configs():
                       hist_interval=HIST_INTERVAL_WIDE),
         stream_config("pi05_yam_stream5_i20_firsttry_full", FIRSTTRY_REPO_ID, BAGGING_PROMPT, lora=False,
                       hist_interval=HIST_INTERVAL_WIDE),
-        # Real (not mirrored) native left-arm teleop, wrist-camera-only, right arm's action loss
-        # down-weighted AND its state hidden from the model (the tokenized state only, at train and
+        # Real (not mirrored) native left-arm teleop, wrist-camera-only, the held right arm out of the
+        # loss (weight 0) AND its state hidden from the model (the tokenized state only, at train and
         # serve time, via active_state_dims -- delta targets still use the real state).
         stream_config("pi05_yam_stream5_i20_bagging_left_real", BAGGING_LEFT_REAL_REPO_ID, BAGGING_PROMPT,
                       lora=True, hist_interval=HIST_INTERVAL_WIDE,
