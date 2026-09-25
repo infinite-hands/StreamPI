@@ -16,28 +16,8 @@ FIRSTTRY_REPO_ID = "local/yam_fullcorpus_teleop_firsttry_20260914"  # the studio
 # gravity-comp trajectory is recorded, not a mirrored/synthetic one.
 BAGGING_LEFT_REAL_REPO_ID = "local/yam_bagging_left_real_20260924"
 BAGGING_PROMPT = "place one part in the bag"
-# Driven/held/pad weights for a single-arm dataset on this 14-of-32-dim bimanual embodiment (see
-# Pi0Config.action_dim_weights). Duplicated from infinite-hands/VLA-Precision's identical constants
-# rather than imported -- these are two independently-evolving forks with no dependency between them.
-DRIVEN_ARM_WEIGHT = 1.0
-# 0, not VLA-Precision's 0.07: that held arm was pinned to a constant, this one is a real arm in
-# gravity comp. Its delta band is +/-0.0004 rad, so the ~0.1% of windows where it drifted normalize
-# to 400-2,200 and carried 95% of the weighted target energy at 0.07 (measured over all 483 episodes
-# of yam_bagging_left_real_20260924). Served, that same band keeps its untrained output a hold.
-HELD_ARM_WEIGHT = 0.0
-PAD_WEIGHT = 0.0
 LEFT_ARM_DIMS = tuple(range(7))    # [L j0..5, L grip]
 RIGHT_ARM_DIMS = tuple(range(7, 14))  # [R j0..5, R grip]
-
-
-def single_arm_weights(driven: str, action_dim: int) -> tuple[float, ...]:
-    """Per-dimension action loss weights for a corpus in which only `driven` moves."""
-    if driven not in ("left", "right"):
-        raise ValueError(f"driven arm must be 'left' or 'right', got {driven!r}")
-    left = DRIVEN_ARM_WEIGHT if driven == "left" else HELD_ARM_WEIGHT
-    right = HELD_ARM_WEIGHT if driven == "left" else DRIVEN_ARM_WEIGHT
-    weights = [left] * 7 + [right] * 7
-    return tuple(weights + [PAD_WEIGHT] * (action_dim - len(weights)))
 # T = 5 frames of temporal context, the setting behind every real-robot result in the paper.
 HIST_HORIZON = 5
 # Control frames between two policy calls at the YAM cell's 30 Hz. The deploy loop MUST call the
@@ -76,7 +56,7 @@ YAM_REPACK = _transforms.Group(
 
 def get_ih_yam_configs():
     # Deferred: config.py imports this module while building its registry.
-    from openpi.training.config import DataConfig, LeRobotAgilexDataConfig, ModelTransformFactory, TrainConfig
+    from openpi.training.config import DataConfig, LeRobotAgilexDataConfig, TrainConfig
 
     @dataclasses.dataclass(frozen=True)
     class LeRobotYamStreamDataConfig(LeRobotAgilexDataConfig):
@@ -90,9 +70,6 @@ def get_ih_yam_configs():
         def create(self, assets_dirs, model_config):
             return dataclasses.replace(
                 super().create(assets_dirs, model_config),
-                model_transforms=ModelTransformFactory(
-                    default_prompt=self.default_prompt, active_state_dims=self.active_state_dims,
-                )(model_config),
                 # pi0.5's own default (the AgileX base config forces z-score). The YAM left gripper never
                 # moves in the corpus, so its std is ~1e-3 and z-scoring turns its noise into a loss of
                 # tens of thousands; the quantile band is floored by the stats writer instead.
@@ -103,14 +80,13 @@ def get_ih_yam_configs():
                       hist_interval: int = HIST_INTERVAL,
                       active_image_keys: frozenset[str] | None = None,
                       active_state_dims: tuple[int, ...] | None = None,
-                      action_dim_weights: tuple[float, ...] | None = None):
+                      held_action_dims: tuple[int, ...] | None = None):
         model = pi0_config.Pi0Config(
             pi05=True,
             action_horizon=ACTION_HORIZON,
             hist_horizon=HIST_HORIZON,
             paligemma_variant="gemma_2b_lora" if lora else "gemma_2b",
             action_expert_variant="gemma_300m_lora" if lora else "gemma_300m",
-            action_dim_weights=action_dim_weights,
         )
         return TrainConfig(
             name=name,
@@ -120,6 +96,7 @@ def get_ih_yam_configs():
                 default_prompt=prompt,
                 active_image_keys=active_image_keys,
                 active_state_dims=active_state_dims,
+                held_action_dims=held_action_dims,
                 base_config=DataConfig(
                     prompt_from_task=False,
                     hist_horizon=HIST_HORIZON,
@@ -161,12 +138,12 @@ def get_ih_yam_configs():
                       hist_interval=HIST_INTERVAL_WIDE),
         stream_config("pi05_yam_stream5_i20_firsttry_full", FIRSTTRY_REPO_ID, BAGGING_PROMPT, lora=False,
                       hist_interval=HIST_INTERVAL_WIDE),
-        # Real (not mirrored) native left-arm teleop, wrist-camera-only, the held right arm out of the
-        # loss (weight 0) AND its state hidden from the model (the tokenized state only, at train and
-        # serve time, via active_state_dims -- delta targets still use the real state).
+        # Real (not mirrored) native left-arm teleop: wrist camera only, the right arm's state hidden
+        # from the model, and the right arm trained to hold still -- it was held in gravity comp, so
+        # its recorded drift is not behaviour to imitate.
         stream_config("pi05_yam_stream5_i20_bagging_left_real", BAGGING_LEFT_REAL_REPO_ID, BAGGING_PROMPT,
                       lora=True, hist_interval=HIST_INTERVAL_WIDE,
                       active_image_keys=frozenset({"left_wrist_0_rgb"}),
                       active_state_dims=LEFT_ARM_DIMS,
-                      action_dim_weights=single_arm_weights("left", 32)),
+                      held_action_dims=RIGHT_ARM_DIMS),
     ]

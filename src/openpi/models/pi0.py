@@ -69,8 +69,6 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
-        # None for every config that does not ask for it; compute_loss then takes a plain mean.
-        self.action_dim_weights = config.action_dim_weights
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -278,13 +276,7 @@ class Pi0(_model.BaseModel):
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        squared = jnp.square(v_t - u_t)
-        if self.action_dim_weights is None:
-            return jnp.mean(squared, axis=-1)
-        # Weighted mean, normalized by the weights' own sum so the loss keeps the same scale as the
-        # unweighted form and the learning rate does not have to be retuned alongside the weights.
-        weights = jnp.asarray(self.action_dim_weights, dtype=squared.dtype)
-        return jnp.sum(squared * weights, axis=-1) / jnp.sum(weights)
+        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
     
     @at.typecheck
     def embed_prefix_infer(

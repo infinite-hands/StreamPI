@@ -296,6 +296,30 @@ class AbsoluteActions(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class HoldActions(DataTransformFn):
+    """Replaces the target of `dims` with holding still: 0 where `delta_mask` marks a delta dim, the
+    current state where the dim is absolute. Runs after DeltaActions. A no-op when `dims` is None."""
+
+    dims: Sequence[int] | None
+    delta_mask: Sequence[bool] | None
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "actions" not in data or self.dims is None:
+            return data
+
+        state, actions = np.asarray(data["state"]), np.array(data["actions"], copy=True)
+        delta = np.zeros(actions.shape[-1], dtype=bool)
+        if self.delta_mask is not None:
+            mask = np.asarray(self.delta_mask)
+            delta[: mask.shape[-1]] = mask
+        for dim in self.dims:
+            actions[..., dim] = 0.0 if delta[dim] else state[..., dim]
+        data["actions"] = actions
+
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
 class TokenizePrompt(DataTransformFn):
     tokenizer: _tokenizer.PaligemmaTokenizer
     discrete_state_input: bool = False

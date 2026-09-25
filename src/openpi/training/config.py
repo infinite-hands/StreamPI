@@ -555,11 +555,13 @@ class LeRobotAgilexDataConfig(DataConfigFactory):
     # If provided, will be injected into the input data if the "prompt" key is not present.
     default_prompt: str | None = None
     use_ee6d: bool = False
-    # None (default): every image real, every state dim real -- exact no-op, byte-identical to
-    # every existing config. active_image_keys goes to AgilexInputs; active_state_dims goes to the
-    # model transforms (TokenizePrompt), AFTER DeltaActions, so delta targets use the real state.
+    # None (default) for all three: exact no-op for every existing config. For a single-arm recipe:
+    # active_image_keys masks cameras (AgilexInputs); active_state_dims hides state from the model
+    # (TokenizePrompt, so DeltaActions and AbsoluteActions keep the real state); held_action_dims
+    # trains those dims to hold still (HoldActions, after DeltaActions).
     active_image_keys: frozenset[str] | None = None
     active_state_dims: tuple[int, ...] | None = None
+    held_action_dims: tuple[int, ...] | None = None
 
     # Repack transforms.
     repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
@@ -593,14 +595,20 @@ class LeRobotAgilexDataConfig(DataConfigFactory):
             )],
             outputs=[agilex_policy.AgilexOutputs(use_ee6d=self.use_ee6d)],
         )
-        if self.use_delta_joint_actions:
-            delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+        delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1) if self.use_delta_joint_actions else None
+        if delta_action_mask is not None:
             data_transforms = data_transforms.push(
                 inputs=[_transforms.DeltaActions(delta_action_mask)],
                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],
             )
+        if self.held_action_dims is not None:
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.HoldActions(self.held_action_dims, delta_action_mask)],
+            )
 
-        model_transforms = ModelTransformFactory(active_state_dims=self.active_state_dims)(model_config)
+        model_transforms = ModelTransformFactory(
+            default_prompt=self.default_prompt, active_state_dims=self.active_state_dims,
+        )(model_config)
 
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),

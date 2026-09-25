@@ -230,15 +230,13 @@ class AgilexInputs(transforms.DataTransformFn):
 
     use_ee6d: bool = False
 
-    # None (default): every image real, exact no-op for every existing config. Else: openpi image
-    # keys to keep real; every other key is masked AND zeroed, mirroring VLA-Precision's
-    # DualURInputs.active_image_keys -- applied here, not client-side, so a single-arm recipe's
-    # served checkpoint always sees what it was trained on regardless of what the caller sends.
+    # None (default): every image real. Else: the openpi image keys to keep real; every other key is
+    # masked and zeroed here, server-side, so a served checkpoint sees what it trained on whatever the
+    # caller sends.
     active_image_keys: frozenset[str] | None = None
-    # State masking deliberately does NOT live here: this transform runs before DeltaActions, and
-    # zeroing state here turned the held arm's delta target into its absolute joint angle (~1 rad
-    # against a +/-0.0004 rad normalization band -> step-0 loss ~150k). It is applied to the
-    # tokenized copy instead -- see TokenizePrompt.active_state_dims.
+    # State masking does not belong here: this transform runs before DeltaActions, so masking state
+    # here would change the delta targets too. It is applied to the tokenized copy instead -- see
+    # TokenizePrompt.active_state_dims.
 
     def __call__(self, data: dict) -> dict:
         data = _decode_agilex(data)
