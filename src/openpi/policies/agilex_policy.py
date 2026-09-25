@@ -235,12 +235,10 @@ class AgilexInputs(transforms.DataTransformFn):
     # DualURInputs.active_image_keys -- applied here, not client-side, so a single-arm recipe's
     # served checkpoint always sees what it was trained on regardless of what the caller sends.
     active_image_keys: frozenset[str] | None = None
-    # None (default): state passed through unmodified, exact no-op for every existing config. Else:
-    # state dim indices to keep real (in whatever representation actually reaches `inputs["state"]`
-    # -- raw 14-dim joint state when use_ee6d=False, the joint indices this recipe uses); every
-    # other dim is zeroed. For a real single-arm corpus, this discards the non-driven arm's state at
-    # both train and serve time, the same way active_image_keys discards unwanted cameras.
-    active_state_dims: tuple[int, ...] | None = None
+    # State masking deliberately does NOT live here: this transform runs before DeltaActions, and
+    # zeroing state here turned the held arm's delta target into its absolute joint angle (~1 rad
+    # against a +/-0.0004 rad normalization band -> step-0 loss ~150k). It is applied to the
+    # tokenized copy instead -- see TokenizePrompt.active_state_dims.
 
     def __call__(self, data: dict) -> dict:
         data = _decode_agilex(data)
@@ -289,11 +287,6 @@ class AgilexInputs(transforms.DataTransformFn):
                 state = ee6d_state
             else:
                 raise ValueError(f"Expected state to have shape (14,) or (N, 14), got {state.shape}")
-
-        if self.active_state_dims is not None:
-            keep = np.zeros(state.shape[-1], dtype=bool)
-            keep[list(self.active_state_dims)] = True
-            state = np.where(keep, state, 0.0)
 
         inputs = {
             "image": images,

@@ -38,8 +38,8 @@ class Pi0Config(_model.BaseModelConfig):
     # compute_loss takes a plain mean, as it always has, so every existing config is untouched.
     #
     # For a SINGLE-ARM dataset on a bimanual embodiment: the arm the model does not drive is pinned
-    # to a constant pose (or, for a real single-arm corpus, its state is separately zeroed via
-    # active_state_dims), so its dimensions are trivially predictable, yet a flat mean still spends
+    # to a constant pose (or, for a real single-arm corpus, held in place, its state hidden from the
+    # model via active_state_dims), so its dimensions are trivially predictable, yet a flat mean still spends
     # half the action loss on them. Measured on random targets (openpi upstream, the same rev this
     # was ported from), weighting moves the driven arm's share of the loss from 22.8% to 95.5%.
     #

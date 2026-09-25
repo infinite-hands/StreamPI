@@ -118,8 +118,14 @@ class ModelTransformFactory(GroupFactory):
 
     # If provided, will determine the default prompt that be used by the model.
     default_prompt: str | None = None
+    # None (default): exact no-op. Else: see TokenizePrompt.active_state_dims (pi0.5 only).
+    active_state_dims: tuple[int, ...] | None = None
 
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
+        if self.active_state_dims is not None and model_config.model_type not in (
+            _model.ModelType.PI05, _model.ModelType.PI05Rtc
+        ):
+            raise ValueError(f"active_state_dims is only wired for pi0.5, not {model_config.model_type}")
         match model_config.model_type:
             case _model.ModelType.PI0:
                 return _transforms.Group(
@@ -141,6 +147,7 @@ class ModelTransformFactory(GroupFactory):
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                             discrete_state_input=model_config.discrete_state_input,
+                            active_state_dims=self.active_state_dims,
                         ),
                         _transforms.PadStatesAndActions(model_config.action_dim),
                     ],
@@ -154,6 +161,7 @@ class ModelTransformFactory(GroupFactory):
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                             discrete_state_input=model_config.discrete_state_input,
+                            active_state_dims=self.active_state_dims,
                         ),
                         _transforms.PadStatesAndActions(model_config.action_dim),
                     ],
@@ -548,7 +556,8 @@ class LeRobotAgilexDataConfig(DataConfigFactory):
     default_prompt: str | None = None
     use_ee6d: bool = False
     # None (default): every image real, every state dim real -- exact no-op, byte-identical to
-    # every existing config. Else: forwarded straight to AgilexInputs, see its own docstrings.
+    # every existing config. active_image_keys goes to AgilexInputs; active_state_dims goes to the
+    # model transforms (TokenizePrompt), AFTER DeltaActions, so delta targets use the real state.
     active_image_keys: frozenset[str] | None = None
     active_state_dims: tuple[int, ...] | None = None
 
@@ -581,7 +590,6 @@ class LeRobotAgilexDataConfig(DataConfigFactory):
             inputs=[agilex_policy.AgilexInputs(
                 use_ee6d=self.use_ee6d,
                 active_image_keys=self.active_image_keys,
-                active_state_dims=self.active_state_dims,
             )],
             outputs=[agilex_policy.AgilexOutputs(use_ee6d=self.use_ee6d)],
         )
@@ -592,7 +600,7 @@ class LeRobotAgilexDataConfig(DataConfigFactory):
                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],
             )
 
-        model_transforms = ModelTransformFactory()(model_config)
+        model_transforms = ModelTransformFactory(active_state_dims=self.active_state_dims)(model_config)
 
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),

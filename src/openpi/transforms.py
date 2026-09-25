@@ -299,6 +299,15 @@ class AbsoluteActions(DataTransformFn):
 class TokenizePrompt(DataTransformFn):
     tokenizer: _tokenizer.PaligemmaTokenizer
     discrete_state_input: bool = False
+    # None (default): exact no-op. Else: state dims the model may see; every other dim is set to the
+    # normalized midpoint (0) in the TOKENIZED copy only. data["state"] is left real on purpose:
+    # DeltaActions (train) and AbsoluteActions (serve) both need the true state, and pi0.5 reads
+    # state nowhere but these tokens, so this is the one place a mask hides it from the model.
+    active_state_dims: tuple[int, ...] | None = None
+
+    def __post_init__(self):
+        if self.active_state_dims is not None and not self.discrete_state_input:
+            raise ValueError("active_state_dims masks the discrete state tokens; it needs discrete_state_input")
 
     def __call__(self, data: DataDict) -> DataDict:
         if (prompt := data.pop("prompt", None)) is None:
@@ -307,6 +316,11 @@ class TokenizePrompt(DataTransformFn):
         if self.discrete_state_input:
             if (state := data.get("state", None)) is None:
                 raise ValueError("State is required.")
+            if self.active_state_dims is not None:
+                state = np.asarray(state)
+                keep = np.zeros(state.shape[-1], dtype=bool)
+                keep[list(self.active_state_dims)] = True
+                state = np.where(keep, state, 0.0)
         else:
             state = None
 

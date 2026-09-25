@@ -86,7 +86,9 @@ def get_ih_yam_configs():
         def create(self, assets_dirs, model_config):
             return dataclasses.replace(
                 super().create(assets_dirs, model_config),
-                model_transforms=ModelTransformFactory(default_prompt=self.default_prompt)(model_config),
+                model_transforms=ModelTransformFactory(
+                    default_prompt=self.default_prompt, active_state_dims=self.active_state_dims,
+                )(model_config),
                 # pi0.5's own default (the AgileX base config forces z-score). The YAM left gripper never
                 # moves in the corpus, so its std is ~1e-3 and z-scoring turns its noise into a loss of
                 # tens of thousands; the quantile band is floored by the stats writer instead.
@@ -156,7 +158,8 @@ def get_ih_yam_configs():
         stream_config("pi05_yam_stream5_i20_firsttry_full", FIRSTTRY_REPO_ID, BAGGING_PROMPT, lora=False,
                       hist_interval=HIST_INTERVAL_WIDE),
         # Real (not mirrored) native left-arm teleop, wrist-camera-only, right arm's action loss
-        # down-weighted AND its state zeroed (both train and serve time, via active_state_dims).
+        # down-weighted AND its state hidden from the model (the tokenized state only, at train and
+        # serve time, via active_state_dims -- delta targets still use the real state).
         stream_config("pi05_yam_stream5_i20_bagging_left_real", BAGGING_LEFT_REAL_REPO_ID, BAGGING_PROMPT,
                       lora=True, hist_interval=HIST_INTERVAL_WIDE,
                       active_image_keys=frozenset({"left_wrist_0_rgb"}),
