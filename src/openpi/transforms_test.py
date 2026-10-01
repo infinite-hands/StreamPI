@@ -188,3 +188,13 @@ def test_extract_prompt_from_task():
 
     with pytest.raises(ValueError, match="task_index=2 not found in task mapping"):
         transform({"task_index": 2})
+
+
+def test_agilex_inputs_without_the_base_camera():
+    from openpi.policies import agilex_policy
+
+    wrist = np.random.randint(256, size=(3, 8, 8), dtype=np.uint8)
+    out = agilex_policy.AgilexInputs()({"state": np.ones(14), "images": {"cam_left_wrist": wrist}, "prompt": "p"})
+    assert set(out["image"]) == set(agilex_policy.AgilexInputs.IMAGE_KEY_BY_CAMERA.values())
+    assert out["image_mask"]["left_wrist_0_rgb"] and not out["image_mask"]["base_0_rgb"] and not out["image_mask"]["right_wrist_0_rgb"]
+    assert out["image"]["base_0_rgb"].shape == out["image"]["left_wrist_0_rgb"].shape and not out["image"]["base_0_rgb"].any()

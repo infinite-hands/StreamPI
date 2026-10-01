@@ -106,6 +106,9 @@ class DataConfig:
     # The paper's shared-observation training: this many offsets per sample behind one observation
     # (0: one offset per sample). Must match the model's Pi0Config.vlash_branches.
     vlash_branches: int = 0
+    # Decode only the video columns in hist_sequence_keys. A recipe that masks a camera still pays
+    # its decode otherwise: LeRobot decodes every video column for every sample.
+    decode_only_hist_cameras: bool = False
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False

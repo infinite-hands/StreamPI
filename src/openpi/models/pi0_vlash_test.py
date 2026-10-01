@@ -21,18 +21,40 @@ def _config(**overrides) -> _pi0_config.Pi0Config:
         action_horizon=HORIZON, hist_horizon=1, max_token_len=TOKENS, **overrides)
 
 
-def _observation(batch: int, branches: int = 0) -> _model.Observation:
-    image = jnp.zeros((batch, 1, *_model.IMAGE_RESOLUTION, 3), dtype=jnp.float32)
+def _observation(batch: int, branches: int = 0, image_keys=_model.IMAGE_KEYS, masked=()) -> _model.Observation:
     state_shape = (batch, branches, ACTION_DIM) if branches else (batch, ACTION_DIM)
     with jax.ensure_compile_time_eval():
         state = jnp.asarray(np.random.default_rng(0).normal(size=state_shape), dtype=jnp.float32)
+        # Seeded per camera, so the same camera carries the same image whichever cameras a fixture has.
+        images = {key: jnp.asarray(np.random.default_rng(_model.IMAGE_KEYS.index(key) + 1)
+                                   .uniform(-1, 1, size=(batch, 1, *_model.IMAGE_RESOLUTION, 3)), dtype=jnp.float32)
+                  for key in image_keys}
     return _model.Observation(
-        images={key: image for key in _model.IMAGE_KEYS},
-        image_masks={key: jnp.ones((batch,), dtype=bool) for key in _model.IMAGE_KEYS},
+        images={key: (jnp.zeros_like(image) if key in masked else image) for key, image in images.items()},
+        image_masks={key: jnp.full((batch,), key not in masked, dtype=bool) for key in image_keys},
         state=state,
         tokenized_prompt=jnp.ones((batch, TOKENS), dtype=jnp.int32),
         tokenized_prompt_mask=jnp.ones((batch, TOKENS), dtype=bool),
     )
+
+
+def test_single_camera_model_equals_masked_three_camera_model():
+    """Skipping the cameras a recipe masks is the same model: a masked camera's tokens are padding."""
+    key = jax.random.key(0)
+    three = _config(dtype="float32").create(key)
+    one = _config(dtype="float32", image_keys=("left_wrist_0_rgb",)).create(key)
+    actions = jnp.asarray(np.random.default_rng(1).normal(size=(2, HORIZON, ACTION_DIM)), dtype=jnp.float32)
+    masked = _observation(2, masked=("base_0_rgb", "right_wrist_0_rgb"))
+    only = _observation(2, image_keys=("left_wrist_0_rgb",))
+    assert np.allclose(np.asarray(masked.images["left_wrist_0_rgb"]), np.asarray(only.images["left_wrist_0_rgb"]))
+    loss_three, loss_one = three.compute_loss(key, masked, actions), one.compute_loss(key, only, actions)
+    assert loss_one.shape == (2, HORIZON)
+    assert np.allclose(np.asarray(loss_three), np.asarray(loss_one), rtol=1e-3, atol=1e-4), (loss_three, loss_one)
+    # The one-camera model also accepts an observation that still carries the other cameras (serving sends all three).
+    loss_extra = one.compute_loss(key, masked, actions)
+    assert np.allclose(np.asarray(loss_extra), np.asarray(loss_one), rtol=1e-3, atol=1e-4)
+    with pytest.raises(ValueError, match="image_keys"):
+        _config(image_keys=("nose_cam",))
 
 
 def test_config_rules():

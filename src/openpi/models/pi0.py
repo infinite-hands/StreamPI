@@ -129,6 +129,7 @@ class Pi0(_model.BaseModel):
         self.deterministic = True
 
         self.hist_horizon = config.hist_horizon
+        self.image_keys = tuple(config.image_keys)
 
     @at.typecheck
     def embed_prefix(
@@ -140,7 +141,7 @@ class Pi0(_model.BaseModel):
         # embed images
         all_image_tokens = dict()
 
-        for name in obs.images:
+        for name in self.image_keys:
             image = obs.images[name]
             bs, T = image.shape[0], image.shape[1]
             image = image.reshape(bs*T, image.shape[2], image.shape[3], image.shape[4])
@@ -159,7 +160,7 @@ class Pi0(_model.BaseModel):
         for t in range(T):
             visual_tokens = list()
             visual_input_mask = list()
-            for name in obs.images:
+            for name in self.image_keys:
                 visual_tokens.append(all_image_tokens[name][:, t])
 
                 visual_input_mask.append(einops.repeat(
@@ -262,7 +263,7 @@ class Pi0(_model.BaseModel):
         if actions.ndim == 4:
             return self._compute_loss_branches(rng, observation, actions, train=train)
         preprocess_rng, noise_rng, time_rng, mask_rng = jax.random.split(rng, 4)
-        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+        observation = _model.preprocess_observation(preprocess_rng, observation, train=train, image_keys=self.image_keys)
 
         b, ah, ad = actions.shape
         batch_shape = actions.shape[:-2]
@@ -326,7 +327,7 @@ class Pi0(_model.BaseModel):
         if not self.state_cond:
             raise ValueError("branched samples need state_cond: the prompt carries no per-branch state")
         preprocess_rng, noise_rng, time_rng, mask_rng = jax.random.split(rng, 4)
-        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+        observation = _model.preprocess_observation(preprocess_rng, observation, train=train, image_keys=self.image_keys)
 
         b, n, ah, ad = actions.shape
         noise = jax.random.normal(noise_rng, actions.shape)
@@ -373,7 +374,7 @@ class Pi0(_model.BaseModel):
         # embed images
         all_image_tokens = dict()
 
-        for name in obs.images:
+        for name in self.image_keys:
             image = obs.images[name]
             bs, T = image.shape[0], image.shape[1]
             image = image.reshape(bs*T, image.shape[2], image.shape[3], image.shape[4])
@@ -392,7 +393,7 @@ class Pi0(_model.BaseModel):
         for t in range(T):
             visual_tokens = list()
             visual_input_mask = list()
-            for name in obs.images:
+            for name in self.image_keys:
                 visual_tokens.append(all_image_tokens[name][:, t])
 
                 visual_input_mask.append(einops.repeat(
@@ -459,7 +460,7 @@ class Pi0(_model.BaseModel):
         step: at.Int[at.Array, ""] = None,
         memory: dict = None
     ) -> _model.Actions:
-        observation = _model.preprocess_observation(None, observation, train=False)
+        observation = _model.preprocess_observation(None, observation, train=False, image_keys=self.image_keys)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
         dt = -1.0 / num_steps

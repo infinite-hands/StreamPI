@@ -132,6 +132,22 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+class _DecodeSomeCamerasDataset(lerobot_dataset.LeRobotDataset):
+    """A LeRobotDataset that decodes only `video_keys`; the other video columns are left out of the
+    sample (the repack must not ask for them)."""
+
+    def __init__(self, video_keys: set[str], *args, **kwargs) -> None:
+        self._decode_video_keys = set(video_keys)
+        super().__init__(*args, **kwargs)
+        unknown = self._decode_video_keys - set(self.meta.video_keys)
+        if unknown:
+            raise ValueError(f"not video columns of {self.repo_id}: {sorted(unknown)}")
+
+    def _query_videos(self, query_timestamps: dict[str, list[float]], ep_idx: int) -> dict:
+        wanted = {key: ts for key, ts in query_timestamps.items() if key in self._decode_video_keys}
+        return super()._query_videos(wanted, ep_idx)
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -169,10 +185,11 @@ def create_torch_dataset(
 
     delta_timestamps.update(hist_delta_timestamps)
 
-    dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
-        delta_timestamps=delta_timestamps,
-    )
+    if data_config.decode_only_hist_cameras:
+        dataset = _DecodeSomeCamerasDataset(set(data_config.hist_sequence_keys), data_config.repo_id,
+                                            delta_timestamps=delta_timestamps)
+    else:
+        dataset = lerobot_dataset.LeRobotDataset(data_config.repo_id, delta_timestamps=delta_timestamps)
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
