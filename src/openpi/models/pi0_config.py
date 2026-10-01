@@ -33,12 +33,33 @@ class Pi0Config(_model.BaseModelConfig):
     hist_horizon: int = 1
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
+    # VLASH (arXiv 2512.01031, appendix III): the state reaches the action expert as an adaRMS conditioning
+    # signal (a zero-initialised MLP beside the time MLP) and leaves the prompt, which then reads
+    # "Task: ...;\nAction: ". What lets one observation prefix carry several state/action branches.
+    state_cond: bool = False
+    # State dims the conditioning may read; every other dim is zeroed first. None: all of them.
+    state_cond_dims: tuple[int, ...] | None = None
+    # VLASH's shared-observation training: each sample carries this many (state, action chunk) branches
+    # at different temporal offsets behind one observation (transforms.TemporalOffset). 0: one branch,
+    # the plain layout. Needs state_cond: the branches differ only in their state, which the prompt
+    # cannot carry per branch.
+    vlash_branches: int = 0
 
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
         if self.discrete_state_input is None:
-            object.__setattr__(self, "discrete_state_input", self.pi05)
+            object.__setattr__(self, "discrete_state_input", self.pi05 and not self.state_cond)
+        if self.state_cond and not self.pi05:
+            raise ValueError("state_cond is pi0.5's state path: pi0 already feeds the state as a suffix token")
+        if self.state_cond and self.discrete_state_input:
+            raise ValueError("state_cond moves the state out of the prompt: discrete_state_input must be False")
+        if self.vlash_branches < 0:
+            raise ValueError(f"vlash_branches must be >= 0, got {self.vlash_branches}")
+        if self.vlash_branches and not self.state_cond:
+            raise ValueError("vlash_branches needs state_cond: a shared prompt cannot carry one state per branch")
+        if self.state_cond_dims is not None and not self.state_cond:
+            raise ValueError("state_cond_dims masks the conditioning state; it needs state_cond")
 
     @property
     @override
@@ -57,6 +78,8 @@ class Pi0Config(_model.BaseModelConfig):
     def inputs_spec(self, *, batch_size: int = 1) -> tuple[_model.Observation, _model.Actions]:
         image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
         image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
+        # With branches, the state and the action chunk carry a branch axis behind the one observation.
+        branch_shape = [self.vlash_branches] if self.vlash_branches else []
 
         with at.disable_typechecking():
             observation_spec = _model.Observation(
@@ -70,11 +93,12 @@ class Pi0Config(_model.BaseModelConfig):
                     "left_wrist_0_rgb": image_mask_spec,
                     "right_wrist_0_rgb": image_mask_spec,
                 },
-                state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
+                state=jax.ShapeDtypeStruct([batch_size, *branch_shape, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
             )
-        action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
+        action_spec = jax.ShapeDtypeStruct(
+            [batch_size, *branch_shape, self.action_horizon, self.action_dim], jnp.float32)
 
         return observation_spec, action_spec
 

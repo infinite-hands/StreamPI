@@ -81,13 +81,17 @@ def get_ih_yam_configs():
                       active_image_keys: frozenset[str] | None = None,
                       active_state_dims: tuple[int, ...] | None = None,
                       held_action_dims: tuple[int, ...] | None = None,
-                      vlash_max_offset: int = 0):
+                      vlash_max_offset: int = 0, vlash_branches: int = 0, state_cond: bool = False):
         model = pi0_config.Pi0Config(
             pi05=True,
             action_horizon=ACTION_HORIZON,
             hist_horizon=HIST_HORIZON,
             paligemma_variant="gemma_2b_lora" if lora else "gemma_2b",
             action_expert_variant="gemma_300m_lora" if lora else "gemma_300m",
+            # With the state out of the prompt, the single-arm recipe's state mask moves to the conditioning.
+            state_cond=state_cond,
+            state_cond_dims=active_state_dims if state_cond else None,
+            vlash_branches=vlash_branches,
         )
         return TrainConfig(
             name=name,
@@ -104,6 +108,7 @@ def get_ih_yam_configs():
                     hist_interval=hist_interval,
                     enable_jitter=True,
                     vlash_max_offset=vlash_max_offset,
+                    vlash_branches=vlash_branches,
                 ),
             ),
             weight_loader=weight_loaders.CheckpointWeightLoader(PI05_BASE_PARAMS),
@@ -156,4 +161,13 @@ def get_ih_yam_configs():
         interval = recipe.get("hist_interval", HIST_INTERVAL)
         return {**recipe, "name": recipe["name"] + "_vlash", "vlash_max_offset": interval - 1}
 
-    return [stream_config(**recipe) for recipe in recipes + [vlash_twin(recipe) for recipe in recipes]]
+    def vlash_packed_twin(recipe: dict) -> dict:
+        # The paper's shared-observation training: every offset 0..max as one branch behind one
+        # observation, the state as adaRMS conditioning instead of prompt text. A different model
+        # (state_cond) and prompt from the _vlash twin, so a different checkpoint and serve config.
+        interval = recipe.get("hist_interval", HIST_INTERVAL)
+        return {**recipe, "name": recipe["name"] + "_vlashp", "vlash_max_offset": interval - 1,
+                "vlash_branches": interval, "state_cond": True}
+
+    return [stream_config(**recipe) for recipe in
+            recipes + [vlash_twin(recipe) for recipe in recipes] + [vlash_packed_twin(recipe) for recipe in recipes]]

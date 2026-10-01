@@ -179,10 +179,14 @@ def create_torch_dataset(
 
     dataset = TransformedDataset(dataset, [_transforms.TemporalJitter(jitter_range, hist_interval, hist_horizon, data_config.hist_sequence_keys, enable_jitter)])
 
-    if data_config.vlash_max_offset > 0:
+    if data_config.vlash_max_offset > 0 or data_config.vlash_branches:
+        if data_config.vlash_branches != getattr(model_config, "vlash_branches", 0):
+            raise ValueError(f"DataConfig.vlash_branches ({data_config.vlash_branches}) must match the model's "
+                             f"vlash_branches ({getattr(model_config, 'vlash_branches', 0)})")
         dataset = TransformedDataset(dataset, [_transforms.TemporalOffset(
             data_config.vlash_max_offset, action_horizon, data_config.action_sequence_keys,
-            state_key=VLASH_STATE_KEY, state_source=data_config.vlash_state_source)])
+            state_key=VLASH_STATE_KEY, state_source=data_config.vlash_state_source,
+            branches=data_config.vlash_branches)])
 
     return dataset
 

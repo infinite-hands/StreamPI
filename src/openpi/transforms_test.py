@@ -150,6 +150,30 @@ def test_temporal_offset_from_recorded_state(monkeypatch):
     assert np.all(item["observation.state"] == np.array([30.0, 30.0, 30.0]))
 
 
+def test_temporal_offset_branches(monkeypatch):
+    monkeypatch.setattr(_transforms.random, "sample", lambda population, k: [0, 2, 3])
+    item = _transforms.TemporalOffset(3, 4, ("action",), branches=3)(_offset_item())
+
+    assert item["action"].shape == (3, 4, 3) and item["observation.state"].shape == (3, 3)
+    assert np.all(item["action"][:, :, 0] == np.array([[0, 1, 2, 3], [2, 3, 4, 5], [3, 4, 5, 6]]))
+    # Offset 0 keeps the measured state; the others carry the previous commanded action.
+    assert np.all(item["observation.state"][:, 0] == np.array([-1.0, 1.0, 2.0]))
+
+
+def test_temporal_offset_branches_bounds():
+    with pytest.raises(ValueError, match="branches"):
+        _transforms.TemporalOffset(3, 4, ("action",), branches=5)
+
+
+def test_hold_actions_over_branches():
+    state = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+    actions = np.zeros((2, 3, 2), dtype=np.float32)
+    held = _transforms.HoldActions(dims=(1,), delta_mask=[True, False])({"state": state, "actions": actions})
+    assert np.all(held["actions"][0, :, 1] == 2.0) and np.all(held["actions"][1, :, 1] == 4.0)
+    flat = _transforms.HoldActions(dims=(1,), delta_mask=[True, False])({"state": state[0], "actions": actions[0]})
+    assert np.all(flat["actions"][:, 1] == 2.0)
+
+
 def test_temporal_offset_needs_the_wider_window():
     item = _offset_item(horizon=4, max_offset=1)
     with pytest.raises(ValueError, match="needs 7"):

@@ -103,6 +103,9 @@ class DataConfig:
     # Where the shifted state comes from: the previous commanded action ("action") or the recorded
     # state ("state").
     vlash_state_source: Literal["action", "state"] = "action"
+    # The paper's shared-observation training: this many offsets per sample behind one observation
+    # (0: one offset per sample). Must match the model's Pi0Config.vlash_branches.
+    vlash_branches: int = 0
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
@@ -155,7 +158,8 @@ class ModelTransformFactory(GroupFactory):
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                             discrete_state_input=model_config.discrete_state_input,
-                            active_state_dims=self.active_state_dims,
+                            active_state_dims=self.active_state_dims if model_config.discrete_state_input else None,
+                            task_only=model_config.state_cond,
                         ),
                         _transforms.PadStatesAndActions(model_config.action_dim),
                     ],
