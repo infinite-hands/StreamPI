@@ -143,19 +143,26 @@ def train_step(
     model = nnx.merge(state.model_def, state.params)
     model.train()
 
+    spatial_weight = getattr(config.model, "spatial_weight", 0.0) if getattr(config.model, "spatial_layer", None) is not None else None
+
     @at.typecheck
     def loss_fn(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
-        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-        return jnp.mean(chunked_loss)
+        if spatial_weight is None:
+            chunked_loss = model.compute_loss(rng, observation, actions, train=True)
+            return jnp.mean(chunked_loss), {}
+        chunked_loss, align_loss = model.compute_losses(rng, observation, actions, train=True)
+        action_loss = jnp.mean(chunked_loss)
+        return action_loss + spatial_weight * align_loss, {"action_loss": action_loss, "align_loss": align_loss}
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions = batch
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+    (loss, parts), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(
+        model, train_rng, observation, actions)
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -187,6 +194,7 @@ def train_step(
         "loss": loss,
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
+        **parts,
     }
     return new_state, info
 

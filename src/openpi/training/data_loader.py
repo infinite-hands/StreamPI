@@ -162,15 +162,21 @@ def create_torch_dataset(
 
     delta_timestamps.update(hist_delta_timestamps)
 
-    dataset = lerobot_dataset.LeRobotDataset(
+    lerobot = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         delta_timestamps=delta_timestamps,
     )
+    dataset = lerobot
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 
     dataset = TransformedDataset(dataset, [_transforms.TemporalJitter(jitter_range, hist_interval, hist_horizon, data_config.hist_sequence_keys, enable_jitter)])
+    if data_config.spatial_targets_dir is not None:
+        starts = lerobot.episode_data_index["from"]
+        dataset = TransformedDataset(dataset, [_transforms.SpatialTargets(
+            data_config.spatial_targets_dir, {episode: int(starts[episode]) for episode in range(len(starts))},
+            (hist_horizon - 1) * hist_interval)])
 
     return dataset
 

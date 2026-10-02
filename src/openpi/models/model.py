@@ -107,6 +107,10 @@ class Observation(Generic[ArrayT]):
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "#b l"] | None = None
 
+    # Spatial Forcing: a 3D teacher's features for the current frame's patches, and which patches count.
+    spatial_targets: at.Float[ArrayT, "#b p d"] | None = None
+    spatial_target_mask: at.Bool[ArrayT, "#b p"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -136,6 +140,8 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            spatial_targets=data.get("spatial_targets"),
+            spatial_target_mask=data.get("spatial_target_mask"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -218,6 +224,8 @@ def preprocess_observation(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        spatial_targets=observation.spatial_targets,
+        spatial_target_mask=observation.spatial_target_mask,
     )
 
 

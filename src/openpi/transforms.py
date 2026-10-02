@@ -208,6 +208,7 @@ class TemporalJitter(DataTransformFn):
                 sampled_frames.append(full_seq[frame_idx])
 
             data[key] = np.stack(sampled_frames[::-1], axis=0)
+        data["hist_offset"] = base_offset
 
         # import cv2
         # T, H, W, _ = data[self.hist_sequence_keys[0]].shape
@@ -216,6 +217,33 @@ class TemporalJitter(DataTransformFn):
         # concat_image = cv2.hconcat(frames_list)
         # success = cv2.imwrite("/workspace/jhhou/projects/StreamingVLA/imgs.png", concat_image)
         # import pdb;pdb.set_trace()
+        return data
+
+
+_SPATIAL_STORES: dict[str, tuple[np.ndarray, np.ndarray]] = {}   # per process: each loader worker maps the store once
+
+
+@dataclasses.dataclass(frozen=True)
+class SpatialTargets(DataTransformFn):
+    """Spatial Forcing's targets for the frame TemporalJitter made the sample's current one: that frame's
+    teacher features (`spatial_targets`, (patches, dim)) and which patches count (`spatial_target_mask`).
+    The current frame sits `window` frames into the history sequence, moved by the jitter and held inside
+    the episode the way LeRobot pads a history that reaches back before it."""
+
+    directory: str
+    episode_starts: dict
+    window: int
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if self.directory not in _SPATIAL_STORES:
+            _SPATIAL_STORES[self.directory] = (np.load(f"{self.directory}/features.npy", mmap_mode="r"),
+                                               np.load(f"{self.directory}/token_mask.npy"))
+        features, mask = _SPATIAL_STORES[self.directory]
+        position = int(np.clip(self.window + int(data.pop("hist_offset", 0)), 0, self.window))
+        start = self.episode_starts[int(data["episode_index"])]
+        frame = max(int(data["index"]) - (self.window - position), start)
+        data["spatial_targets"] = np.asarray(features[frame], dtype=np.float32)
+        data["spatial_target_mask"] = mask.copy()
         return data
 
 

@@ -105,6 +105,14 @@ class Pi0(_model.BaseModel):
         self.deterministic = True
 
         self.hist_horizon = config.hist_horizon
+        self.spatial_layer = config.spatial_layer
+        self.spatial_camera = config.spatial_camera
+        if config.spatial_layer is not None:
+            # The paper's projector: LayerNorm, Linear to twice the target width, GELU, Linear to the target width.
+            hidden = 2 * config.spatial_target_dim
+            self.spatial_norm = nnx.LayerNorm(paligemma_config.width, rngs=rngs)
+            self.spatial_fc1 = nnx.Linear(paligemma_config.width, hidden, rngs=rngs)
+            self.spatial_fc2 = nnx.Linear(hidden, config.spatial_target_dim, rngs=rngs)
 
     @at.typecheck
     def embed_prefix(
@@ -224,6 +232,12 @@ class Pi0(_model.BaseModel):
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
+        return self.compute_losses(rng, observation, actions, train=train)[0]
+
+    def compute_losses(
+        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+    ):
+        """(the per-sample flow-matching loss, Spatial Forcing's alignment loss or None without it)."""
         preprocess_rng, noise_rng, time_rng, mask_rng = jax.random.split(rng, 4)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
@@ -271,12 +285,33 @@ class Pi0(_model.BaseModel):
         # # safe_print("x2, x3 = {}", attn_mask[0, 768*2:768*3, 768*3:768*3 + 10].sum())
         # safe_print("x3, x2 = {}", attn_mask[0, 768*3:768*3 + 10, 768*2:768*3].sum())
 
-        (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-            [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
-        )
+        if self.spatial_layer is None:
+            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+                [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
+            )
+            align_loss = None
+        else:
+            # The current frame is the last of T; within it, the cameras' patches come in images order.
+            cameras = list(observation.images)
+            patches = (prefix_tokens.shape[1] // T - observation.tokenized_prompt.shape[1]) // len(cameras)
+            start = (T - 1) * (prefix_tokens.shape[1] // T) + cameras.index(self.spatial_camera) * patches
+            (prefix_out, suffix_out), _, hidden = self.PaliGemma.llm(
+                [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond],
+                capture_layer=self.spatial_layer, capture_tokens=(start, patches),
+            )
+            align_loss = self._align_loss(hidden, observation)
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        return jnp.mean(jnp.square(v_t - u_t), axis=-1), align_loss
+
+    def _align_loss(self, hidden, observation: _model.Observation):
+        """1 - cosine between each projected patch and its teacher feature, over the patches that count."""
+        projected = self.spatial_fc2(nnx.gelu(self.spatial_fc1(self.spatial_norm(hidden.astype(jnp.float32)))))
+        targets = observation.spatial_targets.astype(jnp.float32)
+        cosine = jnp.sum(projected * targets, axis=-1) / jnp.maximum(
+            jnp.linalg.norm(projected, axis=-1) * jnp.linalg.norm(targets, axis=-1), 1e-6)
+        mask = observation.spatial_target_mask & observation.image_masks[self.spatial_camera][:, None]
+        return jnp.sum((1.0 - cosine) * mask) / jnp.maximum(jnp.sum(mask), 1)
     
     @at.typecheck
     def embed_prefix_infer(

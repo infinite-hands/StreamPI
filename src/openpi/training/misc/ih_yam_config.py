@@ -35,6 +35,11 @@ HIST_INTERVAL = 10
 # observation half as often. Model shape is untouched -- HIST_HORIZON and ACTION_HORIZON set the
 # token count and KV-cache size -- so fsdp_devices and batch_size below are unchanged.
 HIST_INTERVAL_WIDE = 20
+# Spatial Forcing (arXiv 2510.12276) on left-real, with a substitute teacher: the targets infinite-hands'
+# models.vla.streampi.spatial_teacher wrote from facebook/map-anything-apache for the left wrist camera,
+# aligned at the paper's pi0 layer (12 of 18).
+LEFT_REAL_SPATIAL_TARGETS = "/misc/spatial-teacher/local_yam_bagging_left_real_20260924/cam_left_wrist"
+SPATIAL_LAYER = 12
 ACTION_HORIZON = 30
 # The YAM LeRobot layout: three cameras, 14-dim state/action [L j0..5, L grip, R j0..5, R grip].
 YAM_REPACK = _transforms.Group(
@@ -80,20 +85,28 @@ def get_ih_yam_configs():
                       hist_interval: int = HIST_INTERVAL,
                       active_image_keys: frozenset[str] | None = None,
                       active_state_dims: tuple[int, ...] | None = None,
-                      held_action_dims: tuple[int, ...] | None = None):
+                      held_action_dims: tuple[int, ...] | None = None,
+                      spatial_targets_dir: str | None = None):
         model = pi0_config.Pi0Config(
             pi05=True,
             action_horizon=ACTION_HORIZON,
             hist_horizon=HIST_HORIZON,
             paligemma_variant="gemma_2b_lora" if lora else "gemma_2b",
             action_expert_variant="gemma_300m_lora" if lora else "gemma_300m",
+            spatial_layer=None if spatial_targets_dir is None else SPATIAL_LAYER,
         )
+        repack = YAM_REPACK if spatial_targets_dir is None else _transforms.Group(inputs=[_transforms.RepackTransform({
+            **YAM_REPACK.inputs[0].structure,
+            "spatial_targets": "spatial_targets",
+            "spatial_target_mask": "spatial_target_mask",
+        })])
         return TrainConfig(
             name=name,
             model=model,
             data=LeRobotYamStreamDataConfig(
                 repo_id=repo_id,
                 default_prompt=prompt,
+                repack_transforms=repack,
                 active_image_keys=active_image_keys,
                 active_state_dims=active_state_dims,
                 held_action_dims=held_action_dims,
@@ -102,6 +115,7 @@ def get_ih_yam_configs():
                     hist_horizon=HIST_HORIZON,
                     hist_interval=hist_interval,
                     enable_jitter=True,
+                    spatial_targets_dir=spatial_targets_dir,
                 ),
             ),
             weight_loader=weight_loaders.CheckpointWeightLoader(PI05_BASE_PARAMS),
@@ -146,4 +160,10 @@ def get_ih_yam_configs():
                       active_image_keys=frozenset({"left_wrist_0_rgb"}),
                       active_state_dims=LEFT_ARM_DIMS,
                       held_action_dims=RIGHT_ARM_DIMS),
+        stream_config("pi05_yam_stream5_i20_bagging_left_real_sf", BAGGING_LEFT_REAL_REPO_ID, BAGGING_PROMPT,
+                      lora=True, hist_interval=HIST_INTERVAL_WIDE,
+                      active_image_keys=frozenset({"left_wrist_0_rgb"}),
+                      active_state_dims=LEFT_ARM_DIMS,
+                      held_action_dims=RIGHT_ARM_DIMS,
+                      spatial_targets_dir=LEFT_REAL_SPATIAL_TARGETS),
     ]

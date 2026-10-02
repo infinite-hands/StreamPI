@@ -33,6 +33,13 @@ class Pi0Config(_model.BaseModelConfig):
     hist_horizon: int = 1
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
+    # Spatial Forcing (arXiv 2510.12276): align this PaliGemma layer's current-frame patches of `spatial_camera`
+    # with a 3D teacher's features (Observation.spatial_targets) by a cosine loss of weight `spatial_weight`;
+    # None trains without it.
+    spatial_layer: int | None = None
+    spatial_camera: str = "left_wrist_0_rgb"
+    spatial_target_dim: int = 256
+    spatial_weight: float = 0.5   # the paper's align_loss_coeff for pi0
 
     def __post_init__(self):
         if self.max_token_len is None:

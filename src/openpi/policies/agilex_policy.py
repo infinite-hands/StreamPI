@@ -312,6 +312,10 @@ class AgilexInputs(transforms.DataTransformFn):
         if "action_prefix" in data:
             inputs["action_prefix"] = data["action_prefix"]
 
+        for key in ("spatial_targets", "spatial_target_mask"):
+            if key in data:
+                inputs[key] = data[key]
+
         return inputs
 
 

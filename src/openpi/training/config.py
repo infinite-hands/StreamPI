@@ -95,6 +95,9 @@ class DataConfig:
     hist_interval: int = 5
     jitter_range: tuple = (-2, -1, 0, 1, 2)
     enable_jitter: bool = False
+    # Spatial Forcing: the directory of a 3D teacher's per-frame features for this dataset (features.npy by
+    # global frame index, token_mask.npy), written by infinite-hands' models.vla.streampi.spatial_teacher.
+    spatial_targets_dir: str | None = None
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False

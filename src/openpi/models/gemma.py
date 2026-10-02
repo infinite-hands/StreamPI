@@ -290,7 +290,8 @@ class Block(nn.Module):
     dropout_bdims: tuple[int, ...] = ()
 
     @nn.compact
-    def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True):  # noqa: FBT002
+    def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True,  # noqa: FBT002
+                 capture=None, capture_tokens=None):
         xs = sharding.activation_sharding_constraint(xs)
         drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x
 
@@ -330,6 +331,10 @@ class Block(nn.Module):
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, out, gates, strict=True)]
         xs = sharding.activation_sharding_constraint(xs)
 
+        if capture is not None:
+            start, length = capture_tokens
+            held = xs[0][:, start:start + length]
+            return xs, (kv_cache, jnp.where(capture, held, jnp.zeros_like(held)))
         return xs, kv_cache
 
 
@@ -359,7 +364,7 @@ class Module(nn.Module):
         block_cls = nn.remat(
             Block,
             prevent_cse=False,
-            static_argnums=(5,),  # 0=self, 6=deterministic
+            static_argnums=(5, 8),  # 0=self, 6=deterministic, 8=capture_tokens
             policy=jax.checkpoint_policies.nothing_saveable,
         )
         self.layers = nn.scan(
@@ -372,7 +377,9 @@ class Module(nn.Module):
                 nn.broadcast,
                 nn.broadcast,
                 nn.broadcast,
-            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=deterministic
+                0,
+                nn.broadcast,
+            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=deterministic, 5=capture, 6=capture_tokens
             length=self.configs[0].depth,
         )(
             configs=self.configs,
@@ -396,19 +403,34 @@ class Module(nn.Module):
         *,
         kv_cache: KVCache | None = None,
         deterministic: bool = True,
-    ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]:
+        capture_layer: int | None = None,
+        capture_tokens: tuple[int, int] | None = None,
+    ) -> tuple:
+        """With `capture_layer`, also returns, last, the first expert's residual after that layer for the
+        `capture_tokens` (start, length) slice: (b, length, width), for Spatial Forcing's alignment loss."""
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
         mask = jnp.asarray(mask)[:, None, :, :]
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
 
-        embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic)
+        capture = None if capture_layer is None else jnp.arange(self.configs[0].depth) == capture_layer
+        embedded, layer_outputs = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic,
+                                              capture, capture_tokens)
+        captured = None
+        if capture_layer is None:
+            kv_cache = layer_outputs
+        else:
+            kv_cache, captured_by_layer = layer_outputs
+            captured = captured_by_layer[capture_layer]
 
         assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
 
-        return [
+        outputs = [
             f(e, a)[0] if e is not None else e for f, e, a in zip(self.final_norms, embedded, adarms_cond, strict=True)
-        ], kv_cache
+        ]
+        if capture_layer is None:
+            return outputs, kv_cache
+        return outputs, kv_cache, captured
 
     def init(self, use_adarms: Sequence[bool]):
         """Convenience method for initializing all parameters, necessary due to the quirks of linen."""
