@@ -15,6 +15,9 @@ FIRSTTRY_REPO_ID = "local/yam_fullcorpus_teleop_firsttry_20260914"  # the studio
 # 483 REAL (not mirrored) native left-arm teleop episodes, --leaders left: the right arm's real
 # gravity-comp trajectory is recorded, not a mirrored/synthetic one.
 BAGGING_LEFT_REAL_REPO_ID = "local/yam_bagging_left_real_20260924"
+# 313 REAL native right-arm teleop episodes, --leaders right (2026-09-30 + 2026-10-02); the left arm
+# was held, except in four takes where a left policy ran beside the teleop.
+BAGGING_RIGHT_REAL_REPO_ID = "local/yam_bagging_right_real_20261002"
 BAGGING_PROMPT = "place one part in the bag"
 LEFT_ARM_DIMS = tuple(range(7))    # [L j0..5, L grip]
 RIGHT_ARM_DIMS = tuple(range(7, 14))  # [R j0..5, R grip]
@@ -146,4 +149,10 @@ def get_ih_yam_configs():
                       active_image_keys=frozenset({"left_wrist_0_rgb"}),
                       active_state_dims=LEFT_ARM_DIMS,
                       held_action_dims=RIGHT_ARM_DIMS),
+        # Its mirror for real native right-arm teleop: the same recipe with the arms swapped.
+        stream_config("pi05_yam_stream5_i20_bagging_right_real", BAGGING_RIGHT_REAL_REPO_ID, BAGGING_PROMPT,
+                      lora=True, hist_interval=HIST_INTERVAL_WIDE,
+                      active_image_keys=frozenset({"right_wrist_0_rgb"}),
+                      active_state_dims=RIGHT_ARM_DIMS,
+                      held_action_dims=LEFT_ARM_DIMS),
     ]
