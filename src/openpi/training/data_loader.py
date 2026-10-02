@@ -1,7 +1,9 @@
 from collections.abc import Iterator, Sequence
+import json
 import logging
 import multiprocessing
 import os
+import pathlib
 import typing
 import random
 from functools import partial
@@ -173,12 +175,31 @@ def create_torch_dataset(
 
     dataset = TransformedDataset(dataset, [_transforms.TemporalJitter(jitter_range, hist_interval, hist_horizon, data_config.hist_sequence_keys, enable_jitter)])
     if data_config.spatial_targets_dir is not None:
+        camera = _check_spatial_targets(data_config.spatial_targets_dir, dataset_meta, model_config)
         starts = lerobot.episode_data_index["from"]
         dataset = TransformedDataset(dataset, [_transforms.SpatialTargets(
-            data_config.spatial_targets_dir, {episode: int(starts[episode]) for episode in range(len(starts))},
-            (hist_horizon - 1) * hist_interval)])
+            data_config.spatial_targets_dir, f"observation.images.{camera}",
+            {episode: int(starts[episode]) for episode in range(len(starts))}, (hist_horizon - 1) * hist_interval)])
 
     return dataset
+
+
+def _check_spatial_targets(directory: str, dataset_meta, model_config) -> str:
+    """The rig camera a Spatial Forcing store was written for (its meta.json, the one declaration of it),
+    after refusing a store this dataset or model does not match."""
+    from openpi.policies.agilex_policy import CAMERA_INPUT_NAMES
+
+    meta = json.loads(pathlib.Path(directory, "meta.json").read_text())
+    problems = []
+    if meta["frames"] != dataset_meta.total_frames:
+        problems.append(f"it holds {meta['frames']} frames, the dataset {dataset_meta.total_frames}")
+    if meta["target_dim"] != model_config.spatial_target_dim:
+        problems.append(f"its targets are {meta['target_dim']}-d, the model's {model_config.spatial_target_dim}-d")
+    if CAMERA_INPUT_NAMES.get(meta["camera"]) != model_config.spatial_camera:
+        problems.append(f"it was written for {meta['camera']}, the model aligns {model_config.spatial_camera}")
+    if problems:
+        raise ValueError(f"Spatial Forcing store {directory} does not fit: " + "; ".join(problems))
+    return meta["camera"]
 
 
 def create_rlds_dataset(

@@ -293,8 +293,8 @@ class Pi0(_model.BaseModel):
         else:
             # The current frame is the last of T; within it, the cameras' patches come in images order.
             cameras = list(observation.images)
-            patches = (prefix_tokens.shape[1] // T - observation.tokenized_prompt.shape[1]) // len(cameras)
-            start = (T - 1) * (prefix_tokens.shape[1] // T) + cameras.index(self.spatial_camera) * patches
+            patches = (num_img_tokens - observation.tokenized_prompt.shape[1]) // len(cameras)
+            start = (T - 1) * num_img_tokens + cameras.index(self.spatial_camera) * patches
             (prefix_out, suffix_out), _, hidden = self.PaliGemma.llm(
                 [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond],
                 capture_layer=self.spatial_layer, capture_tokens=(start, patches),

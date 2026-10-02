@@ -210,6 +210,9 @@ def joint_to_ee6d(joint: np.ndarray, binary_gripper: bool = False) -> np.ndarray
     return eef_pos
 
 
+# The rig camera behind each of the model's image inputs.
+CAMERA_INPUT_NAMES = {"cam_high": "base_0_rgb", "cam_left_wrist": "left_wrist_0_rgb", "cam_right_wrist": "right_wrist_0_rgb"}
+
 @dataclasses.dataclass(frozen=True)
 class AgilexInputs(transforms.DataTransformFn):
     """Inputs for the Agilex policy.
@@ -256,10 +259,7 @@ class AgilexInputs(transforms.DataTransformFn):
         }
 
         # Add the extra images.
-        extra_image_names = {
-            "left_wrist_0_rgb": "cam_left_wrist",
-            "right_wrist_0_rgb": "cam_right_wrist",
-        }
+        extra_image_names = {dest: source for source, dest in CAMERA_INPUT_NAMES.items() if source != "cam_high"}
         for dest, source in extra_image_names.items():
             if source in in_images:
                 images[dest] = in_images[source]

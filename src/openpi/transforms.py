@@ -191,6 +191,7 @@ class TemporalJitter(DataTransformFn):
     enable_jitter: bool
 
     def __call__(self, data: DataDict) -> DataDict:
+        offsets = {}
         for key in self.hist_sequence_keys:
             full_seq = data[key]
             T = full_seq.shape[0]
@@ -208,7 +209,8 @@ class TemporalJitter(DataTransformFn):
                 sampled_frames.append(full_seq[frame_idx])
 
             data[key] = np.stack(sampled_frames[::-1], axis=0)
-        data["hist_offset"] = base_offset
+            offsets[key] = base_offset
+        data["hist_offsets"] = offsets   # each camera draws its own jitter; SpatialTargets reads its camera's
 
         # import cv2
         # T, H, W, _ = data[self.hist_sequence_keys[0]].shape
@@ -225,12 +227,13 @@ _SPATIAL_STORES: dict[str, tuple[np.ndarray, np.ndarray]] = {}   # per process: 
 
 @dataclasses.dataclass(frozen=True)
 class SpatialTargets(DataTransformFn):
-    """Spatial Forcing's targets for the frame TemporalJitter made the sample's current one: that frame's
+    """Spatial Forcing's targets for the frame TemporalJitter made `video_key`'s current one: that frame's
     teacher features (`spatial_targets`, (patches, dim)) and which patches count (`spatial_target_mask`).
-    The current frame sits `window` frames into the history sequence, moved by the jitter and held inside
-    the episode the way LeRobot pads a history that reaches back before it."""
+    The current frame sits `window` frames into the history sequence, moved by that camera's jitter and held
+    inside the episode the way LeRobot pads a history that reaches back before it."""
 
     directory: str
+    video_key: str
     episode_starts: dict
     window: int
 
@@ -239,10 +242,10 @@ class SpatialTargets(DataTransformFn):
             _SPATIAL_STORES[self.directory] = (np.load(f"{self.directory}/features.npy", mmap_mode="r"),
                                                np.load(f"{self.directory}/token_mask.npy"))
         features, mask = _SPATIAL_STORES[self.directory]
-        position = int(np.clip(self.window + int(data.pop("hist_offset", 0)), 0, self.window))
+        position = int(np.clip(self.window + int(data.pop("hist_offsets", {}).get(self.video_key, 0)), 0, self.window))
         start = self.episode_starts[int(data["episode_index"])]
         frame = max(int(data["index"]) - (self.window - position), start)
-        data["spatial_targets"] = np.asarray(features[frame], dtype=np.float32)
+        data["spatial_targets"] = np.array(features[frame])   # float16 off the store; the loss casts on device
         data["spatial_target_mask"] = mask.copy()
         return data
 

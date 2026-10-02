@@ -94,6 +94,7 @@ def get_ih_yam_configs():
             paligemma_variant="gemma_2b_lora" if lora else "gemma_2b",
             action_expert_variant="gemma_300m_lora" if lora else "gemma_300m",
             spatial_layer=None if spatial_targets_dir is None else SPATIAL_LAYER,
+            spatial_camera="left_wrist_0_rgb",   # the camera the store's meta.json names; the loader refuses a mismatch
         )
         repack = YAM_REPACK if spatial_targets_dir is None else _transforms.Group(inputs=[_transforms.RepackTransform({
             **YAM_REPACK.inputs[0].structure,
