@@ -2,7 +2,9 @@
 
 import dataclasses
 
+from openpi.models.model import IMAGE_KEYS
 import openpi.models.pi0_config as pi0_config
+from openpi.policies.agilex_policy import AgilexInputs
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
@@ -36,22 +38,30 @@ HIST_INTERVAL = 10
 # token count and KV-cache size -- so fsdp_devices and batch_size below are unchanged.
 HIST_INTERVAL_WIDE = 20
 ACTION_HORIZON = 30
+# The reference implementation's offset range (mit-han-lab/vlash, examples/train/*/async*.yaml:
+# max_delay_steps: 8), for a deployment that fixes its lead at this many rows or fewer. The full-window
+# range (hist_interval - 1) made the previous command so close to the next target that the left-real
+# fine-tune followed the wrist image about a third as much as its non-vlash twin did, offline.
+VLASH_REFERENCE_MAX_OFFSET = 8
 # The YAM LeRobot layout: three cameras, 14-dim state/action [L j0..5, L grip, R j0..5, R grip].
-YAM_REPACK = _transforms.Group(
-    inputs=[
-        _transforms.RepackTransform(
-            {
-                "images": {
-                    "cam_high": "observation.images.cam_high",
-                    "cam_left_wrist": "observation.images.cam_left_wrist",
-                    "cam_right_wrist": "observation.images.cam_right_wrist",
-                },
-                "state": "observation.state",
-                "actions": "action",
-            }
-        )
-    ]
-)
+YAM_CAMERAS = ("cam_high", "cam_left_wrist", "cam_right_wrist")
+
+
+def yam_repack(cameras: tuple[str, ...] = YAM_CAMERAS) -> _transforms.Group:
+    return _transforms.Group(
+        inputs=[
+            _transforms.RepackTransform(
+                {
+                    "images": {camera: f"observation.images.{camera}" for camera in cameras},
+                    "state": "observation.state",
+                    "actions": "action",
+                }
+            )
+        ]
+    )
+
+
+YAM_REPACK = yam_repack()
 
 
 def get_ih_yam_configs():
@@ -80,13 +90,28 @@ def get_ih_yam_configs():
                       hist_interval: int = HIST_INTERVAL,
                       active_image_keys: frozenset[str] | None = None,
                       active_state_dims: tuple[int, ...] | None = None,
-                      held_action_dims: tuple[int, ...] | None = None):
+                      held_action_dims: tuple[int, ...] | None = None,
+                      vlash_max_offset: int = 0, vlash_branches: int = 0, state_cond: bool = False,
+                      encode_only_active_cameras: bool = False):
+        # A masked camera's tokens are padding, so a recipe may skip decoding and encoding them: the same
+        # model, one SigLIP pass per frame instead of three and a third of the prefix. Opt-in per config
+        # because it changes the model's input layout (not its weights).
+        if encode_only_active_cameras and active_image_keys is None:
+            raise ValueError(f"{name}: encode_only_active_cameras needs active_image_keys")
+        cameras = {image_key: camera for camera, image_key in AgilexInputs.IMAGE_KEY_BY_CAMERA.items()}
+        image_keys = tuple(key for key in IMAGE_KEYS if not encode_only_active_cameras or key in active_image_keys)
+        kept_cameras = tuple(cameras[key] for key in image_keys)
         model = pi0_config.Pi0Config(
             pi05=True,
             action_horizon=ACTION_HORIZON,
             hist_horizon=HIST_HORIZON,
             paligemma_variant="gemma_2b_lora" if lora else "gemma_2b",
             action_expert_variant="gemma_300m_lora" if lora else "gemma_300m",
+            # With the state out of the prompt, the single-arm recipe's state mask moves to the conditioning.
+            state_cond=state_cond,
+            state_cond_dims=active_state_dims if state_cond else None,
+            vlash_branches=vlash_branches,
+            image_keys=image_keys,
         )
         return TrainConfig(
             name=name,
@@ -97,11 +122,16 @@ def get_ih_yam_configs():
                 active_image_keys=active_image_keys,
                 active_state_dims=active_state_dims,
                 held_action_dims=held_action_dims,
+                repack_transforms=yam_repack(kept_cameras),
+                hist_sequence_keys=tuple(f"observation.images.{camera}" for camera in kept_cameras),
                 base_config=DataConfig(
                     prompt_from_task=False,
                     hist_horizon=HIST_HORIZON,
                     hist_interval=hist_interval,
                     enable_jitter=True,
+                    vlash_max_offset=vlash_max_offset,
+                    vlash_branches=vlash_branches,
+                    decode_only_hist_cameras=encode_only_active_cameras,
                 ),
             ),
             weight_loader=weight_loaders.CheckpointWeightLoader(PI05_BASE_PARAMS),
@@ -124,26 +154,50 @@ def get_ih_yam_configs():
             ema_decay=None if lora else 0.99,
         )
 
-    return [
-        stream_config("pi05_yam_stream5_bagging", BAGGING_REPO_ID, BAGGING_PROMPT, lora=True),
-        stream_config("pi05_yam_stream5_bagging_full", BAGGING_REPO_ID, BAGGING_PROMPT, lora=False),
-        stream_config("pi05_yam_stream5_firsttry", FIRSTTRY_REPO_ID, BAGGING_PROMPT, lora=True),
-        stream_config("pi05_yam_stream5_firsttry_full", FIRSTTRY_REPO_ID, BAGGING_PROMPT, lora=False),
+    recipes = [
+        dict(name="pi05_yam_stream5_bagging", repo_id=BAGGING_REPO_ID, prompt=BAGGING_PROMPT, lora=True),
+        dict(name="pi05_yam_stream5_bagging_full", repo_id=BAGGING_REPO_ID, prompt=BAGGING_PROMPT, lora=False),
+        dict(name="pi05_yam_stream5_firsttry", repo_id=FIRSTTRY_REPO_ID, prompt=BAGGING_PROMPT, lora=True),
+        dict(name="pi05_yam_stream5_firsttry_full", repo_id=FIRSTTRY_REPO_ID, prompt=BAGGING_PROMPT, lora=False),
         # The same four at the wider cadence; `_i20` is the only thing that differs.
-        stream_config("pi05_yam_stream5_i20_bagging", BAGGING_REPO_ID, BAGGING_PROMPT, lora=True,
-                      hist_interval=HIST_INTERVAL_WIDE),
-        stream_config("pi05_yam_stream5_i20_bagging_full", BAGGING_REPO_ID, BAGGING_PROMPT, lora=False,
-                      hist_interval=HIST_INTERVAL_WIDE),
-        stream_config("pi05_yam_stream5_i20_firsttry", FIRSTTRY_REPO_ID, BAGGING_PROMPT, lora=True,
-                      hist_interval=HIST_INTERVAL_WIDE),
-        stream_config("pi05_yam_stream5_i20_firsttry_full", FIRSTTRY_REPO_ID, BAGGING_PROMPT, lora=False,
-                      hist_interval=HIST_INTERVAL_WIDE),
+        dict(name="pi05_yam_stream5_i20_bagging", repo_id=BAGGING_REPO_ID, prompt=BAGGING_PROMPT, lora=True,
+             hist_interval=HIST_INTERVAL_WIDE),
+        dict(name="pi05_yam_stream5_i20_bagging_full", repo_id=BAGGING_REPO_ID, prompt=BAGGING_PROMPT, lora=False,
+             hist_interval=HIST_INTERVAL_WIDE),
+        dict(name="pi05_yam_stream5_i20_firsttry", repo_id=FIRSTTRY_REPO_ID, prompt=BAGGING_PROMPT, lora=True,
+             hist_interval=HIST_INTERVAL_WIDE),
+        dict(name="pi05_yam_stream5_i20_firsttry_full", repo_id=FIRSTTRY_REPO_ID, prompt=BAGGING_PROMPT, lora=False,
+             hist_interval=HIST_INTERVAL_WIDE),
         # Real (not mirrored) native left-arm teleop: wrist camera only, the right arm's state hidden
         # from the model, and the right arm trained to hold still -- it was held in gravity comp, so
         # its recorded drift is not behaviour to imitate.
-        stream_config("pi05_yam_stream5_i20_bagging_left_real", BAGGING_LEFT_REAL_REPO_ID, BAGGING_PROMPT,
-                      lora=True, hist_interval=HIST_INTERVAL_WIDE,
-                      active_image_keys=frozenset({"left_wrist_0_rgb"}),
-                      active_state_dims=LEFT_ARM_DIMS,
-                      held_action_dims=RIGHT_ARM_DIMS),
+        dict(name="pi05_yam_stream5_i20_bagging_left_real", repo_id=BAGGING_LEFT_REAL_REPO_ID,
+             prompt=BAGGING_PROMPT, lora=True, hist_interval=HIST_INTERVAL_WIDE,
+             active_image_keys=frozenset({"left_wrist_0_rgb"}),
+             active_state_dims=LEFT_ARM_DIMS,
+             held_action_dims=RIGHT_ARM_DIMS),
     ]
+
+    def vlash_twin(recipe: dict) -> dict:
+        # The offset covers every lead the deploy loop can ask for at this cadence: it plays
+        # hist_interval rows per call, so a chunk is asked for at most hist_interval - 1 rows ahead.
+        # A single-camera recipe also stops decoding and encoding the cameras it masks.
+        interval = recipe.get("hist_interval", HIST_INTERVAL)
+        return {**recipe, "name": recipe["name"] + "_vlash", "vlash_max_offset": interval - 1,
+                "encode_only_active_cameras": recipe.get("active_image_keys") is not None}
+
+    def vlash_reference_twin(recipe: dict) -> dict:
+        # The `_vlash` twin with the reference's offset range instead of the whole window: deployed at a
+        # fixed lead of at most VLASH_REFERENCE_MAX_OFFSET rows (rollout --vlash-lead).
+        return {**vlash_twin(recipe), "name": recipe["name"] + "_vlash8", "vlash_max_offset": VLASH_REFERENCE_MAX_OFFSET}
+
+    def vlash_packed_twin(recipe: dict) -> dict:
+        # The paper's shared-observation training: every offset 0..max as one branch behind one
+        # observation, the state as adaRMS conditioning instead of prompt text. A different model
+        # (state_cond) and prompt from the _vlash twin, so a different checkpoint and serve config.
+        return {**vlash_twin(recipe), "name": recipe["name"] + "_vlashp",
+                "vlash_branches": recipe.get("hist_interval", HIST_INTERVAL), "state_cond": True}
+
+    return [stream_config(**recipe) for recipe in
+            recipes + [vlash_twin(recipe) for recipe in recipes] + [vlash_reference_twin(recipe) for recipe in recipes]
+            + [vlash_packed_twin(recipe) for recipe in recipes]]

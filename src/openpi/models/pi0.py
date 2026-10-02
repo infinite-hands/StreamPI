@@ -1,3 +1,4 @@
+import dataclasses
 import functools
 import logging
 
@@ -46,6 +47,18 @@ def make_attn_mask(input_mask, mask_ar):
     return jnp.logical_and(attn_mask, valid_mask)
 
 
+def branch_isolation_mask(prefix_len: int, branches: int, branch_len: int) -> jax.Array:
+    """bool[N, N] over a prefix followed by `branches` suffix blocks of `branch_len` tokens: False only
+    where one suffix block would look at another. ANDed onto make_attn_mask's block-causal mask it gives
+    VLASH's shared-observation attention (arXiv 2512.01031, fig. 4): every branch sees the prefix and
+    itself, never a sibling; the prefix never sees a suffix."""
+    total = prefix_len + branches * branch_len
+    branch_of = jnp.concatenate([jnp.full((prefix_len,), -1), jnp.repeat(jnp.arange(branches), branch_len)])
+    suffix = jnp.arange(total) >= prefix_len
+    cross_branch = suffix[:, None] & suffix[None, :] & (branch_of[:, None] != branch_of[None, :])
+    return ~cross_branch
+
+
 @at.typecheck
 def posemb_sincos(
     pos: at.Real[at.Array, " b"], embedding_dim: int, min_period: float, max_period: float
@@ -92,9 +105,20 @@ class Pi0(_model.BaseModel):
         img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
         self.PaliGemma = nnx.Dict(llm=llm, img=img)
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
+        self.state_cond = config.state_cond
+        self.state_cond_dims = config.state_cond_dims
+        self.vlash_branches = config.vlash_branches
         if config.pi05:
             self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
+            if config.state_cond:
+                # Zero-initialised output: at the first step the conditioning is the time MLP's alone, so a
+                # pi0.5 checkpoint without these weights keeps its behaviour until fine-tuning moves them.
+                self.state_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
+                self.state_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
+                self.state_mlp_out = nnx.Linear(
+                    action_expert_config.width, action_expert_config.width, rngs=rngs,
+                    kernel_init=nnx.initializers.zeros_init(), bias_init=nnx.initializers.zeros_init())
         else:
             self.state_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
             self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
@@ -105,6 +129,7 @@ class Pi0(_model.BaseModel):
         self.deterministic = True
 
         self.hist_horizon = config.hist_horizon
+        self.image_keys = tuple(config.image_keys)
 
     @at.typecheck
     def embed_prefix(
@@ -116,7 +141,7 @@ class Pi0(_model.BaseModel):
         # embed images
         all_image_tokens = dict()
 
-        for name in obs.images:
+        for name in self.image_keys:
             image = obs.images[name]
             bs, T = image.shape[0], image.shape[1]
             image = image.reshape(bs*T, image.shape[2], image.shape[3], image.shape[4])
@@ -135,7 +160,7 @@ class Pi0(_model.BaseModel):
         for t in range(T):
             visual_tokens = list()
             visual_input_mask = list()
-            for name in obs.images:
+            for name in self.image_keys:
                 visual_tokens.append(all_image_tokens[name][:, t])
 
                 visual_input_mask.append(einops.repeat(
@@ -202,6 +227,8 @@ class Pi0(_model.BaseModel):
             time_emb = nnx.swish(time_emb)
             action_expert_tokens = action_tokens
             adarms_cond = time_emb
+            if self.state_cond:
+                adarms_cond = adarms_cond + self._state_cond_emb(obs.state)[:, None, :]
         else:
             # mix timestep + action information using an MLP (no adaRMS)
             time_tokens = einops.repeat(time_emb, "b emb -> b s emb", s=self.action_horizon)
@@ -220,12 +247,23 @@ class Pi0(_model.BaseModel):
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask, adarms_cond
 
+    def _state_cond_emb(self, state: at.Float[at.Array, "b s"]) -> at.Float[at.Array, "b emb"]:
+        if self.state_cond_dims is not None:
+            keep = jnp.zeros((state.shape[-1],), dtype=bool).at[jnp.array(self.state_cond_dims)].set(True)
+            state = jnp.where(keep, state, 0.0)
+        emb = self.state_mlp_in(self.state_proj(state))
+        emb = nnx.swish(emb)
+        emb = self.state_mlp_out(emb)
+        return nnx.swish(emb)
+
     @override
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
+        if actions.ndim == 4:
+            return self._compute_loss_branches(rng, observation, actions, train=train)
         preprocess_rng, noise_rng, time_rng, mask_rng = jax.random.split(rng, 4)
-        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+        observation = _model.preprocess_observation(preprocess_rng, observation, train=train, image_keys=self.image_keys)
 
         b, ah, ad = actions.shape
         batch_shape = actions.shape[:-2]
@@ -277,7 +315,55 @@ class Pi0(_model.BaseModel):
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
         return jnp.mean(jnp.square(v_t - u_t), axis=-1)
-    
+
+    def _compute_loss_branches(
+        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: at.Float[at.Array, "b n ah ad"],
+        *, train: bool,
+    ) -> at.Float[at.Array, "b n ah"]:
+        """VLASH's shared-observation loss: one prefix (images + prompt) for `n` (state, action chunk)
+        branches at different temporal offsets. Each branch's action tokens attend to the prefix and to
+        themselves, never to a sibling branch, and every branch's positions restart at the prefix's end,
+        so the pass equals `n` separate samples that share the observation -- encoded once."""
+        if not self.state_cond:
+            raise ValueError("branched samples need state_cond: the prompt carries no per-branch state")
+        preprocess_rng, noise_rng, time_rng, mask_rng = jax.random.split(rng, 4)
+        observation = _model.preprocess_observation(preprocess_rng, observation, train=train, image_keys=self.image_keys)
+
+        b, n, ah, ad = actions.shape
+        noise = jax.random.normal(noise_rng, actions.shape)
+        time = jax.random.beta(time_rng, 1.5, 1, (b, n, 1)) * 0.999 + 0.001
+        time = jnp.broadcast_to(time, (b, n, ah))
+
+        x_t = time[..., None] * noise + (1 - time[..., None]) * actions
+        u_t = noise - actions
+
+        prefix_tokens, prefix_mask, prefix_ar_mask, num_img_tokens, T = self.embed_prefix(observation)
+        flat = dataclasses.replace(observation, state=observation.state.reshape(b * n, -1))
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+            flat, x_t.reshape(b * n, ah, ad), time.reshape(b * n, ah))
+        suffix_len = suffix_tokens.shape[1]
+        suffix_tokens = suffix_tokens.reshape(b, n * suffix_len, -1)
+        suffix_mask = suffix_mask.reshape(b, n * suffix_len)
+        adarms_cond = adarms_cond.reshape(b, n * suffix_len, -1)
+
+        # The same history drop as the plain loss, on the prefix alone.
+        mask_num = jax.random.randint(mask_rng, (), 0, T)
+        prefix_len = prefix_mask.shape[1]
+        prefix_mask = prefix_mask & ~(jnp.arange(prefix_len) < mask_num * num_img_tokens)[None, :]
+
+        input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
+        ar_mask = jnp.concatenate([prefix_ar_mask, jnp.tile(suffix_ar_mask, n)], axis=0)
+        attn_mask = make_attn_mask(input_mask, ar_mask) & branch_isolation_mask(prefix_len, n, suffix_len)[None]
+        prefix_positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        suffix_positions = jnp.sum(prefix_mask, axis=1)[:, None] + jnp.tile(jnp.arange(suffix_len), n)[None, :]
+        positions = jnp.concatenate([prefix_positions, suffix_positions], axis=1)
+
+        (_prefix_out, suffix_out), _ = self.PaliGemma.llm(
+            [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
+        )
+        v_t = self.action_out_proj(suffix_out).reshape(b, n, suffix_len, ad)[:, :, -ah:]
+        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+
     @at.typecheck
     def embed_prefix_infer(
         self, obs: _model.Observation, memory_tokens
@@ -288,7 +374,7 @@ class Pi0(_model.BaseModel):
         # embed images
         all_image_tokens = dict()
 
-        for name in obs.images:
+        for name in self.image_keys:
             image = obs.images[name]
             bs, T = image.shape[0], image.shape[1]
             image = image.reshape(bs*T, image.shape[2], image.shape[3], image.shape[4])
@@ -307,7 +393,7 @@ class Pi0(_model.BaseModel):
         for t in range(T):
             visual_tokens = list()
             visual_input_mask = list()
-            for name in obs.images:
+            for name in self.image_keys:
                 visual_tokens.append(all_image_tokens[name][:, t])
 
                 visual_input_mask.append(einops.repeat(
@@ -374,7 +460,7 @@ class Pi0(_model.BaseModel):
         step: at.Int[at.Array, ""] = None,
         memory: dict = None
     ) -> _model.Actions:
-        observation = _model.preprocess_observation(None, observation, train=False)
+        observation = _model.preprocess_observation(None, observation, train=False, image_keys=self.image_keys)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
         dt = -1.0 / num_steps

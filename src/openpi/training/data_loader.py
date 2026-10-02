@@ -20,6 +20,9 @@ import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
 
+# The LeRobot state column every config's repack reads; TemporalOffset shifts it in place.
+VLASH_STATE_KEY = "observation.state"
+
 
 class Dataset(Protocol[T_co]):
     """Interface for a dataset with random access."""
@@ -129,6 +132,22 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+class _DecodeSomeCamerasDataset(lerobot_dataset.LeRobotDataset):
+    """A LeRobotDataset that decodes only `video_keys`; the other video columns are left out of the
+    sample (the repack must not ask for them)."""
+
+    def __init__(self, video_keys: set[str], *args, **kwargs) -> None:
+        self._decode_video_keys = set(video_keys)
+        super().__init__(*args, **kwargs)
+        unknown = self._decode_video_keys - set(self.meta.video_keys)
+        if unknown:
+            raise ValueError(f"not video columns of {self.repo_id}: {sorted(unknown)}")
+
+    def _query_videos(self, query_timestamps: dict[str, list[float]], ep_idx: int) -> dict:
+        wanted = {key: ts for key, ts in query_timestamps.items() if key in self._decode_video_keys}
+        return super()._query_videos(wanted, ep_idx)
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -141,9 +160,13 @@ def create_torch_dataset(
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
 
+    # TemporalOffset slices the window it needs out of these extra rows.
+    fetched_actions = action_horizon + data_config.vlash_max_offset
     delta_timestamps = {
-        key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+        key: [t / dataset_meta.fps for t in range(fetched_actions)] for key in data_config.action_sequence_keys
     }
+    if data_config.vlash_max_offset > 0 and data_config.vlash_state_source == "state":
+        delta_timestamps[VLASH_STATE_KEY] = [t / dataset_meta.fps for t in range(data_config.vlash_max_offset + 1)]
 
     hist_interval = data_config.hist_interval
     hist_horizon = data_config.hist_horizon
@@ -162,15 +185,25 @@ def create_torch_dataset(
 
     delta_timestamps.update(hist_delta_timestamps)
 
-    dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
-        delta_timestamps=delta_timestamps,
-    )
+    if data_config.decode_only_hist_cameras:
+        dataset = _DecodeSomeCamerasDataset(set(data_config.hist_sequence_keys), data_config.repo_id,
+                                            delta_timestamps=delta_timestamps)
+    else:
+        dataset = lerobot_dataset.LeRobotDataset(data_config.repo_id, delta_timestamps=delta_timestamps)
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 
     dataset = TransformedDataset(dataset, [_transforms.TemporalJitter(jitter_range, hist_interval, hist_horizon, data_config.hist_sequence_keys, enable_jitter)])
+
+    if data_config.vlash_max_offset > 0 or data_config.vlash_branches:
+        if data_config.vlash_branches != getattr(model_config, "vlash_branches", 0):
+            raise ValueError(f"DataConfig.vlash_branches ({data_config.vlash_branches}) must match the model's "
+                             f"vlash_branches ({getattr(model_config, 'vlash_branches', 0)})")
+        dataset = TransformedDataset(dataset, [_transforms.TemporalOffset(
+            data_config.vlash_max_offset, action_horizon, data_config.action_sequence_keys,
+            state_key=VLASH_STATE_KEY, state_source=data_config.vlash_state_source,
+            branches=data_config.vlash_branches)])
 
     return dataset
 

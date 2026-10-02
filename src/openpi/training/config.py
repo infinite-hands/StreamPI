@@ -96,6 +96,20 @@ class DataConfig:
     jitter_range: tuple = (-2, -1, 0, 1, 2)
     enable_jitter: bool = False
 
+    # VLASH temporal-offset augmentation (transforms.TemporalOffset): how many frames ahead of the
+    # images the state and action window may be moved, 0 for none. A checkpoint trained at N lets the
+    # deploy loop ask for a chunk up to N rows ahead of the state it sends.
+    vlash_max_offset: int = 0
+    # Where the shifted state comes from: the previous commanded action ("action") or the recorded
+    # state ("state").
+    vlash_state_source: Literal["action", "state"] = "action"
+    # The paper's shared-observation training: this many offsets per sample behind one observation
+    # (0: one offset per sample). Must match the model's Pi0Config.vlash_branches.
+    vlash_branches: int = 0
+    # Decode only the video columns in hist_sequence_keys. A recipe that masks a camera still pays
+    # its decode otherwise: LeRobot decodes every video column for every sample.
+    decode_only_hist_cameras: bool = False
+
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
@@ -147,7 +161,8 @@ class ModelTransformFactory(GroupFactory):
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                             discrete_state_input=model_config.discrete_state_input,
-                            active_state_dims=self.active_state_dims,
+                            active_state_dims=self.active_state_dims if model_config.discrete_state_input else None,
+                            task_only=model_config.state_cond,
                         ),
                         _transforms.PadStatesAndActions(model_config.action_dim),
                     ],
