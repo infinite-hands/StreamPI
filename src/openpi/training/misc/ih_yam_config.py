@@ -92,6 +92,7 @@ def get_ih_yam_configs():
                       active_state_dims: tuple[int, ...] | None = None,
                       held_action_dims: tuple[int, ...] | None = None,
                       vlash_max_offset: int = 0, vlash_branches: int = 0, state_cond: bool = False,
+                      vlash_state_source: str = "action",
                       encode_only_active_cameras: bool = False):
         # A masked camera's tokens are padding, so a recipe may skip decoding and encoding them: the same
         # model, one SigLIP pass per frame instead of three and a third of the prefix. Opt-in per config
@@ -131,6 +132,7 @@ def get_ih_yam_configs():
                     enable_jitter=True,
                     vlash_max_offset=vlash_max_offset,
                     vlash_branches=vlash_branches,
+                    vlash_state_source=vlash_state_source,
                     decode_only_hist_cameras=encode_only_active_cameras,
                 ),
             ),
@@ -191,6 +193,13 @@ def get_ih_yam_configs():
         # fixed lead of at most VLASH_REFERENCE_MAX_OFFSET rows (rollout --vlash-lead).
         return {**vlash_twin(recipe), "name": recipe["name"] + "_vlash8", "vlash_max_offset": VLASH_REFERENCE_MAX_OFFSET}
 
+    def vlash_measured_twin(recipe: dict) -> dict:
+        # The `_vlash8` twin with the MEASURED state at t + delta instead of the previous command: the
+        # command is the next target one row early, a shortcut that let the left-real fine-tunes follow
+        # the wrist image a third to a half as much as run3 offline; the measured pose lags it by ~3-4 rows
+        # and carries the gripper's real opening (a part in hand reads ~0.23, the command 0).
+        return {**vlash_reference_twin(recipe), "name": recipe["name"] + "_vlash8m", "vlash_state_source": "state"}
+
     def vlash_packed_twin(recipe: dict) -> dict:
         # The paper's shared-observation training: every offset 0..max as one branch behind one
         # observation, the state as adaRMS conditioning instead of prompt text. A different model
@@ -200,4 +209,4 @@ def get_ih_yam_configs():
 
     return [stream_config(**recipe) for recipe in
             recipes + [vlash_twin(recipe) for recipe in recipes] + [vlash_reference_twin(recipe) for recipe in recipes]
-            + [vlash_packed_twin(recipe) for recipe in recipes]]
+            + [vlash_measured_twin(recipe) for recipe in recipes] + [vlash_packed_twin(recipe) for recipe in recipes]]
