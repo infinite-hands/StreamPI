@@ -125,6 +125,7 @@ def test_packed_model_serves_one_state():
                                                                           "memory_kv_cache": None,
                                                                           "memory_prefix_mask": None})
     assert sampled.shape == (1, HORIZON, ACTION_DIM) and bool(jnp.isfinite(sampled).all())
-    branched = _observation(1, branches=9)
-    actions = jnp.zeros((1, 9, HORIZON, ACTION_DIM), dtype=jnp.float32)
-    assert packed.compute_loss(key, branched, actions).shape == (1, 9, HORIZON)
+    # Batch 2, not 1: a size-1 batch broadcasts against batch x branches and hid a shape bug in training.
+    branched = _observation(2, branches=9)
+    actions = jnp.zeros((2, 9, HORIZON, ACTION_DIM), dtype=jnp.float32)
+    assert packed.compute_loss(key, branched, actions).shape == (2, 9, HORIZON)
