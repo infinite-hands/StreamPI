@@ -41,6 +41,11 @@ HIST_INTERVAL = 10
 # token count and KV-cache size -- so fsdp_devices and batch_size below are unchanged.
 HIST_INTERVAL_WIDE = 20
 ACTION_HORIZON = 30
+# The reference implementation's offset range (mit-han-lab/vlash, examples/train/*/async*.yaml:
+# max_delay_steps: 8), for a deployment that fixes its lead at this many rows or fewer. The full-window
+# range (hist_interval - 1) made the previous command so close to the next target that the left-real
+# fine-tune followed the wrist image about a third as much as its non-vlash twin did, offline.
+VLASH_REFERENCE_MAX_OFFSET = 8
 # The YAM LeRobot layout: three cameras, 14-dim state/action [L j0..5, L grip, R j0..5, R grip].
 YAM_CAMERAS = ("cam_high", "cam_left_wrist", "cam_right_wrist")
 
@@ -90,6 +95,7 @@ def get_ih_yam_configs():
                       active_state_dims: tuple[int, ...] | None = None,
                       held_action_dims: tuple[int, ...] | None = None,
                       vlash_max_offset: int = 0, vlash_branches: int = 0, state_cond: bool = False,
+                      vlash_state_source: str = "action",
                       encode_only_active_cameras: bool = False):
         # A masked camera's tokens are padding, so a recipe may skip decoding and encoding them: the same
         # model, one SigLIP pass per frame instead of three and a third of the prefix. Opt-in per config
@@ -129,6 +135,7 @@ def get_ih_yam_configs():
                     enable_jitter=True,
                     vlash_max_offset=vlash_max_offset,
                     vlash_branches=vlash_branches,
+                    vlash_state_source=vlash_state_source,
                     decode_only_hist_cameras=encode_only_active_cameras,
                 ),
             ),
@@ -192,6 +199,18 @@ def get_ih_yam_configs():
         return {**recipe, "name": recipe["name"] + "_vlash", "vlash_max_offset": interval - 1,
                 "encode_only_active_cameras": recipe.get("active_image_keys") is not None}
 
+    def vlash_reference_twin(recipe: dict) -> dict:
+        # The `_vlash` twin with the reference's offset range instead of the whole window: deployed at a
+        # fixed lead of at most VLASH_REFERENCE_MAX_OFFSET rows (rollout --vlash-lead).
+        return {**vlash_twin(recipe), "name": recipe["name"] + "_vlash8", "vlash_max_offset": VLASH_REFERENCE_MAX_OFFSET}
+
+    def vlash_measured_twin(recipe: dict) -> dict:
+        # The `_vlash8` twin with the MEASURED state at t + delta instead of the previous command: the
+        # command is the next target one row early, a shortcut that let the left-real fine-tunes follow
+        # the wrist image a third to a half as much as run3 offline; the measured pose lags it by ~3-4 rows
+        # and carries the gripper's real opening (a part in hand reads ~0.23, the command 0).
+        return {**vlash_reference_twin(recipe), "name": recipe["name"] + "_vlash8m", "vlash_state_source": "state"}
+
     def vlash_packed_twin(recipe: dict) -> dict:
         # The paper's shared-observation training: every offset 0..max as one branch behind one
         # observation, the state as adaRMS conditioning instead of prompt text. A different model
@@ -200,4 +219,5 @@ def get_ih_yam_configs():
                 "vlash_branches": recipe.get("hist_interval", HIST_INTERVAL), "state_cond": True}
 
     return [stream_config(**recipe) for recipe in
-            recipes + [vlash_twin(recipe) for recipe in recipes] + [vlash_packed_twin(recipe) for recipe in recipes]]
+            recipes + [vlash_twin(recipe) for recipe in recipes] + [vlash_reference_twin(recipe) for recipe in recipes]
+            + [vlash_measured_twin(recipe) for recipe in recipes] + [vlash_packed_twin(recipe) for recipe in recipes]]
