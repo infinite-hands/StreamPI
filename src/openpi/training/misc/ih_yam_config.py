@@ -200,6 +200,13 @@ def get_ih_yam_configs():
         # and carries the gripper's real opening (a part in hand reads ~0.23, the command 0).
         return {**vlash_reference_twin(recipe), "name": recipe["name"] + "_vlash8m", "vlash_state_source": "state"}
 
+    def vlash_packed_measured_twin(recipe: dict) -> dict:
+        # The `_vlash8m` twin trained the paper's shared-observation way: every offset 0..8 as a branch behind
+        # one observation, the measured state as adaRMS conditioning instead of prompt text (the reference's
+        # pi0.5 layout, state_cond). Serves one state per call like any other config.
+        return {**vlash_measured_twin(recipe), "name": recipe["name"] + "_vlash8mp",
+                "vlash_branches": VLASH_REFERENCE_MAX_OFFSET + 1, "state_cond": True}
+
     def vlash_packed_twin(recipe: dict) -> dict:
         # The paper's shared-observation training: every offset 0..max as one branch behind one
         # observation, the state as adaRMS conditioning instead of prompt text. A different model
@@ -209,4 +216,5 @@ def get_ih_yam_configs():
 
     return [stream_config(**recipe) for recipe in
             recipes + [vlash_twin(recipe) for recipe in recipes] + [vlash_reference_twin(recipe) for recipe in recipes]
-            + [vlash_measured_twin(recipe) for recipe in recipes] + [vlash_packed_twin(recipe) for recipe in recipes]]
+            + [vlash_measured_twin(recipe) for recipe in recipes] + [vlash_packed_measured_twin(recipe) for recipe in recipes]
+            + [vlash_packed_twin(recipe) for recipe in recipes]]
