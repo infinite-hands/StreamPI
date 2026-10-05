@@ -114,3 +114,17 @@ def test_branched_loss_isolates_branches():
                                                                                          "memory_kv_cache": None,
                                                                                          "memory_prefix_mask": None})
     assert sampled.shape == (1, HORIZON, ACTION_DIM)
+
+
+def test_packed_model_serves_one_state():
+    """A model trained with branches serves one state per call: the branch count shapes training only."""
+    key = jax.random.key(0)
+    packed = _config(state_cond=True, vlash_branches=9, state_cond_dims=tuple(range(7))).create(key)
+    obs = _observation(1)
+    sampled, _memory = packed.sample_actions(key, obs, num_steps=2, memory={"memory_tokens": None,
+                                                                          "memory_kv_cache": None,
+                                                                          "memory_prefix_mask": None})
+    assert sampled.shape == (1, HORIZON, ACTION_DIM) and bool(jnp.isfinite(sampled).all())
+    branched = _observation(1, branches=9)
+    actions = jnp.zeros((1, 9, HORIZON, ACTION_DIM), dtype=jnp.float32)
+    assert packed.compute_loss(key, branched, actions).shape == (1, 9, HORIZON)

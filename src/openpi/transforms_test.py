@@ -198,3 +198,13 @@ def test_agilex_inputs_without_the_base_camera():
     assert set(out["image"]) == set(agilex_policy.AgilexInputs.IMAGE_KEY_BY_CAMERA.values())
     assert out["image_mask"]["left_wrist_0_rgb"] and not out["image_mask"]["base_0_rgb"] and not out["image_mask"]["right_wrist_0_rgb"]
     assert out["image"]["base_0_rgb"].shape == out["image"]["left_wrist_0_rgb"].shape and not out["image"]["base_0_rgb"].any()
+
+
+def test_temporal_offset_branches_from_recorded_state(monkeypatch):
+    monkeypatch.setattr(_transforms.random, "sample", lambda population, k: list(population)[:k])
+    item = _offset_item()
+    item["observation.state"] = np.arange(4, dtype=np.float32)[:, None] * np.ones(3, dtype=np.float32) * 10
+    item = _transforms.TemporalOffset(3, 4, ("action",), state_source="state", branches=4)(item)
+    assert item["action"].shape == (4, 4, 3) and item["observation.state"].shape == (4, 3)
+    assert np.all(item["observation.state"][:, 0] == np.array([0.0, 10.0, 20.0, 30.0])), "each branch: s[t + delta]"
+    assert np.all(item["action"][:, 0, 0] == np.array([0, 1, 2, 3]))
