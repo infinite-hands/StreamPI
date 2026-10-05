@@ -340,9 +340,12 @@ class Pi0(_model.BaseModel):
         u_t = noise - actions
 
         prefix_tokens, prefix_mask, prefix_ar_mask, num_img_tokens, T = self.embed_prefix(observation)
-        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-            observation, x_t.reshape(b * n, ah, ad), time.reshape(b * n, ah),
-            state=observation.state.reshape(b * n, -1))
+        # Unchecked on purpose: embed_suffix's annotations tie its batch to the observation's, and this call
+        # embeds batch x branches rows of actions and states against one observation per sample.
+        with at.disable_typechecking():
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+                observation, x_t.reshape(b * n, ah, ad), time.reshape(b * n, ah),
+                state=observation.state.reshape(b * n, -1))
         suffix_len = suffix_tokens.shape[1]
         suffix_tokens = suffix_tokens.reshape(b, n * suffix_len, -1)
         suffix_mask = suffix_mask.reshape(b, n * suffix_len)
