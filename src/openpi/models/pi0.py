@@ -1,4 +1,3 @@
-import dataclasses
 import functools
 import logging
 
@@ -194,7 +193,8 @@ class Pi0(_model.BaseModel):
 
     @at.typecheck
     def embed_suffix(
-        self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b ah"]
+        self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b ah"],
+        state: at.Float[at.Array, "b s"] | None = None,
     ) -> tuple[
         at.Float[at.Array, "b s emb"],
         at.Bool[at.Array, "b s"],
@@ -228,7 +228,9 @@ class Pi0(_model.BaseModel):
             action_expert_tokens = action_tokens
             adarms_cond = time_emb
             if self.state_cond:
-                adarms_cond = adarms_cond + self._state_cond_emb(obs.state)[:, None, :]
+                # `state` overrides obs.state for the branched loss, whose rows are batch x branches
+                # while the observation's images stay one per sample.
+                adarms_cond = adarms_cond + self._state_cond_emb(obs.state if state is None else state)[:, None, :]
         else:
             # mix timestep + action information using an MLP (no adaRMS)
             time_tokens = einops.repeat(time_emb, "b emb -> b s emb", s=self.action_horizon)
@@ -338,9 +340,9 @@ class Pi0(_model.BaseModel):
         u_t = noise - actions
 
         prefix_tokens, prefix_mask, prefix_ar_mask, num_img_tokens, T = self.embed_prefix(observation)
-        flat = dataclasses.replace(observation, state=observation.state.reshape(b * n, -1))
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-            flat, x_t.reshape(b * n, ah, ad), time.reshape(b * n, ah))
+            observation, x_t.reshape(b * n, ah, ad), time.reshape(b * n, ah),
+            state=observation.state.reshape(b * n, -1))
         suffix_len = suffix_tokens.shape[1]
         suffix_tokens = suffix_tokens.reshape(b, n * suffix_len, -1)
         suffix_mask = suffix_mask.reshape(b, n * suffix_len)
