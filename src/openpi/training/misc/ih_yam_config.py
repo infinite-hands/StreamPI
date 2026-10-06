@@ -21,6 +21,7 @@ BAGGING_LEFT_REAL_REPO_ID = "local/yam_bagging_left_real_20260924"
 # was held, except in four takes where a left policy ran beside the teleop.
 BAGGING_RIGHT_REAL_REPO_ID = "local/yam_bagging_right_real_20261002"
 BAGGING_PROMPT = "place one part in the bag"
+STATE_DIM = 14                      # [L j0..5, L grip, R j0..5, R grip]
 LEFT_ARM_DIMS = tuple(range(7))    # [L j0..5, L grip]
 RIGHT_ARM_DIMS = tuple(range(7, 14))  # [R j0..5, R grip]
 # T = 5 frames of temporal context, the setting behind every real-robot result in the paper.
@@ -50,7 +51,8 @@ VLASH_REFERENCE_MAX_OFFSET = 8
 YAM_CAMERAS = ("cam_high", "cam_left_wrist", "cam_right_wrist")
 
 
-def yam_repack(cameras: tuple[str, ...] = YAM_CAMERAS) -> _transforms.Group:
+def yam_repack(cameras: tuple[str, ...] = YAM_CAMERAS, *, vlash_cond_now: bool = False) -> _transforms.Group:
+    extras = {key: key for key in (_transforms.NOW_STATE_KEY, _transforms.DELTA_KEY)} if vlash_cond_now else {}
     return _transforms.Group(
         inputs=[
             _transforms.RepackTransform(
@@ -58,6 +60,7 @@ def yam_repack(cameras: tuple[str, ...] = YAM_CAMERAS) -> _transforms.Group:
                     "images": {camera: f"observation.images.{camera}" for camera in cameras},
                     "state": "observation.state",
                     "actions": "action",
+                    **extras,
                 }
             )
         ]
@@ -65,6 +68,12 @@ def yam_repack(cameras: tuple[str, ...] = YAM_CAMERAS) -> _transforms.Group:
 
 
 YAM_REPACK = yam_repack()
+
+
+def vlash_cond_dims(active_state_dims: tuple[int, ...]) -> tuple[int, ...]:
+    """The conditioning dims of [state at t + delta (14), state at t (14), delta (1)] a one-arm recipe keeps:
+    its arm in both states, and the offset."""
+    return (*active_state_dims, *(STATE_DIM + d for d in active_state_dims), 2 * STATE_DIM)
 
 
 def get_ih_yam_configs():
@@ -81,8 +90,19 @@ def get_ih_yam_configs():
 
         @override
         def create(self, assets_dirs, model_config):
+            created = super().create(assets_dirs, model_config)
+            if created.vlash_cond_now:
+                # The state at the image's frame is a state: normalized with the state's own statistics.
+                # Saved with the checkpoint's norm stats, so the server normalizes it the same way.
+                norm_stats = (None if created.norm_stats is None
+                              else {**created.norm_stats, _transforms.NOW_STATE_KEY: created.norm_stats["state"]})
+                created = dataclasses.replace(
+                    created, norm_stats=norm_stats,
+                    model_transforms=_transforms.Group(
+                        inputs=[_transforms.ConcatVlashCond(), *created.model_transforms.inputs],
+                        outputs=created.model_transforms.outputs))
             return dataclasses.replace(
-                super().create(assets_dirs, model_config),
+                created,
                 # pi0.5's own default (the AgileX base config forces z-score). The YAM left gripper never
                 # moves in the corpus, so its std is ~1e-3 and z-scoring turns its noise into a loss of
                 # tens of thousands; the quantile band is floored by the stats writer instead.
@@ -95,7 +115,8 @@ def get_ih_yam_configs():
                       active_state_dims: tuple[int, ...] | None = None,
                       held_action_dims: tuple[int, ...] | None = None,
                       vlash_max_offset: int = 0, vlash_branches: int = 0, state_cond: bool = False,
-                      vlash_state_source: str = "action",
+                      vlash_state_source: str = "action", vlash_cond_now: bool = False,
+                      num_train_steps: int = 20_000,
                       encode_only_active_cameras: bool = False):
         # A masked camera's tokens are padding, so a recipe may skip decoding and encoding them: the same
         # model, one SigLIP pass per frame instead of three and a third of the prefix. Opt-in per config
@@ -113,7 +134,8 @@ def get_ih_yam_configs():
             action_expert_variant="gemma_300m_lora" if lora else "gemma_300m",
             # With the state out of the prompt, the single-arm recipe's state mask moves to the conditioning.
             state_cond=state_cond,
-            state_cond_dims=active_state_dims if state_cond else None,
+            state_cond_dims=(None if not state_cond or active_state_dims is None else
+                             vlash_cond_dims(active_state_dims) if vlash_cond_now else active_state_dims),
             vlash_branches=vlash_branches,
             image_keys=image_keys,
         )
@@ -126,7 +148,7 @@ def get_ih_yam_configs():
                 active_image_keys=active_image_keys,
                 active_state_dims=active_state_dims,
                 held_action_dims=held_action_dims,
-                repack_transforms=yam_repack(kept_cameras),
+                repack_transforms=yam_repack(kept_cameras, vlash_cond_now=vlash_cond_now),
                 hist_sequence_keys=tuple(f"observation.images.{camera}" for camera in kept_cameras),
                 base_config=DataConfig(
                     prompt_from_task=False,
@@ -136,6 +158,7 @@ def get_ih_yam_configs():
                     vlash_max_offset=vlash_max_offset,
                     vlash_branches=vlash_branches,
                     vlash_state_source=vlash_state_source,
+                    vlash_cond_now=vlash_cond_now,
                     decode_only_hist_cameras=encode_only_active_cameras,
                 ),
             ),
@@ -151,8 +174,9 @@ def get_ih_yam_configs():
             # loader fed ~54 frames/s and the trainer waited on it (8.95 s/step, 5-17 s swings). The
             # compute profile pins 32 CPUs; leave a few for the main process and JAX.
             num_workers=24,
-            num_train_steps=20_000,
-            lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=20_000),
+            num_train_steps=num_train_steps,
+            # Annealed over the run's own length: a shorter run that kept the 20k schedule stopped at near-peak LR.
+            lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=num_train_steps),
             save_interval=1_000,
             keep_period=5_000,
             freeze_filter=model.get_freeze_filter(),
@@ -218,6 +242,13 @@ def get_ih_yam_configs():
         return {**vlash_measured_twin(recipe), "name": recipe["name"] + "_vlash8mp",
                 "vlash_branches": VLASH_REFERENCE_MAX_OFFSET + 1, "state_cond": True}
 
+    def vlash_conditioned_twin(recipe: dict) -> dict:
+        # `_vlash8mp` that also conditions on the measured state at the image's frame (where the wrist camera
+        # was when it saw the part) and on the offset (how far the state runs ahead of the image), trained
+        # 10k steps with the learning rate annealed to its floor over them.
+        return {**vlash_packed_measured_twin(recipe), "name": recipe["name"] + "_vlash8mpc",
+                "vlash_cond_now": True, "num_train_steps": 10_000}
+
     def vlash_packed_twin(recipe: dict) -> dict:
         # The paper's shared-observation training: every offset 0..max as one branch behind one
         # observation, the state as adaRMS conditioning instead of prompt text. A different model
@@ -228,4 +259,5 @@ def get_ih_yam_configs():
     return [stream_config(**recipe) for recipe in
             recipes + [vlash_twin(recipe) for recipe in recipes] + [vlash_reference_twin(recipe) for recipe in recipes]
             + [vlash_measured_twin(recipe) for recipe in recipes] + [vlash_packed_measured_twin(recipe) for recipe in recipes]
+            + [vlash_conditioned_twin(recipe) for recipe in recipes]
             + [vlash_packed_twin(recipe) for recipe in recipes]]

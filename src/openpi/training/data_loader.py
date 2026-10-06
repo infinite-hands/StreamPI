@@ -203,7 +203,7 @@ def create_torch_dataset(
         dataset = TransformedDataset(dataset, [_transforms.TemporalOffset(
             data_config.vlash_max_offset, action_horizon, data_config.action_sequence_keys,
             state_key=VLASH_STATE_KEY, state_source=data_config.vlash_state_source,
-            branches=data_config.vlash_branches)])
+            branches=data_config.vlash_branches, cond_now=data_config.vlash_cond_now)])
 
     return dataset
 

@@ -306,6 +306,11 @@ class AgilexInputs(transforms.DataTransformFn):
         if "delay" in data:
             inputs["delay"] = data["delay"]
 
+        # The vlash conditioning extras (transforms.TemporalOffset cond_now; ConcatVlashCond joins them later).
+        for key in ("state_now", "vlash_delta"):
+            if key in data:
+                inputs[key] = np.asarray(data[key])
+
         if "action_prefix" in data:
             inputs["action_prefix"] = data["action_prefix"]
 

@@ -219,6 +219,26 @@ class TemporalJitter(DataTransformFn):
         return data
 
 
+NOW_STATE_KEY = "state_now"   # the measured state at the image's frame, beside the state at t + delta
+DELTA_KEY = "vlash_delta"     # delta / max_offset: how far the state runs ahead of the image
+
+
+@dataclasses.dataclass(frozen=True)
+class ConcatVlashCond(DataTransformFn):
+    """Join NOW_STATE_KEY and DELTA_KEY to the (normalized) state: [state at t+delta, state at t, delta],
+    the input of a state_cond model's conditioning MLP. Runs after Normalize and before the state is padded
+    to the model's width. A request without them is the offset-0 case -- the state is now, delta 0 -- which
+    is exactly what a plain (non-vlash) call is."""
+
+    def __call__(self, data: DataDict) -> DataDict:
+        state = np.asarray(data["state"], dtype=np.float32)
+        now = np.asarray(data.pop(NOW_STATE_KEY, state), dtype=np.float32)
+        delta = np.asarray(data.pop(DELTA_KEY, np.zeros(state.shape[:-1], dtype=np.float32)), dtype=np.float32)
+        delta = delta.reshape(state.shape[:-1] + (1,))   # one per sample, or one per branch
+        data["state"] = np.concatenate([state, np.broadcast_to(now, state.shape), delta], axis=-1)
+        return data
+
+
 @dataclasses.dataclass(frozen=True)
 class TemporalOffset(DataTransformFn):
     """VLASH's temporal-offset augmentation (arXiv 2512.01031): the images stay at frame t while the
@@ -233,7 +253,12 @@ class TemporalOffset(DataTransformFn):
 
     With `branches` > 0 (the paper's shared-observation training) the sample keeps the one observation
     and carries that many distinct offsets at once: the state becomes (branches, D) and each action key
-    (branches, action_horizon, A), in ascending offset order."""
+    (branches, action_horizon, A), in ascending offset order.
+
+    With `cond_now` the sample also carries what the state at t+delta alone leaves out: NOW_STATE_KEY, the
+    measured state at frame t (where the arm -- and a wrist camera -- was when the image was taken), and
+    DELTA_KEY, delta / max_offset (how far the state runs ahead of the image). ConcatVlashCond joins them to
+    the state for the adaRMS conditioning."""
 
     max_offset: int
     action_horizon: int
@@ -241,6 +266,7 @@ class TemporalOffset(DataTransformFn):
     state_key: str = "observation.state"
     state_source: str = "action"
     branches: int = 0
+    cond_now: bool = False
 
     def __post_init__(self):
         if self.max_offset < 0:
@@ -265,17 +291,24 @@ class TemporalOffset(DataTransformFn):
             raise ValueError(f"{self.state_key} has {states.shape[0]} rows; TemporalOffset needs "
                              f"{self.max_offset + 1} for state_source 'state'")
         first_actions = data[self.action_keys[0]]
+        now = np.asarray(states[0] if self.state_source == "state" else states)
         if self.branches:
             deltas = sorted(random.sample(range(self.max_offset + 1), self.branches))
             data[self.state_key] = np.stack([self._state_at(delta, states, first_actions) for delta in deltas])
             for key in self.action_keys:
                 rows = data[key]
                 data[key] = np.stack([rows[delta:delta + self.action_horizon] for delta in deltas])
+            if self.cond_now:
+                data[NOW_STATE_KEY] = np.stack([now] * len(deltas))
+                data[DELTA_KEY] = np.asarray(deltas, dtype=np.float32) / max(self.max_offset, 1)
             return data
         delta = random.randint(0, self.max_offset)
         data[self.state_key] = self._state_at(delta, states, first_actions)
         for key in self.action_keys:
             data[key] = data[key][delta:delta + self.action_horizon]
+        if self.cond_now:
+            data[NOW_STATE_KEY] = now
+            data[DELTA_KEY] = np.float32(delta / max(self.max_offset, 1))
         return data
 
     def _state_at(self, delta: int, states, actions):
