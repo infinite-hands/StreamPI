@@ -219,6 +219,104 @@ class TemporalJitter(DataTransformFn):
         return data
 
 
+NOW_STATE_KEY = "state_now"   # the measured state at the image's frame, beside the state at t + delta
+DELTA_KEY = "vlash_delta"     # delta / max_offset: how far the state runs ahead of the image
+
+
+@dataclasses.dataclass(frozen=True)
+class ConcatVlashCond(DataTransformFn):
+    """Join NOW_STATE_KEY and DELTA_KEY to the (normalized) state: [state at t+delta, state at t, delta],
+    the input of a state_cond model's conditioning MLP. Runs after Normalize and before the state is padded
+    to the model's width. A request without them is the offset-0 case -- the state is now, delta 0 -- which
+    is exactly what a plain (non-vlash) call is."""
+
+    def __call__(self, data: DataDict) -> DataDict:
+        state = np.asarray(data["state"], dtype=np.float32)
+        now = np.asarray(data.pop(NOW_STATE_KEY, state), dtype=np.float32)
+        delta = np.asarray(data.pop(DELTA_KEY, np.zeros(state.shape[:-1], dtype=np.float32)), dtype=np.float32)
+        delta = delta.reshape(state.shape[:-1] + (1,))   # one per sample, or one per branch
+        data["state"] = np.concatenate([state, np.broadcast_to(now, state.shape), delta], axis=-1)
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class TemporalOffset(DataTransformFn):
+    """VLASH's temporal-offset augmentation (arXiv 2512.01031): the images stay at frame t while the
+    state and the action window move `delta` frames ahead, `delta` drawn uniformly from 0..max_offset
+    per sample. The deploy loop can then send the state the arm will be at when the chunk starts.
+
+    The dataset must have fetched action_horizon + max_offset action rows. The state at t+delta is
+    the previous commanded action a[t+delta-1] (state_source "action": the reference
+    implementation's proxy, and the one thing the deploy loop knows ahead of time) or the recorded
+    state s[t+delta] (state_source "state", which needs max_offset + 1 fetched state rows). Runs
+    before repack so DeltaActions is relative to the shifted state. A no-op at max_offset 0.
+
+    With `branches` > 0 (the paper's shared-observation training) the sample keeps the one observation
+    and carries that many distinct offsets at once: the state becomes (branches, D) and each action key
+    (branches, action_horizon, A), in ascending offset order.
+
+    With `cond_now` the sample also carries what the state at t+delta alone leaves out: NOW_STATE_KEY, the
+    measured state at frame t (where the arm -- and a wrist camera -- was when the image was taken), and
+    DELTA_KEY, delta / max_offset (how far the state runs ahead of the image). ConcatVlashCond joins them to
+    the state for the adaRMS conditioning."""
+
+    max_offset: int
+    action_horizon: int
+    action_keys: Sequence[str]
+    state_key: str = "observation.state"
+    state_source: str = "action"
+    branches: int = 0
+    cond_now: bool = False
+
+    def __post_init__(self):
+        if self.max_offset < 0:
+            raise ValueError(f"max_offset must be >= 0, got {self.max_offset}")
+        if self.state_source not in ("action", "state"):
+            raise ValueError(f"state_source must be 'action' or 'state', got {self.state_source!r}")
+        if not self.action_keys:
+            raise ValueError("TemporalOffset needs at least one action key")
+        if self.branches < 0 or self.branches > self.max_offset + 1:
+            raise ValueError(f"branches must be 0..{self.max_offset + 1} (one per distinct offset), got {self.branches}")
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if self.max_offset == 0 and not self.branches:
+            return data
+        needed = self.action_horizon + self.max_offset
+        for key in self.action_keys:
+            if data[key].shape[0] < needed:
+                raise ValueError(f"{key} has {data[key].shape[0]} rows; TemporalOffset needs {needed} "
+                                 f"(action_horizon {self.action_horizon} + max_offset {self.max_offset})")
+        states = data[self.state_key]
+        if self.state_source == "state" and states.shape[0] < self.max_offset + 1:
+            raise ValueError(f"{self.state_key} has {states.shape[0]} rows; TemporalOffset needs "
+                             f"{self.max_offset + 1} for state_source 'state'")
+        first_actions = data[self.action_keys[0]]
+        now = np.asarray(states[0] if self.state_source == "state" else states)
+        if self.branches:
+            deltas = sorted(random.sample(range(self.max_offset + 1), self.branches))
+            data[self.state_key] = np.stack([self._state_at(delta, states, first_actions) for delta in deltas])
+            for key in self.action_keys:
+                rows = data[key]
+                data[key] = np.stack([rows[delta:delta + self.action_horizon] for delta in deltas])
+            if self.cond_now:
+                data[NOW_STATE_KEY] = np.stack([now] * len(deltas))
+                data[DELTA_KEY] = np.asarray(deltas, dtype=np.float32) / max(self.max_offset, 1)
+            return data
+        delta = random.randint(0, self.max_offset)
+        data[self.state_key] = self._state_at(delta, states, first_actions)
+        for key in self.action_keys:
+            data[key] = data[key][delta:delta + self.action_horizon]
+        if self.cond_now:
+            data[NOW_STATE_KEY] = now
+            data[DELTA_KEY] = np.float32(delta / max(self.max_offset, 1))
+        return data
+
+    def _state_at(self, delta: int, states, actions):
+        if self.state_source == "state":
+            return states[delta]
+        return states if delta == 0 else actions[delta - 1]
+
+
 @dataclasses.dataclass(frozen=True)
 class ResizeImages(DataTransformFn):
     height: int
@@ -313,7 +411,7 @@ class HoldActions(DataTransformFn):
             mask = np.asarray(self.delta_mask)
             delta[: mask.shape[-1]] = mask
         for dim in self.dims:
-            actions[..., dim] = 0.0 if delta[dim] else state[..., dim]
+            actions[..., dim] = 0.0 if delta[dim] else state[..., dim, None]   # one state per chunk, over its rows
         data["actions"] = actions
 
         return data
@@ -328,10 +426,14 @@ class TokenizePrompt(DataTransformFn):
     # DeltaActions (train) and AbsoluteActions (serve) both need the true state, and pi0.5 reads
     # state nowhere but these tokens, so this is the one place a mask hides it from the model.
     active_state_dims: tuple[int, ...] | None = None
+    # pi0.5 with the state out of the prompt (Pi0Config.state_cond): "Task: ...;\nAction: ".
+    task_only: bool = False
 
     def __post_init__(self):
         if self.active_state_dims is not None and not self.discrete_state_input:
             raise ValueError("active_state_dims masks the discrete state tokens; it needs discrete_state_input")
+        if self.task_only and self.discrete_state_input:
+            raise ValueError("task_only leaves the state out of the prompt; it excludes discrete_state_input")
 
     def __call__(self, data: DataDict) -> DataDict:
         if (prompt := data.pop("prompt", None)) is None:
@@ -351,7 +453,7 @@ class TokenizePrompt(DataTransformFn):
         if not isinstance(prompt, str):
             prompt = prompt.item()
 
-        tokens, token_masks = self.tokenizer.tokenize(prompt, state)
+        tokens, token_masks = self.tokenizer.tokenize(prompt, state, task_only=self.task_only)
         return {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
 
 

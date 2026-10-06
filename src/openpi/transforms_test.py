@@ -111,6 +111,75 @@ def test_transform_dict():
     assert output == {"a": {"b": 1, "d": 1}, "b": {"d": 2}}
 
 
+def _offset_item(horizon: int = 4, max_offset: int = 3) -> dict:
+    rows = np.arange(horizon + max_offset, dtype=np.float32)[:, None] * np.ones(3, dtype=np.float32)
+    return {"observation.state": np.array([-1.0, -1.0, -1.0], dtype=np.float32), "action": rows}
+
+
+def test_temporal_offset_zero_is_identity():
+    item = _offset_item()
+    transform = _transforms.TemporalOffset(0, 4, ("action",))
+    assert transform(item) is item
+    assert item["action"].shape == (7, 3)
+
+
+def test_temporal_offset_shifts_state_and_actions(monkeypatch):
+    monkeypatch.setattr(_transforms.random, "randint", lambda low, high: 2)
+    item = _transforms.TemporalOffset(3, 4, ("action",))(_offset_item())
+
+    assert item["action"].shape == (4, 3)
+    assert np.all(item["action"][:, 0] == np.array([2, 3, 4, 5]))
+    assert np.all(item["observation.state"] == np.array([1.0, 1.0, 1.0]))
+
+
+def test_temporal_offset_delta_zero_keeps_measured_state(monkeypatch):
+    monkeypatch.setattr(_transforms.random, "randint", lambda low, high: 0)
+    item = _transforms.TemporalOffset(3, 4, ("action",))(_offset_item())
+
+    assert np.all(item["action"][:, 0] == np.array([0, 1, 2, 3]))
+    assert np.all(item["observation.state"] == np.array([-1.0, -1.0, -1.0]))
+
+
+def test_temporal_offset_from_recorded_state(monkeypatch):
+    monkeypatch.setattr(_transforms.random, "randint", lambda low, high: 3)
+    item = _offset_item()
+    item["observation.state"] = np.arange(4, dtype=np.float32)[:, None] * np.ones(3, dtype=np.float32) * 10
+    item = _transforms.TemporalOffset(3, 4, ("action",), state_source="state")(item)
+
+    assert np.all(item["action"][:, 0] == np.array([3, 4, 5, 6]))
+    assert np.all(item["observation.state"] == np.array([30.0, 30.0, 30.0]))
+
+
+def test_temporal_offset_branches(monkeypatch):
+    monkeypatch.setattr(_transforms.random, "sample", lambda population, k: [0, 2, 3])
+    item = _transforms.TemporalOffset(3, 4, ("action",), branches=3)(_offset_item())
+
+    assert item["action"].shape == (3, 4, 3) and item["observation.state"].shape == (3, 3)
+    assert np.all(item["action"][:, :, 0] == np.array([[0, 1, 2, 3], [2, 3, 4, 5], [3, 4, 5, 6]]))
+    # Offset 0 keeps the measured state; the others carry the previous commanded action.
+    assert np.all(item["observation.state"][:, 0] == np.array([-1.0, 1.0, 2.0]))
+
+
+def test_temporal_offset_branches_bounds():
+    with pytest.raises(ValueError, match="branches"):
+        _transforms.TemporalOffset(3, 4, ("action",), branches=5)
+
+
+def test_hold_actions_over_branches():
+    state = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+    actions = np.zeros((2, 3, 2), dtype=np.float32)
+    held = _transforms.HoldActions(dims=(1,), delta_mask=[True, False])({"state": state, "actions": actions})
+    assert np.all(held["actions"][0, :, 1] == 2.0) and np.all(held["actions"][1, :, 1] == 4.0)
+    flat = _transforms.HoldActions(dims=(1,), delta_mask=[True, False])({"state": state[0], "actions": actions[0]})
+    assert np.all(flat["actions"][:, 1] == 2.0)
+
+
+def test_temporal_offset_needs_the_wider_window():
+    item = _offset_item(horizon=4, max_offset=1)
+    with pytest.raises(ValueError, match="needs 7"):
+        _transforms.TemporalOffset(3, 4, ("action",))(item)
+
+
 def test_extract_prompt_from_task():
     transform = _transforms.PromptFromLeRobotTask({1: "Hello, world!"})
 
@@ -119,3 +188,73 @@ def test_extract_prompt_from_task():
 
     with pytest.raises(ValueError, match="task_index=2 not found in task mapping"):
         transform({"task_index": 2})
+
+
+def test_agilex_inputs_without_the_base_camera():
+    from openpi.policies import agilex_policy
+
+    wrist = np.random.randint(256, size=(3, 8, 8), dtype=np.uint8)
+    out = agilex_policy.AgilexInputs()({"state": np.ones(14), "images": {"cam_left_wrist": wrist}, "prompt": "p"})
+    assert set(out["image"]) == set(agilex_policy.AgilexInputs.IMAGE_KEY_BY_CAMERA.values())
+    assert out["image_mask"]["left_wrist_0_rgb"] and not out["image_mask"]["base_0_rgb"] and not out["image_mask"]["right_wrist_0_rgb"]
+    assert out["image"]["base_0_rgb"].shape == out["image"]["left_wrist_0_rgb"].shape and not out["image"]["base_0_rgb"].any()
+
+
+def test_temporal_offset_branches_from_recorded_state(monkeypatch):
+    monkeypatch.setattr(_transforms.random, "sample", lambda population, k: list(population)[:k])
+    item = _offset_item()
+    item["observation.state"] = np.arange(4, dtype=np.float32)[:, None] * np.ones(3, dtype=np.float32) * 10
+    item = _transforms.TemporalOffset(3, 4, ("action",), state_source="state", branches=4)(item)
+    assert item["action"].shape == (4, 4, 3) and item["observation.state"].shape == (4, 3)
+    assert np.all(item["observation.state"][:, 0] == np.array([0.0, 10.0, 20.0, 30.0])), "each branch: s[t + delta]"
+    assert np.all(item["action"][:, 0, 0] == np.array([0, 1, 2, 3]))
+
+
+def test_temporal_offset_cond_now(monkeypatch):
+    monkeypatch.setattr(_transforms.random, "randint", lambda low, high: 2)
+    item = _offset_item()
+    item["observation.state"] = np.arange(4, dtype=np.float32)[:, None] * np.ones(3, dtype=np.float32) * 10
+    out = _transforms.TemporalOffset(3, 4, ("action",), state_source="state", cond_now=True)(item)
+    assert np.all(out["observation.state"] == 20.0) and np.all(out[_transforms.NOW_STATE_KEY] == 0.0)
+    assert np.isclose(out[_transforms.DELTA_KEY], 2 / 3)
+    monkeypatch.setattr(_transforms.random, "sample", lambda population, k: list(population)[:k])
+    item = _offset_item()
+    item["observation.state"] = np.arange(4, dtype=np.float32)[:, None] * np.ones(3, dtype=np.float32) * 10
+    out = _transforms.TemporalOffset(3, 4, ("action",), state_source="state", branches=4, cond_now=True)(item)
+    assert out[_transforms.NOW_STATE_KEY].shape == (4, 3) and np.all(out[_transforms.NOW_STATE_KEY] == 0.0)
+    assert np.allclose(out[_transforms.DELTA_KEY], [0, 1 / 3, 2 / 3, 1])
+
+
+def test_concat_vlash_cond():
+    joined = _transforms.ConcatVlashCond()({"state": np.full(3, 2.0), _transforms.NOW_STATE_KEY: np.full(3, 1.0),
+                                            _transforms.DELTA_KEY: np.float32(0.5)})
+    assert np.allclose(joined["state"], [2, 2, 2, 1, 1, 1, 0.5]) and _transforms.NOW_STATE_KEY not in joined
+    branched = _transforms.ConcatVlashCond()({"state": np.full((2, 3), 2.0), _transforms.NOW_STATE_KEY: np.ones((2, 3)),
+                                              _transforms.DELTA_KEY: np.array([0.0, 1.0])})
+    assert branched["state"].shape == (2, 7) and np.allclose(branched["state"][:, -1], [0, 1])
+    plain = _transforms.ConcatVlashCond()({"state": np.full(3, 2.0)})
+    assert np.allclose(plain["state"], [2, 2, 2, 2, 2, 2, 0]), "a plain request is the offset-0 case"
+
+
+def test_vlash_cond_pipeline_end_to_end(monkeypatch):
+    """Offset -> repack -> adapter -> normalize -> concat, as the _vlash8mpc twins train: the conditioning
+    state is [state at t + delta, state at t, delta / max], both states normalized with the state's stats."""
+    from openpi.policies import agilex_policy
+    from openpi.shared import normalize as _normalize
+    from openpi.training.misc.ih_yam_config import yam_repack
+
+    monkeypatch.setattr(_transforms.random, "randint", lambda low, high: 2)
+    states = np.stack([np.full(14, float(10 * i), dtype=np.float32) for i in range(4)])
+    actions = np.stack([np.full(14, float(i), dtype=np.float32) for i in range(7)])
+    item = {"observation.state": states, "action": actions,
+            "observation.images.cam_left_wrist": np.zeros((3, 8, 8), dtype=np.uint8)}
+    item = _transforms.TemporalOffset(3, 4, ("action",), state_source="state", cond_now=True)(item)
+    item = yam_repack(("cam_left_wrist",), vlash_cond_now=True).inputs[0](item)
+    item = agilex_policy.AgilexInputs()(item)
+    stats = _normalize.NormStats(mean=np.zeros(14), std=np.ones(14), q01=np.zeros(14), q99=np.full(14, 40.0))
+    item = _transforms.Normalize({"state": stats, _transforms.NOW_STATE_KEY: stats}, use_quantiles=True)(item)
+    item = _transforms.ConcatVlashCond()(item)
+    assert item["state"].shape == (29,)
+    assert np.allclose(item["state"][:14], 0.0, atol=1e-5), "state at t + 2 = 20 -> quantile-normalized to 0 on [0, 40]"
+    assert np.allclose(item["state"][14:28], -1.0, atol=1e-5), "state at t = 0 -> -1"
+    assert np.isclose(item["state"][28], 2 / 3)

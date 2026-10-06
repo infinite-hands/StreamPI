@@ -227,6 +227,12 @@ class AgilexInputs(transforms.DataTransformFn):
         "cam_left_wrist",
         "cam_right_wrist",
     )
+    # The model's image key for each camera, the mapping the loop below applies.
+    IMAGE_KEY_BY_CAMERA: ClassVar[dict[str, str]] = {
+        "cam_high": "base_0_rgb",
+        "cam_left_wrist": "left_wrist_0_rgb",
+        "cam_right_wrist": "right_wrist_0_rgb",
+    }
 
     use_ee6d: bool = False
 
@@ -244,28 +250,19 @@ class AgilexInputs(transforms.DataTransformFn):
         in_images = data["images"]
         if set(in_images) - set(self.EXPECTED_CAMERAS):
             raise ValueError(f"Expected images to contain {self.EXPECTED_CAMERAS}, got {tuple(in_images)}")
+        if not in_images:
+            raise ValueError("Expected at least one camera image")
 
-        # Assume that base image always exists.
-        base_image = in_images["cam_high"]
-
-        images = {
-            "base_0_rgb": base_image,
-        }
-        image_masks = {
-            "base_0_rgb": np.True_,
-        }
-
-        # Add the extra images.
-        extra_image_names = {
-            "left_wrist_0_rgb": "cam_left_wrist",
-            "right_wrist_0_rgb": "cam_right_wrist",
-        }
-        for dest, source in extra_image_names.items():
+        # Any present camera sets the shape a missing one is zero-filled to: a recipe that decodes only
+        # the cameras it keeps (DataConfig.decode_only_hist_cameras) may leave cam_high out.
+        reference = next(iter(in_images.values()))
+        images, image_masks = {}, {}
+        for source, dest in self.IMAGE_KEY_BY_CAMERA.items():
             if source in in_images:
                 images[dest] = in_images[source]
                 image_masks[dest] = np.True_
             else:
-                images[dest] = np.zeros_like(base_image)
+                images[dest] = np.zeros_like(reference)
                 image_masks[dest] = np.False_
 
         if self.active_image_keys is not None:
@@ -308,6 +305,11 @@ class AgilexInputs(transforms.DataTransformFn):
 
         if "delay" in data:
             inputs["delay"] = data["delay"]
+
+        # The vlash conditioning extras (transforms.TemporalOffset cond_now; ConcatVlashCond joins them later).
+        for key in ("state_now", "vlash_delta"):
+            if key in data:
+                inputs[key] = np.asarray(data[key])
 
         if "action_prefix" in data:
             inputs["action_prefix"] = data["action_prefix"]
