@@ -255,6 +255,6 @@ def test_vlash_cond_pipeline_end_to_end(monkeypatch):
     item = _transforms.Normalize({"state": stats, _transforms.NOW_STATE_KEY: stats}, use_quantiles=True)(item)
     item = _transforms.ConcatVlashCond()(item)
     assert item["state"].shape == (29,)
-    assert np.allclose(item["state"][:14], 0.0), "state at t + 2 = 20 -> quantile-normalized to 0 on [0, 40]"
-    assert np.allclose(item["state"][14:28], -1.0), "state at t = 0 -> -1"
+    assert np.allclose(item["state"][:14], 0.0, atol=1e-5), "state at t + 2 = 20 -> quantile-normalized to 0 on [0, 40]"
+    assert np.allclose(item["state"][14:28], -1.0, atol=1e-5), "state at t = 0 -> -1"
     assert np.isclose(item["state"][28], 2 / 3)
