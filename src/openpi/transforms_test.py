@@ -208,3 +208,53 @@ def test_temporal_offset_branches_from_recorded_state(monkeypatch):
     assert item["action"].shape == (4, 4, 3) and item["observation.state"].shape == (4, 3)
     assert np.all(item["observation.state"][:, 0] == np.array([0.0, 10.0, 20.0, 30.0])), "each branch: s[t + delta]"
     assert np.all(item["action"][:, 0, 0] == np.array([0, 1, 2, 3]))
+
+
+def test_temporal_offset_cond_now(monkeypatch):
+    monkeypatch.setattr(_transforms.random, "randint", lambda low, high: 2)
+    item = _offset_item()
+    item["observation.state"] = np.arange(4, dtype=np.float32)[:, None] * np.ones(3, dtype=np.float32) * 10
+    out = _transforms.TemporalOffset(3, 4, ("action",), state_source="state", cond_now=True)(item)
+    assert np.all(out["observation.state"] == 20.0) and np.all(out[_transforms.NOW_STATE_KEY] == 0.0)
+    assert np.isclose(out[_transforms.DELTA_KEY], 2 / 3)
+    monkeypatch.setattr(_transforms.random, "sample", lambda population, k: list(population)[:k])
+    item = _offset_item()
+    item["observation.state"] = np.arange(4, dtype=np.float32)[:, None] * np.ones(3, dtype=np.float32) * 10
+    out = _transforms.TemporalOffset(3, 4, ("action",), state_source="state", branches=4, cond_now=True)(item)
+    assert out[_transforms.NOW_STATE_KEY].shape == (4, 3) and np.all(out[_transforms.NOW_STATE_KEY] == 0.0)
+    assert np.allclose(out[_transforms.DELTA_KEY], [0, 1 / 3, 2 / 3, 1])
+
+
+def test_concat_vlash_cond():
+    joined = _transforms.ConcatVlashCond()({"state": np.full(3, 2.0), _transforms.NOW_STATE_KEY: np.full(3, 1.0),
+                                            _transforms.DELTA_KEY: np.float32(0.5)})
+    assert np.allclose(joined["state"], [2, 2, 2, 1, 1, 1, 0.5]) and _transforms.NOW_STATE_KEY not in joined
+    branched = _transforms.ConcatVlashCond()({"state": np.full((2, 3), 2.0), _transforms.NOW_STATE_KEY: np.ones((2, 3)),
+                                              _transforms.DELTA_KEY: np.array([0.0, 1.0])})
+    assert branched["state"].shape == (2, 7) and np.allclose(branched["state"][:, -1], [0, 1])
+    plain = _transforms.ConcatVlashCond()({"state": np.full(3, 2.0)})
+    assert np.allclose(plain["state"], [2, 2, 2, 2, 2, 2, 0]), "a plain request is the offset-0 case"
+
+
+def test_vlash_cond_pipeline_end_to_end(monkeypatch):
+    """Offset -> repack -> adapter -> normalize -> concat, as the _vlash8mpc twins train: the conditioning
+    state is [state at t + delta, state at t, delta / max], both states normalized with the state's stats."""
+    from openpi.policies import agilex_policy
+    from openpi.shared import normalize as _normalize
+    from openpi.training.misc.ih_yam_config import yam_repack
+
+    monkeypatch.setattr(_transforms.random, "randint", lambda low, high: 2)
+    states = np.stack([np.full(14, float(10 * i), dtype=np.float32) for i in range(4)])
+    actions = np.stack([np.full(14, float(i), dtype=np.float32) for i in range(7)])
+    item = {"observation.state": states, "action": actions,
+            "observation.images.cam_left_wrist": np.zeros((3, 8, 8), dtype=np.uint8)}
+    item = _transforms.TemporalOffset(3, 4, ("action",), state_source="state", cond_now=True)(item)
+    item = yam_repack(("cam_left_wrist",), vlash_cond_now=True).inputs[0](item)
+    item = agilex_policy.AgilexInputs()(item)
+    stats = _normalize.NormStats(mean=np.zeros(14), std=np.ones(14), q01=np.zeros(14), q99=np.full(14, 40.0))
+    item = _transforms.Normalize({"state": stats, _transforms.NOW_STATE_KEY: stats}, use_quantiles=True)(item)
+    item = _transforms.ConcatVlashCond()(item)
+    assert item["state"].shape == (29,)
+    assert np.allclose(item["state"][:14], 0.0), "state at t + 2 = 20 -> quantile-normalized to 0 on [0, 40]"
+    assert np.allclose(item["state"][14:28], -1.0), "state at t = 0 -> -1"
+    assert np.isclose(item["state"][28], 2 / 3)
