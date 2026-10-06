@@ -47,6 +47,8 @@ ACTION_HORIZON = 30
 # range (hist_interval - 1) made the previous command so close to the next target that the left-real
 # fine-tune followed the wrist image about a third as much as its non-vlash twin did, offline.
 VLASH_REFERENCE_MAX_OFFSET = 8
+# A longer range for a deploy whose round trip runs past 8 rows (~270 ms at 30 Hz): the `_vlash12mpc` twin.
+VLASH_LONG_MAX_OFFSET = 12
 # The YAM LeRobot layout: three cameras, 14-dim state/action [L j0..5, L grip, R j0..5, R grip].
 YAM_CAMERAS = ("cam_high", "cam_left_wrist", "cam_right_wrist")
 
@@ -249,6 +251,11 @@ def get_ih_yam_configs():
         return {**vlash_packed_measured_twin(recipe), "name": recipe["name"] + "_vlash8mpc",
                 "vlash_cond_now": True, "num_train_steps": 10_000}
 
+    def vlash_long_conditioned_twin(recipe: dict) -> dict:
+        # `_vlash8mpc` with offsets 0-12 (13 branches): leads up to 12 rows, for a serve slower than ~270 ms.
+        return {**vlash_conditioned_twin(recipe), "name": recipe["name"] + "_vlash12mpc",
+                "vlash_max_offset": VLASH_LONG_MAX_OFFSET, "vlash_branches": VLASH_LONG_MAX_OFFSET + 1}
+
     def vlash_packed_twin(recipe: dict) -> dict:
         # The paper's shared-observation training: every offset 0..max as one branch behind one
         # observation, the state as adaRMS conditioning instead of prompt text. A different model
@@ -259,5 +266,5 @@ def get_ih_yam_configs():
     return [stream_config(**recipe) for recipe in
             recipes + [vlash_twin(recipe) for recipe in recipes] + [vlash_reference_twin(recipe) for recipe in recipes]
             + [vlash_measured_twin(recipe) for recipe in recipes] + [vlash_packed_measured_twin(recipe) for recipe in recipes]
-            + [vlash_conditioned_twin(recipe) for recipe in recipes]
+            + [vlash_conditioned_twin(recipe) for recipe in recipes] + [vlash_long_conditioned_twin(recipe) for recipe in recipes]
             + [vlash_packed_twin(recipe) for recipe in recipes]]
