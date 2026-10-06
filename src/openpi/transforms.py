@@ -223,6 +223,14 @@ NOW_STATE_KEY = "state_now"   # the measured state at the image's frame, beside 
 DELTA_KEY = "vlash_delta"     # delta / max_offset: how far the state runs ahead of the image
 
 
+def output_norm_stats(norm_stats):
+    """The norm stats Unnormalize gets: without the input-only NOW_STATE_KEY, which no model output carries
+    (Unnormalize is strict, so leaving it in failed every serve call of a vlash_cond_now config)."""
+    if norm_stats is None:
+        return None
+    return {key: value for key, value in norm_stats.items() if key != NOW_STATE_KEY}
+
+
 @dataclasses.dataclass(frozen=True)
 class ConcatVlashCond(DataTransformFn):
     """Join NOW_STATE_KEY and DELTA_KEY to the (normalized) state: [state at t+delta, state at t, delta],

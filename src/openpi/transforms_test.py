@@ -258,3 +258,18 @@ def test_vlash_cond_pipeline_end_to_end(monkeypatch):
     assert np.allclose(item["state"][:14], 0.0, atol=1e-5), "state at t + 2 = 20 -> quantile-normalized to 0 on [0, 40]"
     assert np.allclose(item["state"][14:28], -1.0, atol=1e-5), "state at t = 0 -> -1"
     assert np.isclose(item["state"][28], 2 / 3)
+
+
+def test_unnormalize_skips_the_input_only_state_now():
+    """Serving a vlash_cond_now config: its norm stats carry state_now for the input side, but Unnormalize is
+    strict and the model's outputs never carry it -- output_norm_stats drops it so the call returns."""
+    from openpi.shared import normalize as _normalize
+
+    stats = _normalize.NormStats(mean=np.zeros(14), std=np.ones(14), q01=np.zeros(14), q99=np.ones(14))
+    norm_stats = {"state": stats, "actions": stats, _transforms.NOW_STATE_KEY: stats}
+    outputs = {"state": np.zeros(32), "actions": np.zeros((4, 32))}
+    with pytest.raises(ValueError, match="state_now"):
+        _transforms.Unnormalize(norm_stats, use_quantiles=True)(dict(outputs))
+    restored = _transforms.Unnormalize(_transforms.output_norm_stats(norm_stats), use_quantiles=True)(dict(outputs))
+    assert restored["actions"].shape == (4, 32)
+    assert _transforms.output_norm_stats(None) is None
