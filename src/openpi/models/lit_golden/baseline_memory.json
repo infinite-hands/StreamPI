@@ -1,0 +1,386 @@
+{
+ "bf16_rand_eager": {
+  "call1": {
+   "memory_kv_cache": [
+    {
+     "dtype": "bfloat16",
+     "sha256": "c138361d10e4ca3e38af57c26b2ad64be56be4574a181d1d0816e61af198e0b8",
+     "shape": [
+      4,
+      2,
+      2328,
+      1,
+      16
+     ],
+     "sum": 10823.930995464325
+    },
+    {
+     "dtype": "bfloat16",
+     "sha256": "da63e5a3ab0cb7c5c02e8a8d02b8ef5cc06e96c2a49df7d2b4554a5d6ca57d3d",
+     "shape": [
+      4,
+      2,
+      2328,
+      1,
+      16
+     ],
+     "sum": -16533.58419340849
+    }
+   ],
+   "memory_prefix_mask": {
+    "dtype": "bool",
+    "sha256": "a2e17dcb710f5481ea4870792fc2934d7dd3a4cbb6e3dc102392d241a9145a59",
+    "shape": [
+     2,
+     2328
+    ],
+    "sum": 3879.0
+   },
+   "memory_tokens": {
+    "dtype": "bfloat16",
+    "sha256": "7fb08c561d170c3492553801191dfe27c3e35211b6216eefc446834e09fbf995",
+    "shape": [
+     2,
+     2328,
+     64
+    ],
+    "sum": 16621.047603607178
+   }
+  },
+  "call2": {
+   "memory_kv_cache": [
+    {
+     "dtype": "bfloat16",
+     "sha256": "3f6dd805486048558c0c0b54eddfbc5926420f70c216a637ddd0282992453bd9",
+     "shape": [
+      4,
+      2,
+      4656,
+      1,
+      16
+     ],
+     "sum": 31182.178093209863
+    },
+    {
+     "dtype": "bfloat16",
+     "sha256": "9873e89e4d02a1cb2ce6f3249bc99b45650b7347ea2fb907ae099a362fcffba5",
+     "shape": [
+      4,
+      2,
+      4656,
+      1,
+      16
+     ],
+     "sum": -29753.745505452156
+    }
+   ],
+   "memory_prefix_mask": {
+    "dtype": "bool",
+    "sha256": "445ccd968d414c07f72dbea5b14fcb5224559fc0c0b0dc73414104de74b42d64",
+    "shape": [
+     2,
+     4656
+    ],
+    "sum": 7758.0
+   },
+   "memory_tokens": {
+    "dtype": "bfloat16",
+    "sha256": "808d2f33e37f6d99776f585b791bed7d0156eba15caf8150f2ef49dd02a17d9a",
+    "shape": [
+     2,
+     2328,
+     64
+    ],
+    "sum": 12745.495839118958
+   }
+  }
+ },
+ "f32_rand_eager": {
+  "call1": {
+   "memory_kv_cache": [
+    {
+     "dtype": "float32",
+     "sha256": "f9609ebf605d548e13cb090e4c325ca984d18b4a389caa0b2d478cb73276f18a",
+     "shape": [
+      4,
+      2,
+      2328,
+      1,
+      16
+     ],
+     "sum": 10753.561580366317
+    },
+    {
+     "dtype": "float32",
+     "sha256": "dcc8553a51fb5a9aa315cffc43cdc7e826c76a5f5ee7d7a07ec6de86df9a4241",
+     "shape": [
+      4,
+      2,
+      2328,
+      1,
+      16
+     ],
+     "sum": -16333.999884509827
+    }
+   ],
+   "memory_prefix_mask": {
+    "dtype": "bool",
+    "sha256": "a2e17dcb710f5481ea4870792fc2934d7dd3a4cbb6e3dc102392d241a9145a59",
+    "shape": [
+     2,
+     2328
+    ],
+    "sum": 3879.0
+   },
+   "memory_tokens": {
+    "dtype": "float32",
+    "sha256": "29147fff7d268e05b277c0d4a28713d797f71e97e8eafcf5e4fcd99bac2ea32d",
+    "shape": [
+     2,
+     2328,
+     64
+    ],
+    "sum": 16608.148121353704
+   }
+  },
+  "call2": {
+   "memory_kv_cache": [
+    {
+     "dtype": "float32",
+     "sha256": "2a2d6f79457fdf51767e68cefb7c34523aefa2f6e8dba784b838f7a4e7d433ce",
+     "shape": [
+      4,
+      2,
+      4656,
+      1,
+      16
+     ],
+     "sum": 31134.37917502503
+    },
+    {
+     "dtype": "float32",
+     "sha256": "ede020f5d370a8896d2f64a472b7545274b8c51e7018b756a022e222badcd530",
+     "shape": [
+      4,
+      2,
+      4656,
+      1,
+      16
+     ],
+     "sum": -29325.803163379824
+    }
+   ],
+   "memory_prefix_mask": {
+    "dtype": "bool",
+    "sha256": "445ccd968d414c07f72dbea5b14fcb5224559fc0c0b0dc73414104de74b42d64",
+    "shape": [
+     2,
+     4656
+    ],
+    "sum": 7758.0
+   },
+   "memory_tokens": {
+    "dtype": "float32",
+    "sha256": "e11e4a00c9ef46dcdd228819440574e79ba4f2a4bb333ad48930efbc6bb9cd7b",
+    "shape": [
+     2,
+     2328,
+     64
+    ],
+    "sum": 12750.794455591691
+   }
+  }
+ },
+ "f32_rand_jit": {
+  "call1": {
+   "memory_kv_cache": [
+    {
+     "dtype": "float32",
+     "sha256": "6e183c59bf2d1535e6035b58fc2c77a881a48158042bd9215336bcded4574e8b",
+     "shape": [
+      4,
+      2,
+      2328,
+      1,
+      16
+     ],
+     "sum": 10753.562075184214
+    },
+    {
+     "dtype": "float32",
+     "sha256": "24a165fd7a19a6abb931e1e6f88b091f321275a9e7182dfc4957a0b3066f9caf",
+     "shape": [
+      4,
+      2,
+      2328,
+      1,
+      16
+     ],
+     "sum": -16333.999895279729
+    }
+   ],
+   "memory_prefix_mask": {
+    "dtype": "bool",
+    "sha256": "a2e17dcb710f5481ea4870792fc2934d7dd3a4cbb6e3dc102392d241a9145a59",
+    "shape": [
+     2,
+     2328
+    ],
+    "sum": 3879.0
+   },
+   "memory_tokens": {
+    "dtype": "float32",
+    "sha256": "4636d87870c2abdde4a5e22acd2b08b2473989a4203cbe47f516192e5619f46d",
+    "shape": [
+     2,
+     2328,
+     64
+    ],
+    "sum": 16608.148714348208
+   }
+  },
+  "call2": {
+   "memory_kv_cache": [
+    {
+     "dtype": "float32",
+     "sha256": "a17a7645a08d4bc22d342ec4e0046cb3d5d342f4d25b4a144dd7598009d78043",
+     "shape": [
+      4,
+      2,
+      4656,
+      1,
+      16
+     ],
+     "sum": 31134.379295319115
+    },
+    {
+     "dtype": "float32",
+     "sha256": "fbdb7af785f86ee0e2d7407a3fb48f61601c542b2b3ba3a3cfe6ad09c534f35f",
+     "shape": [
+      4,
+      2,
+      4656,
+      1,
+      16
+     ],
+     "sum": -29325.802173825366
+    }
+   ],
+   "memory_prefix_mask": {
+    "dtype": "bool",
+    "sha256": "445ccd968d414c07f72dbea5b14fcb5224559fc0c0b0dc73414104de74b42d64",
+    "shape": [
+     2,
+     4656
+    ],
+    "sum": 7758.0
+   },
+   "memory_tokens": {
+    "dtype": "float32",
+    "sha256": "92324f3b575bec559f8c3a656f9fe662f2a6e335fb239f5a0b3c5f9142f618ce",
+    "shape": [
+     2,
+     2328,
+     64
+    ],
+    "sum": 12750.794846607008
+   }
+  }
+ },
+ "f32_raw_eager": {
+  "call1": {
+   "memory_kv_cache": [
+    {
+     "dtype": "float32",
+     "sha256": "e431d76b138b717f6e050928c9e58854264479a6489be9398b3025240c4e45b6",
+     "shape": [
+      4,
+      2,
+      2328,
+      1,
+      16
+     ],
+     "sum": -399.8794501640823
+    },
+    {
+     "dtype": "float32",
+     "sha256": "09866967fec21f756b81020885d96dd79535c9c965d5e290f3393e24cd537db2",
+     "shape": [
+      4,
+      2,
+      2328,
+      1,
+      16
+     ],
+     "sum": -40013.58701545692
+    }
+   ],
+   "memory_prefix_mask": {
+    "dtype": "bool",
+    "sha256": "a2e17dcb710f5481ea4870792fc2934d7dd3a4cbb6e3dc102392d241a9145a59",
+    "shape": [
+     2,
+     2328
+    ],
+    "sum": 3879.0
+   },
+   "memory_tokens": {
+    "dtype": "float32",
+    "sha256": "0d3b95f34d9af960f7046f10debfc8845403e647498e7a38f0c9f18b29224e24",
+    "shape": [
+     2,
+     2328,
+     64
+    ],
+    "sum": -1.9556469645467587
+   }
+  },
+  "call2": {
+   "memory_kv_cache": [
+    {
+     "dtype": "float32",
+     "sha256": "8afc02b8c1e5af3431ceca7599c46aa9e22c6410ed57e36d22f87a76f4f79195",
+     "shape": [
+      4,
+      2,
+      4656,
+      1,
+      16
+     ],
+     "sum": -6677.149279657534
+    },
+    {
+     "dtype": "float32",
+     "sha256": "54cac1a9dd02477e6049e058ee1c080230f377abe8cdd688447e59d3ee2f97c3",
+     "shape": [
+      4,
+      2,
+      4656,
+      1,
+      16
+     ],
+     "sum": -76738.05816721541
+    }
+   ],
+   "memory_prefix_mask": {
+    "dtype": "bool",
+    "sha256": "445ccd968d414c07f72dbea5b14fcb5224559fc0c0b0dc73414104de74b42d64",
+    "shape": [
+     2,
+     4656
+    ],
+    "sum": 7758.0
+   },
+   "memory_tokens": {
+    "dtype": "float32",
+    "sha256": "c48c2cc8dc243fe0cb6bddd84615f6c6b71ec710fc5c25f7e62e7e23dd4b599d",
+    "shape": [
+     2,
+     2328,
+     64
+    ],
+    "sum": 8.406513275389443
+   }
+  }
+ }
+}
