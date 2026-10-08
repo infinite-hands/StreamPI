@@ -37,8 +37,13 @@ class Pi0Config(_model.BaseModelConfig):
     # Latent Interface Training. "off" is the stock model: no extra parameters, nothing else below is read.
     # "stage1": no images; the action expert reads the language/state tokens and the goal (goal K/V), the backbone is
     #   frozen. Only the current history block is used (without images the older blocks are copies of the same prompt).
+    #   The model never embeds an image, but the Observation must still carry every camera: preprocess_observation
+    #   raises "images dict missing keys" on images={}, so a stage-1 data loader supplies and decodes all cameras.
     # "stage2": the action expert is hidden from the image columns (lit_mask_image) and the language/state columns
-    #   (lit_mask_language) of every history block and reads K=lit_num_latents learned latents instead.
+    #   (lit_mask_language) of every history block and reads K=lit_num_latents learned latents instead. Only both
+    #   switches on is the hard firewall (then the action rows also start from a constant RoPE position, not the
+    #   valid-token count). One switch alone does not isolate its modality: image and language tokens attend to each
+    #   other in the prefix pass, so the columns left visible carry the hidden modality too.
     lit: Literal["off", "stage1", "stage2"] = "off"
     lit_num_latents: int = 100
     lit_dim: int = 768
@@ -52,6 +57,7 @@ class Pi0Config(_model.BaseModelConfig):
     lit_goal_tokens: int = 8
     # Weight of the pose loss in the training objective; the loss itself is returned unweighted.
     lit_pose_weight: float = 0.3
+    # Stage-2 ablation switches: hide the image / the language+state columns from the action rows (see "stage2" above).
     lit_mask_image: bool = True
     lit_mask_language: bool = True
     # Indices into the (state-width) goal vector that the pose loss and goal encoder use: the driven arm's dims.

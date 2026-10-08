@@ -74,8 +74,11 @@ class LitPrefix(NamedTuple):
     kv_cache: tuple
     # bool (b, s): the prefix columns the action rows may attend (history drop and the LIT masks applied).
     visible: jax.Array
-    # int (b,): valid prefix tokens; the suffix positions continue from here.
+    # int (b,): valid prefix tokens, after the history drop.
     count: jax.Array
+    # int (b,): the RoPE position the suffix starts from, `Pi0._lit_suffix_offset(count)`: `count`, or a constant 0
+    # when every prefix column is hidden from the action rows.
+    offset: jax.Array
     # (k, v, visible) of the columns appended after the prefix, k and v (layers, b, e, kv_heads, head_dim): the latents
     # (stage 2) or the goal tokens (stage 1).
     extra: tuple
@@ -386,7 +389,12 @@ class Pi0(_model.BaseModel):
         if obs.lit_goal.shape[-1] != self.action_dim:
             raise ValueError(f"lit_goal must be {self.action_dim} wide like the state, got {obs.lit_goal.shape}.")
         b = obs.state.shape[0]
-        valid = jnp.ones((b,), bool) if obs.lit_goal_mask is None else jnp.broadcast_to(obs.lit_goal_mask, (b,))
+        if obs.lit_goal_mask is None:
+            raise ValueError(
+                "observation.lit_goal needs observation.lit_goal_mask (True where the goal is real): without it a "
+                "padded goal would be taken as a real target and train the pose loss and the goal K/V toward zero."
+            )
+        valid = jnp.broadcast_to(obs.lit_goal_mask, (b,))
         goal = jnp.broadcast_to(obs.lit_goal, (b, self.action_dim))[:, jnp.asarray(self.lit_goal_dims)]
         return jnp.where(valid[:, None], goal.astype(jnp.float32), 0.0), valid
 
@@ -412,6 +420,7 @@ class Pi0(_model.BaseModel):
         attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         count = jnp.sum(prefix_mask, axis=1)
+        offset = self._lit_suffix_offset(count)
         if stage1:
             _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=attn_mask, positions=positions)
             goal, valid = self._lit_goal(observation)
@@ -419,7 +428,7 @@ class Pi0(_model.BaseModel):
             layers = kv_cache[0].shape[0]
             k, v = (jnp.broadcast_to(x[None], (layers, *x.shape)) for x in (goal_k, goal_v))
             extra = (*self._lit_kv_columns(k, v), jnp.broadcast_to(valid[:, None], goal_k.shape[:2]))
-            return LitPrefix(kv_cache, prefix_mask, count, extra, None)
+            return LitPrefix(kv_cache, prefix_mask, count, offset, extra, None)
 
         start = (blocks - 1) * block_len
         _, kv_cache, layer_inputs = self.PaliGemma.llm(
@@ -432,17 +441,32 @@ class Pi0(_model.BaseModel):
         semantic_mask, image_mask = _lit.role_masks(roles[:, start:])
         latents, keys, values = self.lit_aggregator(layer_inputs, semantic_mask, image_mask)
         extra = (*self._lit_kv_columns(keys, values), jnp.ones(keys.shape[1:3], bool))
-        return LitPrefix(kv_cache, self._lit_visible(prefix_mask, roles), count, extra, latents)
+        return LitPrefix(kv_cache, self._lit_visible(prefix_mask, roles), count, offset, extra, latents)
 
     def _lit_visible(self, prefix_mask, roles):
         """The valid prefix columns the action rows may attend: the image and language/state ones are hidden per the
-        stage-2 switches. `roles` has the columns' roles (validity does not matter, `prefix_mask` carries it)."""
+        stage-2 switches. `roles` has the columns' roles (validity does not matter, `prefix_mask` carries it).
+        Only both switches on hide everything; one alone does not isolate its modality, since image and language
+        tokens attend to each other in the prefix pass and the visible columns carry the hidden modality."""
         visible = prefix_mask
         if self.lit_mask_image:
             visible = visible & (roles != _lit.ROLE_IMAGE)
         if self.lit_mask_language:
             visible = visible & (roles != _lit.ROLE_SEMANTIC)
         return visible
+
+    def _lit_suffix_offset(self, prefix_count):
+        """The RoPE position the action rows start from, given the valid prefix tokens `prefix_count` (b,): the one
+        place the training pass and the sampling pass (`lit_prefix`) both take it from.
+
+        Latent K/V carry no RoPE while the action rows' queries are rotated by absolute position, so a start that moves
+        with the valid-token count (prompt length, camera masks, history drop, memory length) moves the logits of the
+        action rows against the latents: the count reaches them though every column is hidden. When both stage-2
+        masks are on the start is therefore the constant 0. Whenever a prefix column is visible (stage 1, either
+        mask off) the rows continue from the count, as in the stock model."""
+        if self.lit == "stage2" and self.lit_mask_image and self.lit_mask_language:
+            return jnp.zeros_like(prefix_count)
+        return prefix_count
 
     @staticmethod
     def _lit_extend_cache(kv_cache, visible, extra):
@@ -454,21 +478,22 @@ class Pi0(_model.BaseModel):
         )
         return kv_cache, jnp.concatenate([visible, extra_visible], axis=1)
 
-    def _suffix_velocity(self, observation, x_t, time, kv_cache, visible, prefix_count, extra=None):
+    def _suffix_velocity(self, observation, x_t, time, kv_cache, visible, offset, extra=None):
         """The action expert's velocity for noisy actions `x_t` at `time` over a finished prefix pass: the one routine
         shared by the training loss and sampling.
 
         kv_cache: stacked prefix (k, v), (layers, b, s, kv_heads, head_dim). visible: bool (b, s), the prefix columns
-        every action row may attend. prefix_count: int (b,), the valid prefix tokens (RoPE positions of the suffix
-        continue from it). extra: optional (k, v, visible) to append after the prefix columns, k and v (layers, b, e,
-        kv_heads, head_dim), visible bool (b, e); they are cast to the cache dtype and carry no RoPE."""
+        every action row may attend. offset: int (b,), the RoPE position of the first action row, as `LitPrefix.offset`
+        or `lit_prefix` return it (never the raw valid-token count: see `_lit_suffix_offset`). extra: optional (k, v,
+        visible) to append after the prefix columns, k and v (layers, b, e, kv_heads, head_dim), visible bool (b, e);
+        they are cast to the cache dtype and carry no RoPE."""
         if extra is not None:
             kv_cache, visible = self._lit_extend_cache(kv_cache, visible, extra)
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
         suffix_len = suffix_tokens.shape[1]
         columns = jnp.broadcast_to(visible[:, None, :], (visible.shape[0], suffix_len, visible.shape[1]))
         full_mask = jnp.concatenate([columns, make_attn_mask(suffix_mask, suffix_ar_mask)], axis=-1)
-        positions = prefix_count[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+        positions = offset[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
         (prefix_out, suffix_out), _ = self.PaliGemma.llm(
             [None, suffix_tokens],
             mask=full_mask,
@@ -518,7 +543,7 @@ class Pi0(_model.BaseModel):
 
         prefix = self._lit_prefix_pass(observation, mask_rng)
         v_t = self._suffix_velocity(
-            observation, x_t, time, prefix.kv_cache, prefix.visible, prefix.count, prefix.extra
+            observation, x_t, time, prefix.kv_cache, prefix.visible, prefix.offset, prefix.extra
         )
         action_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
         return action_loss, (self._lit_pose_losses(observation, prefix.latents) if with_aux else {})
@@ -632,8 +657,14 @@ class Pi0(_model.BaseModel):
                     prefix columns (image and language/state ones hidden per the LIT switches, invalid ones
                     hidden) followed by the e = lit_num_latents latent columns, which are always visible.
           kv_cache  stacked (k, v), each (layers, b, s + e, kv_heads, head_dim): [memory; current prefix; latents],
-                    the latent K/V after RoPE in the cache dtype.
-          offset    int (b,): the valid prefix tokens (memory included); suffix RoPE positions continue from it.
+                    the latent K/V (no RoPE) in the cache dtype.
+          offset    int (b,): the RoPE position of the first action row, from `_lit_suffix_offset`. With both masks
+                    on (every prefix column hidden) it is a constant 0 and does NOT count the valid prefix tokens:
+                    the latent K/V carry no RoPE, so a count-dependent start would let the prompt length, the camera
+                    masks and the memory length reach the action rows through their logits against the latents. With
+                    either mask off it is the valid prefix tokens, memory included, as in the stock model. Use it as
+                    given: never replace it by a token count, and do not add anything to it that varies with the
+                    prefix (the training loss uses the same offset).
           new_memory  a copy of `memory` holding this call's prefix, saved before the latents are appended: it
                     has the stock keys only and never a latent, so the memory contract is unchanged.
         The velocity for noisy actions x_t at time t is then
@@ -675,7 +706,7 @@ class Pi0(_model.BaseModel):
         _, keys, values = self.lit_aggregator(layer_inputs, semantic_mask, image_mask)
         extra = (*self._lit_kv_columns(keys, values), jnp.ones(keys.shape[1:3], bool))
         kv_cache, visible = self._lit_extend_cache(kv_cache, self._lit_visible(prefix_mask, layout), extra)
-        return visible, kv_cache, jnp.sum(prefix_mask, axis=-1), new_memory
+        return visible, kv_cache, self._lit_suffix_offset(jnp.sum(prefix_mask, axis=-1)), new_memory
 
     def _check_lit_sampling(self):
         if self.lit == "stage1":

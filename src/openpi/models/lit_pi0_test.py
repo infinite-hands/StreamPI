@@ -16,6 +16,7 @@ Run the whole file with `-s` to see the freeze-filter counts and the real-dimens
 """
 # ruff: noqa: SLF001
 
+import contextlib
 import dataclasses
 import functools
 import json
@@ -128,7 +129,7 @@ def _velocity(stage: str, prefix, obs_key: str = "base", extra=None):
     x_t, time = _x_t_and_time()
     if extra is None:
         extra = prefix.extra
-    return model._suffix_velocity(_pre(_OBS[obs_key]), x_t, time, prefix.kv_cache, prefix.visible, prefix.count, extra)
+    return model._suffix_velocity(_pre(_OBS[obs_key]), x_t, time, prefix.kv_cache, prefix.visible, prefix.offset, extra)
 
 
 def _equal(a, b):
@@ -432,7 +433,7 @@ def _two_pass_loss(model, rng, observation, actions, *, train, hidden_extra=Fals
     extra = None
     if hidden_extra:
         extra = (prefix.extra[0], prefix.extra[1], jnp.zeros_like(prefix.extra[2]))
-    v_t = model._suffix_velocity(observation, x_t, time, prefix.kv_cache, prefix.visible, prefix.count, extra)
+    v_t = model._suffix_velocity(observation, x_t, time, prefix.kv_cache, prefix.visible, prefix.offset, extra)
     return jnp.mean(jnp.square(v_t - (noise - actions)), axis=-1), int(mask_num)
 
 
@@ -613,7 +614,7 @@ def test_stage1_hides_a_padded_goal_from_the_action_rows(stage1):
     def velocity(goal):
         obs = _pre(padded.replace(lit_goal=goal))
         p = stage1._lit_prefix_pass(obs, mask_num=0)
-        return stage1._suffix_velocity(obs, x_t, time, p.kv_cache, p.visible, p.count, p.extra)
+        return stage1._suffix_velocity(obs, x_t, time, p.kv_cache, p.visible, p.offset, p.extra)
 
     reference = velocity(_BASE.lit_goal)
     wild = _BASE.lit_goal.at[1].set(jnp.nan)
@@ -1130,7 +1131,6 @@ def test_lit_prefix_returns_a_new_memory_and_leaves_the_one_it_was_given_alone()
 
 def test_lit_prefix_contract_visibility_cache_and_offset():
     chain = _prefixes(open_masks=False)
-    per_block = _valid_per_block()
     for call, (visible, cache, offset, memory) in enumerate(chain, start=1):
         width = call * _PREFIX_LEN
         assert visible.shape == (B, width + _LATENTS)
@@ -1139,7 +1139,8 @@ def test_lit_prefix_contract_visibility_cache_and_offset():
         assert not bool(jnp.any(visible[:, :width]))
         assert bool(jnp.all(visible[:, width:]))
         assert cache[0].shape == cache[1].shape == (4, B, width + _LATENTS, 1, 16)
-        np.testing.assert_array_equal(np.asarray(offset), [v * HIST * call for v in per_block])
+        # ...and the action rows start from the constant position 0, not from the valid tokens of the prefix and memory
+        np.testing.assert_array_equal(np.asarray(offset), [0] * B)
         # the cache is the memory's cache with the latent K/V behind it
         for stacked, saved in zip(cache, memory["memory_kv_cache"], strict=True):
             _equal(stacked[:, :, :width], saved)
@@ -1188,14 +1189,16 @@ def test_memory_columns_are_hidden_by_what_they_are_not_by_the_current_cameras()
     wrist = slice(2 * IMAGE_TOKENS, 3 * IMAGE_TOKENS)  # right wrist of block 0 of the memory
     assert bool(jnp.all(memory["memory_prefix_mask"][:, wrist])), "the memory holds valid right-wrist tokens"
     assert not bool(jnp.any(visible[:, :-_LATENTS])), "...and none of the memory or current columns is visible"
-    first_valid, second_valid = _valid_per_block(_ALL_VALID), _valid_per_block(_RIGHT_WRIST_OFF)
-    np.testing.assert_array_equal(np.asarray(offset), [HIST * (first_valid[i] + second_valid[i]) for i in range(B)])
+    np.testing.assert_array_equal(np.asarray(offset), [0] * B)
     # with the image switch off the text stays hidden but ONLY the memory's wrist columns reappear, current ones don't
     model.lit_mask_image = False
     try:
-        visible, *_ = model.lit_prefix(_pre(second), memory)
+        visible, _, offset, _ = model.lit_prefix(_pre(second), memory)
     finally:
         model.lit_mask_image = True
+    first_valid, second_valid = _valid_per_block(_ALL_VALID), _valid_per_block(_RIGHT_WRIST_OFF)
+    # (the start of the action rows is the valid-token count again as soon as a prefix column is visible)
+    np.testing.assert_array_equal(np.asarray(offset), [HIST * (first_valid[i] + second_valid[i]) for i in range(B)])
     shown = np.asarray(visible[0, : -_LATENTS - _PREFIX_LEN])
     assert shown[wrist].all(), "memory image columns are visible once the image switch is off"
     assert not np.asarray(visible[0, -_LATENTS - _PREFIX_LEN : -_LATENTS])[wrist].any(), "the lost camera stays off"
@@ -1328,7 +1331,7 @@ def test_a_camera_missing_for_the_whole_batch_is_invisible_to_the_sampler():
     wrist = slice(2 * IMAGE_TOKENS, 3 * IMAGE_TOKENS)
     assert not bool(jnp.any(memory["memory_prefix_mask"][:, wrist]))
     assert not bool(jnp.any(visible[:, :-_LATENTS]))
-    np.testing.assert_array_equal(np.asarray(offset), [v * HIST for v in _valid_per_block(_RIGHT_WRIST_OFF)])
+    np.testing.assert_array_equal(np.asarray(offset), [0] * B)
     _equal(n_cache[0][:, :, -_LATENTS:], cache[0][:, :, -_LATENTS:])
     actions = _denoise(model, 0, visible, cache, offset, observation)
     assert np.isfinite(np.asarray(actions)).all()
@@ -1351,3 +1354,173 @@ def test_history_of_one_block_samples_with_memory():
     assert visible.shape == (B, 3 * BLOCK + _LATENTS)
     assert not bool(jnp.any(visible[:, :-_LATENTS]))
     assert cache[0].shape[2] == 3 * BLOCK + _LATENTS
+
+
+# ---- the valid-token count must not reach the action rows through their RoPE positions ----
+#
+# The latent K/V carry no RoPE while the action rows' queries are rotated by their absolute position, so an action
+# row's logits against a latent depend on the position it starts from. Started from the number of valid prefix tokens,
+# that count (prompt length, camera masks, history drop, memory length) reaches rows that are otherwise blind to the
+# whole prefix. The probes need latent K/V that are held constant AND non-zero: against a zero key every logit is 0
+# whatever the rotation, and perturbing observation.state is vacuous under pi05 (the state is in the prompt).
+
+
+@contextlib.contextmanager
+def _constant_latents(model):
+    """The aggregator returns the base observation's latents and latent K/V whatever it is fed."""
+    base = _prefix("stage2", "base")
+    keys, values = (x.reshape(*x.shape[:3], -1) for x in base.extra[:2])
+    assert float(jnp.max(jnp.abs(keys))) > 0.0
+    assert float(jnp.max(jnp.abs(values))) > 0.0
+    real = model.lit_aggregator
+    model.lit_aggregator = lambda *_: (base.latents, keys, values)
+    try:
+        yield
+    finally:
+        model.lit_aggregator = real
+
+
+def _with_prompt_lengths(observation, lengths):
+    mask = np.arange(TEXT)[None, :] < np.asarray(lengths)[:, None]
+    tokens = np.where(mask, np.asarray(observation.tokenized_prompt), 0).astype(np.int32)
+    return observation.replace(tokenized_prompt=jnp.asarray(tokens), tokenized_prompt_mask=jnp.asarray(mask))
+
+
+def _with_camera_off(observation, camera, sample):
+    mask = np.asarray(observation.image_masks[camera]).copy()
+    mask[sample] = False
+    return observation.replace(image_masks={**observation.image_masks, camera: jnp.asarray(mask)})
+
+
+def _count_variants(base):
+    """(observation, mask_num) pairs that change the valid-token count of the prefix and nothing else a hidden column
+    could carry into the action rows."""
+    return {
+        "prompt 8 -> 7 valid tokens (sample 0)": (_with_prompt_lengths(base, (TEXT - 1, TEXT - 3)), 0),
+        "prompt 8 -> 4 and 5 -> 8 valid tokens": (_with_prompt_lengths(base, (TEXT - 4, TEXT)), 0),
+        "camera 0 off (sample 0)": (_with_camera_off(base, "base_0_rgb", 0), 0),
+        "one history block dropped": (base, 1),
+        "two history blocks dropped": (base, 2),
+    }
+
+
+def test_hard_mask_velocity_is_exactly_independent_of_the_valid_token_count():
+    model = _stage_model("stage2")[1]
+    x_t, time = _x_t_and_time()
+
+    def velocity(prefix, observation, offset):
+        args = (prefix.kv_cache, prefix.visible, offset, prefix.extra)
+        return model._suffix_velocity(_pre(observation), x_t, time, *args)
+
+    with _constant_latents(model):
+        base = model._lit_prefix_pass(_pre(_BASE), mask_num=0)
+        reference = velocity(base, _BASE, base.offset)
+        raw_reference = velocity(base, _BASE, base.count)
+        for name, (observation, mask_num) in _count_variants(_BASE).items():
+            prefix = model._lit_prefix_pass(_pre(observation), mask_num=mask_num)
+            assert not np.array_equal(np.asarray(prefix.count), np.asarray(base.count)), name
+            assert not bool(jnp.any(prefix.visible)), name
+            moved = _differs(velocity(prefix, observation, prefix.offset), reference)
+            # the probe has power: started from the raw count, the same constant latents follow the count
+            leaked = _differs(velocity(prefix, observation, prefix.count), raw_reference)
+            print(f"{name}: velocity moved by {moved:.1e}; from the raw count it would move by {leaked:.1e}")
+            assert moved == 0.0, f"{name}: the velocity moved by {moved:.3e}"
+            assert leaked > 0.0, name
+            _equal(prefix.offset, jnp.zeros_like(prefix.count))
+
+
+def test_hard_mask_loss_is_exactly_independent_of_the_valid_token_count(monkeypatch):
+    model = _stage_model("stage2")[1]
+    actions = _utils.make_actions(1)
+    rng = jax.random.key(1)  # draws mask_num 2: the oldest two history blocks are dropped
+    variants = [observation for observation, mask_num in _count_variants(_BASE).values() if mask_num == 0]
+    with _constant_latents(model):
+        reference = model.compute_loss(rng, _BASE, actions)
+        for observation in variants:
+            _equal(model.compute_loss(rng, observation, actions), reference)
+        # the probe has power: with the raw count as the start the loss follows the count
+        monkeypatch.setattr(_pi0.Pi0, "_lit_suffix_offset", lambda self, count: count)
+        leaked = _differs(model.compute_loss(rng, variants[0], actions), model.compute_loss(rng, _BASE, actions))
+    print(f"loss from the raw count would move by {leaked:.1e}")
+    assert leaked > 0.0
+
+
+def _sampled_chain(model, observations, noises):
+    """sample_actions over `observations` on one memory dict: ([actions per call], the memory after the last call)."""
+    memory = _utils.empty_memory()
+    actions = []
+    for observation, noise in zip(observations, noises, strict=True):
+        out, memory = model.sample_actions(_SAMPLE_RNG, observation, num_steps=_STEPS, noise=noise, memory=memory)
+        actions.append(np.asarray(out))
+    return actions, memory
+
+
+def test_hard_mask_sampled_actions_are_exactly_independent_of_the_valid_token_count_over_a_memory_chain(monkeypatch):
+    model = _sample_model()
+    first, second = _sample_obs(0), _sample_obs(1)
+    noises = [_sample_noise(0), _sample_noise(1)]
+    prompts = [_with_prompt_lengths(first, (TEXT - 1, TEXT - 4)), _with_prompt_lengths(second, (TEXT - 4, TEXT))]
+    cameras = [_with_camera_off(first, "base_0_rgb", 0), _with_camera_off(second, "left_wrist_0_rgb", 1)]
+    with _constant_latents(model):
+        reference, memory = _sampled_chain(model, [first, second], noises)
+        for name, observations in (("prompt lengths", prompts), ("camera masks", cameras)):
+            actions, other = _sampled_chain(model, observations, noises)
+            assert not np.array_equal(
+                np.asarray(other["memory_prefix_mask"]), np.asarray(memory["memory_prefix_mask"])
+            ), f"{name}: the probe changed the valid-token count the memory carries"
+            for call in range(2):
+                _equal(actions[call], reference[call])
+        # the memory length: the second call with an empty memory samples what it samples after the first call
+        alone, _ = _sampled_chain(model, [second], noises[1:])
+        _equal(alone[0], reference[1])
+
+        # the probe has power: with the raw count as the start the same chains do differ
+        monkeypatch.setattr(_pi0.Pi0, "_lit_suffix_offset", lambda self, count: count)
+        raw_reference, _ = _sampled_chain(model, [first, second], noises)
+        raw_prompts, _ = _sampled_chain(model, prompts, noises)
+        raw_alone, _ = _sampled_chain(model, [second], noises[1:])
+    leaked = [_differs(a, b) for a, b in zip(raw_prompts, raw_reference, strict=True)]
+    print(f"sampling from the raw count would move the two calls by {leaked[0]:.1e} and {leaked[1]:.1e}")
+    assert all(d > 0.0 for d in leaked)
+    assert _differs(raw_alone[0], raw_reference[1]) > 0.0
+
+
+@pytest.mark.parametrize(("mask_image", "mask_language"), [(True, False), (False, True), (False, False)])
+def test_with_a_prefix_column_visible_the_suffix_starts_from_the_valid_token_count(stage2, mask_image, mask_language):
+    """Only the both-masks-on setting hides the whole prefix, so only there is the start constant: not silently so
+    for the one-sided ablations or the unmasked model, whose visible columns are rotated at their own positions."""
+    shorter = _with_prompt_lengths(_BASE, (TEXT - 1, TEXT - 3))
+    stage2.lit_mask_image, stage2.lit_mask_language = mask_image, mask_language
+    try:
+        prefix = stage2._lit_prefix_pass(_pre(_BASE))
+        shorter_prefix = stage2._lit_prefix_pass(_pre(shorter))
+        _, _, offset, _ = stage2.lit_prefix(_pre(_sample_obs(0)), _utils.empty_memory())
+    finally:
+        stage2.lit_mask_image = stage2.lit_mask_language = True
+    assert bool(jnp.any(prefix.visible))
+    _equal(prefix.offset, prefix.count)
+    _equal(shorter_prefix.offset, shorter_prefix.count)
+    counts = [v * HIST for v in _valid_per_block()]
+    assert np.asarray(prefix.offset).tolist() == counts
+    # one prompt token fewer in each of the three blocks of sample 0, none fewer for sample 1
+    assert np.asarray(shorter_prefix.offset).tolist() == [counts[0] - HIST, counts[1]]
+    assert np.asarray(offset).tolist() == counts
+
+
+def test_stage1_starts_the_action_rows_from_the_valid_token_count():
+    prefix = _prefix("stage1", "base")
+    _equal(prefix.offset, prefix.count)
+    assert np.asarray(prefix.offset).tolist() == list(TEXT_LENGTHS)
+
+
+def test_a_goal_without_its_mask_is_refused(stage1, stage2):
+    """A zero-padded goal with a forgotten mask would otherwise pass as a real target."""
+    unmasked = _BASE.replace(lit_goal_mask=None)
+    actions = _utils.make_actions(1)
+    for model in (stage1, stage2):
+        with pytest.raises(ValueError, match="lit_goal_mask"):
+            model._lit_goal(_pre(unmasked))
+    with pytest.raises(ValueError, match="lit_goal_mask"):
+        stage1.compute_loss(RNG, unmasked, actions)
+    with pytest.raises(ValueError, match="lit_goal_mask"):
+        stage2.compute_loss_and_aux(RNG, unmasked, actions)
