@@ -968,3 +968,386 @@ def test_freeze_filter_at_real_dimensions(name, stage, lora, capsys):
         assert all("lora" not in p for p in frozen)
         assert all(p.startswith("PaliGemma/llm/") for p in frozen)
         assert any("lora" in p for p in train)
+
+
+# ---- the sampling path: lit_prefix, sample_actions, memory ----
+#
+# Sampling observations are the plain ones lit_golden uses (no goal: sampling never reads it), so a lit="off" model and
+# a stage-2 model with the same backbone parameters see exactly the same prefix and can be compared to the stock
+# fixture. Each prefix pass runs SigLIP eagerly (about 14 s here), hence the caches.
+
+_STEPS = _gen.NUM_STEPS
+_DT = -1.0 / _STEPS
+_SAMPLE_RNG = jax.random.key(_gen.SAMPLE_RNG_SEED)
+_LATENTS = _utils.TINY_LIT_DEFAULTS["lit_num_latents"]
+_PREFIX_LEN = HIST * BLOCK
+# Measured on this CPU in float32: the latent-free two-pass sampler equals the stock fixture exactly (0.0), the jitted
+# sampler differs from the eager one by a relative 1.3e-7. 1e-5 is the training tests' _REL, more than 70x above both.
+_SAMPLE_REL = _REL
+_ALL_VALID = ()
+_STOCK_KEYS = ["memory_kv_cache", "memory_prefix_mask", "memory_tokens"]
+_RIGHT_WRIST_OFF = tuple(("right_wrist_0_rgb", i) for i in range(B))
+
+
+def _sample_obs(call: int, **kwargs):
+    return _utils.make_observation(_gen.OBSERVATION_SEEDS[call], **kwargs)
+
+
+def _sample_noise(call: int):
+    return _utils.fixed_noise(_gen.NOISE_SEEDS[call])
+
+
+def _sample_model(*, open_masks: bool = False, **overrides):
+    if open_masks:
+        overrides = {"lit_mask_image": False, "lit_mask_language": False, **overrides}
+    return _stage_model("stage2", **overrides)[1]
+
+
+def _stock_actions(call: int):
+    with np.load(_gen.FIXTURE_DIR / "baseline_actions.npz") as fixture:
+        return fixture[f"f32_rand_eager__call{call + 1}_actions"]
+
+
+@functools.cache
+def _sampled(*, open_masks: bool):
+    """Two sample_actions calls on one memory dict: ([actions per call], [memory snapshot per call])."""
+    model = _sample_model(open_masks=open_masks)
+    memory = _utils.empty_memory()
+    actions, memories = [], []
+    for call in range(2):
+        out, memory = model.sample_actions(
+            _SAMPLE_RNG, _sample_obs(call), num_steps=_STEPS, noise=_sample_noise(call), memory=memory
+        )
+        actions.append(np.asarray(out))
+        memories.append(dict(memory))
+    return actions, memories
+
+
+def _prefix_chain(model, observations):
+    """lit_prefix over `observations`, each call carrying the previous call's new memory."""
+    memory = _utils.empty_memory()
+    chain = []
+    for observation in observations:
+        before = dict(memory)
+        visible, cache, offset, new_memory = model.lit_prefix(_pre(observation), memory)
+        assert new_memory is not memory
+        assert memory.keys() == before.keys()
+        assert all(memory[key] is before[key] for key in before), "lit_prefix wrote into the memory it was given"
+        memory = new_memory
+        chain.append((visible, cache, offset, memory))
+    return chain
+
+
+@functools.cache
+def _prefixes(*, open_masks: bool):
+    return _prefix_chain(_sample_model(open_masks=open_masks), [_sample_obs(0), _sample_obs(1)])
+
+
+def _denoise(model, call: int, visible, cache, offset, observation=None):
+    observation = _pre(_sample_obs(call) if observation is None else observation)
+    return model._denoise(observation, _sample_noise(call), _DT, visible, cache, offset)
+
+
+def _with_latents_of(cache, other):
+    """`cache` with its latent columns (the last _LATENTS) replaced by those of `other`."""
+    return tuple(
+        jnp.concatenate([c[:, :, :-_LATENTS], o[:, :, -_LATENTS:]], axis=2) for c, o in zip(cache, other, strict=True)
+    )
+
+
+def _without_latents(visible, cache):
+    return visible[:, :-_LATENTS], tuple(c[:, :, :-_LATENTS] for c in cache)
+
+
+def _valid_per_block(masked=_utils.DEFAULT_MASKED):
+    """Valid prefix tokens of each sample in one block, for the cameras `masked` lists as missing."""
+    lost = [sum(IMAGE_TOKENS for camera, sample in masked if sample == i) for i in range(B)]
+    return [CAMERAS * IMAGE_TOKENS + TEXT_LENGTHS[i] - lost[i] for i in range(B)]
+
+
+def test_lit_off_sampling_equals_the_baseline_fixture_and_never_enters_the_lit_path(monkeypatch):
+    def refuse(*args, **kwargs):
+        raise AssertionError("the LIT sampling path ran for lit='off'")
+
+    monkeypatch.setattr(_pi0.Pi0, "lit_prefix", refuse)
+    monkeypatch.setattr(_pi0.Pi0, "_sample_actions_lit", refuse)
+    actions, memory = _gen.run_sample("f32_rand_eager")
+    with np.load(_gen.FIXTURE_DIR / "baseline_actions.npz") as fixture:
+        expected = {k: v for k, v in fixture.items() if k.startswith("f32_rand_eager__")}
+    assert sorted(actions) == sorted(expected) == [f"f32_rand_eager__call{i}_actions" for i in (1, 2)]
+    for key, want in expected.items():
+        assert actions[key].dtype == want.dtype
+        _equal(actions[key], want)
+    expected_memory = json.loads((_gen.FIXTURE_DIR / "baseline_memory.json").read_text())["f32_rand_eager"]
+    assert memory == expected_memory
+    assert sorted(memory["call2"]) == _STOCK_KEYS
+
+
+def test_stage1_cannot_sample_and_lit_off_has_no_lit_prefix(stage1):
+    observation = _sample_obs(0)
+    with pytest.raises(ValueError, match="training-only"):
+        stage1.sample_actions(_SAMPLE_RNG, observation, memory=_utils.empty_memory())
+    with pytest.raises(ValueError, match="training-only"):
+        stage1.lit_prefix(_pre(observation), _utils.empty_memory())
+    with pytest.raises(ValueError, match="stage2"):
+        _gen.get_model("float32", "rand").lit_prefix(_pre(observation), _utils.empty_memory())
+
+
+def test_sample_actions_returns_what_lit_prefix_and_the_shared_denoise_give():
+    actions, memories = _sampled(open_masks=False)
+    model = _sample_model()
+    for call, (visible, cache, offset, new_memory) in enumerate(_prefixes(open_masks=False)):
+        assert actions[call].shape == (B, 4, ACTION_DIM)
+        assert np.isfinite(actions[call]).all()
+        _equal(_denoise(model, call, visible, cache, offset), actions[call])
+        # sample_actions hands back the memory lit_prefix built, in the dict it was given
+        assert sorted(memories[call]) == sorted(new_memory) == _STOCK_KEYS
+        for key in _STOCK_KEYS:
+            for got, want in zip(jax.tree.leaves(memories[call][key]), jax.tree.leaves(new_memory[key]), strict=True):
+                _equal(got, want)
+
+
+def test_memory_over_two_calls_is_the_stock_memory_and_never_holds_a_latent():
+    _, memories = _sampled(open_masks=False)
+    expected = json.loads((_gen.FIXTURE_DIR / "baseline_memory.json").read_text())["f32_rand_eager"]
+    for call, memory in enumerate(memories, start=1):
+        assert sorted(memory) == _STOCK_KEYS
+        assert not any("lit" in key for key in memory)
+        # the cache and mask hold exactly the prefix columns of every call so far: no latent column
+        assert memory["memory_kv_cache"][0].shape == (4, B, call * _PREFIX_LEN, 1, 16)
+        assert memory["memory_prefix_mask"].shape == (B, call * _PREFIX_LEN)
+        assert memory["memory_tokens"].shape[1] == _PREFIX_LEN
+        # and it is bit for bit the memory of the stock model (same backbone parameters, same inputs)
+        assert _utils.memory_summary(memory) == expected[f"call{call}"]
+
+
+def test_lit_prefix_returns_a_new_memory_and_leaves_the_one_it_was_given_alone():
+    # _prefix_chain asserts the input dict is untouched at every call
+    first, second = (memory for *_, memory in _prefixes(open_masks=False))
+    assert first["memory_prefix_mask"].shape == (B, _PREFIX_LEN)
+    assert second["memory_prefix_mask"].shape == (B, 2 * _PREFIX_LEN), "call 2 built on call 1's memory"
+
+
+def test_lit_prefix_contract_visibility_cache_and_offset():
+    chain = _prefixes(open_masks=False)
+    per_block = _valid_per_block()
+    for call, (visible, cache, offset, memory) in enumerate(chain, start=1):
+        width = call * _PREFIX_LEN
+        assert visible.shape == (B, width + _LATENTS)
+        assert visible.dtype == jnp.bool_
+        # both switches on: every memory and prefix column is hidden, the latent columns are all visible
+        assert not bool(jnp.any(visible[:, :width]))
+        assert bool(jnp.all(visible[:, width:]))
+        assert cache[0].shape == cache[1].shape == (4, B, width + _LATENTS, 1, 16)
+        np.testing.assert_array_equal(np.asarray(offset), [v * HIST * call for v in per_block])
+        # the cache is the memory's cache with the latent K/V behind it
+        for stacked, saved in zip(cache, memory["memory_kv_cache"], strict=True):
+            _equal(stacked[:, :, :width], saved)
+    # the latents come from the CURRENT block's aggregation: call 2 has its own, not call 1's
+    assert not np.array_equal(
+        np.asarray(chain[0][1][0][:, :, -_LATENTS:]), np.asarray(chain[1][1][0][:, :, -_LATENTS:])
+    )
+
+
+def test_each_mask_switch_hides_only_its_own_columns_over_memory_and_prefix():
+    model = _sample_model()
+    _, _, _, memory = _prefixes(open_masks=False)[0]
+    per_sample_text = TEXT_LENGTHS
+    try:
+        for mask_image, mask_language in ((True, False), (False, True)):
+            model.lit_mask_image, model.lit_mask_language = mask_image, mask_language
+            visible, *_ = model.lit_prefix(_pre(_sample_obs(1)), memory)
+            for sample in range(B):
+                text = [
+                    t * BLOCK + CAMERAS * IMAGE_TOKENS + j
+                    for t in range(2 * HIST)
+                    for j in range(per_sample_text[sample])
+                ]
+                images = [
+                    t * BLOCK + c * IMAGE_TOKENS + j
+                    for t in range(2 * HIST)
+                    for c in range(CAMERAS)
+                    for j in range(IMAGE_TOKENS)
+                    if not (sample == 1 and c == 2)
+                ]
+                expected = text if mask_image else images
+                np.testing.assert_array_equal(
+                    _columns(visible[:, :-_LATENTS], sample), expected, err_msg=f"{mask_image=} {mask_language=}"
+                )
+    finally:
+        model.lit_mask_image = model.lit_mask_language = True
+
+
+def test_memory_columns_are_hidden_by_what_they_are_not_by_the_current_cameras():
+    """Call 1 had every camera, call 2 has lost one: the memory still holds that camera's valid image tokens. They are
+    image columns, so they stay hidden."""
+    model = _sample_model()
+    first = _sample_obs(0, masked=_ALL_VALID)
+    second = _sample_obs(1, masked=_RIGHT_WRIST_OFF)
+    (_, _, _, memory), (visible, _, offset, _) = _prefix_chain(model, [first, second])
+    wrist = slice(2 * IMAGE_TOKENS, 3 * IMAGE_TOKENS)  # right wrist of block 0 of the memory
+    assert bool(jnp.all(memory["memory_prefix_mask"][:, wrist])), "the memory holds valid right-wrist tokens"
+    assert not bool(jnp.any(visible[:, :-_LATENTS])), "...and none of the memory or current columns is visible"
+    first_valid, second_valid = _valid_per_block(_ALL_VALID), _valid_per_block(_RIGHT_WRIST_OFF)
+    np.testing.assert_array_equal(np.asarray(offset), [HIST * (first_valid[i] + second_valid[i]) for i in range(B)])
+    # with the image switch off the text stays hidden but ONLY the memory's wrist columns reappear, current ones don't
+    model.lit_mask_image = False
+    try:
+        visible, *_ = model.lit_prefix(_pre(second), memory)
+    finally:
+        model.lit_mask_image = True
+    shown = np.asarray(visible[0, : -_LATENTS - _PREFIX_LEN])
+    assert shown[wrist].all(), "memory image columns are visible once the image switch is off"
+    assert not np.asarray(visible[0, -_LATENTS - _PREFIX_LEN : -_LATENTS])[wrist].any(), "the lost camera stays off"
+
+
+def test_hard_mask_sampled_actions_ignore_images_language_and_state_of_every_block_and_memory():
+    """Latents held fixed (the base chain's), the images, the language/state tokens and the state of the current
+    block, the history blocks and the memory all change: the sampled actions are bit for bit the same."""
+    model = _sample_model()
+    base = _prefixes(open_masks=False)
+    other = _prefix_chain(model, [_utils.make_observation(7), _utils.make_observation(8)])
+    for call in range(2):
+        visible, cache, offset, _ = base[call]
+        o_visible, o_cache, o_offset, _ = other[call]
+        assert not np.array_equal(np.asarray(o_cache[0][:, :, :-_LATENTS]), np.asarray(cache[0][:, :, :-_LATENTS]))
+        assert not np.array_equal(np.asarray(o_cache[0][:, :, -_LATENTS:]), np.asarray(cache[0][:, :, -_LATENTS:]))
+        _equal(o_visible, visible)
+        _equal(o_offset, offset)
+        reference = _denoise(model, call, visible, cache, offset)
+        fixed = _denoise(model, call, o_visible, _with_latents_of(o_cache, cache), o_offset)
+        _equal(fixed, reference)
+        # live latents: the same perturbation does change the action
+        live = _denoise(model, call, o_visible, o_cache, o_offset)
+        print(f"call {call + 1}: live latents move the actions by {_differs(live, reference):.3e}")
+        assert _differs(live, reference) > 0.0
+
+
+def test_with_the_masks_off_the_action_rows_do_read_the_prefix_and_the_memory():
+    model = _sample_model(open_masks=True)
+    base = _prefixes(open_masks=True)
+    other = _prefix_chain(model, [_utils.make_observation(7), _utils.make_observation(8)])
+    for call in range(2):
+        visible, cache, offset, _ = base[call]
+        o_visible, o_cache, o_offset, _ = other[call]
+        reference = _denoise(model, call, visible, cache, offset)
+        fixed = _denoise(model, call, o_visible, _with_latents_of(o_cache, cache), o_offset)
+        assert _differs(fixed, reference) > 0.0
+
+
+def test_two_pass_with_no_lit_mask_and_no_latents_equals_the_stock_sampling(capsys):
+    """Masks off and the latent columns dropped, the two-pass sampler is the stock joint one: against the fixture
+    (generated from the unmodified pin), call 1 with an empty memory and call 2 with the memory carried."""
+    model = _sample_model(open_masks=True)
+    worst = 0.0
+    for call, (visible, cache, offset, memory) in enumerate(_prefixes(open_masks=True)):
+        assert bool(jnp.all(visible[:, -_LATENTS:]))
+        no_latent_visible, no_latent_cache = _without_latents(visible, cache)
+        _equal(no_latent_visible, memory["memory_prefix_mask"])
+        stock = _stock_actions(call)
+        got = _denoise(model, call, no_latent_visible, no_latent_cache, offset)
+        worst = max(worst, _differs(got, stock) / float(np.max(np.abs(stock))))
+    with capsys.disabled():
+        print(f"\nsampling two-pass vs stock fixture: worst relative difference {worst:.3e} (tolerance {_SAMPLE_REL})")
+    assert worst <= _SAMPLE_REL
+    # the masks are what separates stage 2 from the stock model: with them on the actions are different
+    assert _differs(_sampled(open_masks=False)[0][0], _stock_actions(0)) > 1e-3
+
+
+def test_train_and_serve_compute_the_same_velocity():
+    """The velocity of the training path (_lit_prefix_pass + its own latent columns) and of the sampling path
+    (lit_prefix, latents inside the cache), for the same x_t, t and observation."""
+    model = _sample_model()
+    observation = _pre(_BASE)
+    x_t, time = _x_t_and_time()
+    train = _velocity("stage2", _prefix("stage2", "base"))
+    visible, cache, offset, _ = _prefixes(open_masks=False)[0]
+    serve = model._suffix_velocity(observation, x_t, time, cache, visible, offset)
+    print(
+        f"train vs serve velocity: max |difference| {_differs(serve, train):.3e}, scale {float(jnp.max(jnp.abs(train))):.3e}"
+    )
+    _equal(serve, train)
+
+
+def test_the_training_loss_is_the_sampling_velocity_against_the_target():
+    """End to end: compute_loss, rebuilt from the draws it makes and the SAMPLING path's velocity."""
+    model = _sample_model()
+    rng = jax.random.key(0)
+    actions = _utils.make_actions(1)
+    noise, time, mask_num = _utils.training_noise_and_time(rng, B)
+    assert int(mask_num) == 0, "this rng keeps every history block, as sampling does"
+    x_t = time[..., None] * noise + (1 - time[..., None]) * actions
+    visible, cache, offset, _ = _prefixes(open_masks=False)[0]
+    v_t = model._suffix_velocity(_pre(_BASE), x_t, time, cache, visible, offset)
+    from_sampling = jnp.mean(jnp.square(v_t - (noise - actions)), axis=-1)
+    loss = model.compute_loss(rng, _BASE, actions)
+    print(f"loss vs sampling-path loss: max |difference| {_differs(loss, from_sampling):.3e}")
+    _equal(loss, from_sampling)
+
+
+def test_sampling_is_deterministic_under_jit_and_matches_eager(capsys):
+    model = _sample_model()
+    fn = _utils.jit_sample(model)
+
+    def run():
+        memory = _utils.empty_memory()
+        actions = []
+        for call in range(2):
+            out, memory = fn(_SAMPLE_RNG, _sample_obs(call), num_steps=_STEPS, noise=_sample_noise(call), memory=memory)
+            actions.append(np.asarray(out))
+        return actions, memory
+
+    first, memory = run()
+    second, _ = run()
+    for a, b in zip(first, second, strict=True):
+        _equal(a, b)
+    assert sorted(memory) == _STOCK_KEYS
+    assert memory["memory_kv_cache"][0].shape[2] == 2 * _PREFIX_LEN
+    eager = _sampled(open_masks=False)[0]
+    worst = max(_differs(a, b) / float(np.max(np.abs(b))) for a, b in zip(first, eager, strict=True))
+    with capsys.disabled():
+        print(f"\njit vs eager sampling: worst relative difference {worst:.3e}")
+    assert worst <= _SAMPLE_REL
+
+
+def test_a_camera_missing_for_the_whole_batch_is_invisible_to_the_sampler():
+    """Single-arm (left_real style): a camera is off for every sample. Its pixels reach neither the latents nor the
+    action rows, even with live latents."""
+    model = _sample_model()
+    observation = _sample_obs(0, masked=_RIGHT_WRIST_OFF)
+    noisy = observation.replace(
+        images={
+            **observation.images,
+            "right_wrist_0_rgb": jnp.asarray(
+                np.random.default_rng(5).uniform(-1, 1, observation.images["right_wrist_0_rgb"].shape), jnp.float32
+            ),
+        }
+    )
+    visible, cache, offset, memory = _prefix_chain(model, [observation])[0]
+    n_visible, n_cache, n_offset, _ = _prefix_chain(model, [noisy])[0]
+    wrist = slice(2 * IMAGE_TOKENS, 3 * IMAGE_TOKENS)
+    assert not bool(jnp.any(memory["memory_prefix_mask"][:, wrist]))
+    assert not bool(jnp.any(visible[:, :-_LATENTS]))
+    np.testing.assert_array_equal(np.asarray(offset), [v * HIST for v in _valid_per_block(_RIGHT_WRIST_OFF)])
+    _equal(n_cache[0][:, :, -_LATENTS:], cache[0][:, :, -_LATENTS:])
+    actions = _denoise(model, 0, visible, cache, offset, observation)
+    assert np.isfinite(np.asarray(actions)).all()
+    _equal(_denoise(model, 0, n_visible, n_cache, n_offset, noisy), actions)
+
+
+def test_history_of_one_block_samples_with_memory():
+    model = _sample_model(hist_horizon=1)
+    config = _utils.make_tiny_config(lit="stage2", hist_horizon=1)
+    memory = _utils.empty_memory()
+    for call in range(2):
+        observation = _utils.make_observation(call, config=config)
+        out, memory = model.sample_actions(
+            _SAMPLE_RNG, observation, num_steps=_STEPS, noise=_utils.fixed_noise(call, config=config), memory=memory
+        )
+        assert np.isfinite(np.asarray(out)).all()
+        assert sorted(memory) == _STOCK_KEYS
+        assert memory["memory_kv_cache"][0].shape[2] == (call + 1) * BLOCK
+    visible, cache, _, _ = model.lit_prefix(_pre(observation), memory)
+    assert visible.shape == (B, 3 * BLOCK + _LATENTS)
+    assert not bool(jnp.any(visible[:, :-_LATENTS]))
+    assert cache[0].shape[2] == 3 * BLOCK + _LATENTS
