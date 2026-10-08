@@ -40,9 +40,15 @@ HIST_INTERVAL_WIDE = 20
 ACTION_HORIZON = 30
 # The YAM LeRobot layout: three cameras, 14-dim state/action [L j0..5, L grip, R j0..5, R grip].
 YAM_CAMERAS = ("cam_high", "cam_left_wrist", "cam_right_wrist")
+# RACE twins (arXiv 2610.05719) read their transition targets from <this>/<dataset repo id> on the misc Volume,
+# which training containers mount at /misc.
+RACE_TARGETS_ROOT = "/misc/race-targets"
+# The recipes that get a `_race` twin (race_twin).
+RACE_TWIN_BASES: tuple[str, ...] = ()
 
 
-def yam_repack(cameras: tuple[str, ...] = YAM_CAMERAS) -> _transforms.Group:
+def yam_repack(cameras: tuple[str, ...] = YAM_CAMERAS, *, race: bool = False) -> _transforms.Group:
+    race_targets = {key: key for key in _transforms.RACE_TARGET_KEYS} if race else {}
     return _transforms.Group(
         inputs=[
             _transforms.RepackTransform(
@@ -50,6 +56,7 @@ def yam_repack(cameras: tuple[str, ...] = YAM_CAMERAS) -> _transforms.Group:
                     "images": {camera: f"observation.images.{camera}" for camera in cameras},
                     "state": "observation.state",
                     "actions": "action",
+                    **race_targets,
                 }
             )
         ]
@@ -70,11 +77,22 @@ def get_ih_yam_configs():
         fills it at train and serve time exactly as the openpi fork's YAM configs do."""
 
         repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(default=YAM_REPACK)
+        # Load the norm stats of this config instead of this recipe's own (a twin that must normalize exactly as
+        # the recipe its checkpoint was trained under). An explicit --data.assets.assets-dir still wins.
+        norm_stats_config: str | None = None
+        # RACE: the dataset's sidecar is <race_targets_root>/<repo_id> (DataConfig.race_targets_dir), so a
+        # --data.repo-id override follows to that dataset's own targets. None: no RACE targets.
+        race_targets_root: str | None = None
 
         @override
         def create(self, assets_dirs, model_config):
+            if self.norm_stats_config is not None:
+                assets_dirs = assets_dirs.parent / self.norm_stats_config
+            created = super().create(assets_dirs, model_config)
+            if self.race_targets_root is not None:
+                created = dataclasses.replace(created, race_targets_dir=f"{self.race_targets_root}/{created.repo_id}")
             return dataclasses.replace(
-                super().create(assets_dirs, model_config),
+                created,
                 # pi0.5's own default (the AgileX base config forces z-score). The YAM left gripper never
                 # moves in the corpus, so its std is ~1e-3 and z-scoring turns its noise into a loss of
                 # tens of thousands; the quantile band is floored by the stats writer instead.
@@ -87,7 +105,8 @@ def get_ih_yam_configs():
                       active_state_dims: tuple[int, ...] | None = None,
                       held_action_dims: tuple[int, ...] | None = None,
                       vlash_max_offset: int = 0, vlash_branches: int = 0, state_cond: bool = False,
-                      encode_only_active_cameras: bool = False):
+                      encode_only_active_cameras: bool = False,
+                      race: bool = False, norm_stats_config: str | None = None):
         # A masked camera's tokens are padding, so a recipe may skip decoding and encoding them: the same
         # model, one SigLIP pass per frame instead of three and a third of the prefix. Opt-in per config
         # because it changes the model's input layout (not its weights).
@@ -107,6 +126,7 @@ def get_ih_yam_configs():
             state_cond_dims=active_state_dims if state_cond else None,
             vlash_branches=vlash_branches,
             image_keys=image_keys,
+            race=race,
         )
         return TrainConfig(
             name=name,
@@ -117,7 +137,9 @@ def get_ih_yam_configs():
                 active_image_keys=active_image_keys,
                 active_state_dims=active_state_dims,
                 held_action_dims=held_action_dims,
-                repack_transforms=yam_repack(kept_cameras),
+                repack_transforms=yam_repack(kept_cameras, race=race),
+                norm_stats_config=norm_stats_config,
+                race_targets_root=RACE_TARGETS_ROOT if race else None,
                 hist_sequence_keys=tuple(f"observation.images.{camera}" for camera in kept_cameras),
                 base_config=DataConfig(
                     prompt_from_task=False,
@@ -188,5 +210,14 @@ def get_ih_yam_configs():
         return {**vlash_twin(recipe), "name": recipe["name"] + "_vlashp",
                 "vlash_branches": recipe.get("hist_interval", HIST_INTERVAL), "state_cond": True}
 
+    def race_twin(recipe: dict) -> dict:
+        # RACE (arXiv 2610.05719) on the recipe a checkpoint was trained under, warm-started from that checkpoint
+        # (--weight-loader.params-path; the new weights start at zero, so step 0 is the checkpoint). It keeps the
+        # recipe's norm stats, and a single-camera recipe skips the cameras it masks (the same model).
+        return {**recipe, "name": recipe["name"] + "_race", "race": True, "norm_stats_config": recipe["name"],
+                "encode_only_active_cameras": recipe.get("active_image_keys") is not None}
+
+    race_twins = [race_twin(recipe) for recipe in recipes if recipe["name"] in RACE_TWIN_BASES]
     return [stream_config(**recipe) for recipe in
-            recipes + [vlash_twin(recipe) for recipe in recipes] + [vlash_packed_twin(recipe) for recipe in recipes]]
+            recipes + [vlash_twin(recipe) for recipe in recipes] + [vlash_packed_twin(recipe) for recipe in recipes]
+            + race_twins]
