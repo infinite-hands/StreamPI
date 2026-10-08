@@ -108,6 +108,12 @@ class Observation(Generic[ArrayT]):
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "#b l"] | None = None
 
+    # RACE (Pi0Config.race), training only: the soft transition target of frames i-1 .. i+H around the sample's
+    # anchor frame i (the action rows plus one neighbour each side, for the conditioning jitter), and which of
+    # those frames lie inside the anchor's episode.
+    transition_window: at.Float[ArrayT, "#b race_rows"] | None = None
+    transition_window_mask: at.Bool[ArrayT, "#b race_rows"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -137,6 +143,8 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            transition_window=data.get("transition_window"),
+            transition_window_mask=data.get("transition_window_mask"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -219,6 +227,8 @@ def preprocess_observation(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        transition_window=observation.transition_window,
+        transition_window_mask=observation.transition_window_mask,
     )
 
 
@@ -292,6 +302,12 @@ class BaseModel(nnx.Module, abc.ABC):
         *,
         train: bool = False,
     ) -> at.Float[at.Array, "*b ah"]: ...
+
+    def training_loss(
+        self, rng: at.KeyArrayLike, observation: Observation, actions: Actions
+    ) -> tuple[at.Float[at.Array, ""], dict[str, at.Array]]:
+        """The scalar a train step minimises, and the named parts it logs beside it."""
+        return jnp.mean(self.compute_loss(rng, observation, actions, train=True)), {}
 
     @abc.abstractmethod
     def sample_actions(self, rng: at.KeyArrayLike, observation: Observation, **kwargs) -> Actions: ...
