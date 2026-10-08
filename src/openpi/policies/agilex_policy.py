@@ -314,6 +314,11 @@ class AgilexInputs(transforms.DataTransformFn):
         if "action_prefix" in data:
             inputs["action_prefix"] = data["action_prefix"]
 
+        # RACE's training targets (transforms.RaceTargets), for the model to read off the Observation.
+        for key in transforms.RACE_TARGET_KEYS:
+            if key in data:
+                inputs[key] = data[key]
+
         return inputs
 
 
@@ -329,7 +334,11 @@ class AgilexOutputs(transforms.DataTransformFn):
         else:
             # Only return the first 14 dims.
             actions = np.asarray(data["actions"][:, :14])
-        return {"actions": actions}
+        outputs = {"actions": actions}
+        if transforms.TRANSITION_SCORES_KEY in data:
+            # A RACE model's per-row transition scores, passed through unchanged.
+            outputs[transforms.TRANSITION_SCORES_KEY] = np.asarray(data[transforms.TRANSITION_SCORES_KEY])
+        return outputs
 
 
 def _decode_agilex(data: dict) -> dict:

@@ -17,6 +17,25 @@ from openpi.shared import array_typing as at
 
 logger = logging.getLogger("openpi")
 
+# RACE (arXiv 2610.05719, "When to Switch: Reliable Action-Chunk Extension"). Every number below is the paper's
+# unless its comment says "our choice".
+# Sec. 4.1, "with K = 10 denoising steps": one learnable gate alpha^k per step k (eq. 1). A flow time is mapped
+# to the gate of the step whose interval [(k-1)/K, k/K) contains it (sec. 3.1), whatever step count a sampler
+# runs.
+RACE_NUM_GATES = 10
+# Eq. 1, "alpha^k in (0, 1) is a learnable per-step gate with sigmoid activation"; sec. 4.1, "we initialize
+# every gate alpha^k to 0.5": a logit of 0.
+RACE_GATE_INIT_LOGIT = 0.0
+# Our choice: the paper gives the head's attention no head count, so it uses one head of width d_z.
+RACE_HEAD_NUM_HEADS = 1
+# App. C.4, "we randomly shift the target by one action step with probability 0.5" (alg. 1: "+-1 step").
+RACE_JITTER_PROB = 0.5
+# Our choice: a +1 and a -1 shift are equally likely (the paper says only "+-1").
+RACE_JITTER_FORWARD_PROB = 0.5
+# Folded into the step's rng for the jitter draws, so the base model's noise, time and history-drop draws are
+# the same with and without RACE.
+_RACE_JITTER_STREAM = 0x5ACE
+
 
 def make_attn_mask(input_mask, mask_ar):
     """Adapted from big_vision.
@@ -91,7 +110,8 @@ class Pi0(_model.BaseModel):
                 adarms=config.pi05,
             )
         )
-        llm.lazy_init(rngs=rngs, method="init", use_adarms=[False, True] if config.pi05 else [False, False])
+        llm.lazy_init(rngs=rngs, method="init", use_adarms=[False, True] if config.pi05 else [False, False],
+                      race=config.race)
         img = nnx_bridge.ToNNX(
             _siglip.Module(
                 num_classes=paligemma_config.width,
@@ -123,6 +143,21 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
+        self.race = config.race
+        if config.race:
+            self.race_aux_weight = config.race_aux_weight
+            self.race_timing_weight = config.race_timing_weight
+            width = action_expert_config.width                                   # d_a
+            prefix_width = paligemma_config.num_kv_heads * paligemma_config.head_dim  # d_z: a cached value's width
+            # Eq. 5's e_trans, "a randomly initialized learnable transition embedding"; N(0, 1) is our choice.
+            self.race_embedding = nnx.Param(jax.random.normal(rngs.params(), (width,)))
+            self.race_gate_logits = nnx.Param(jnp.full((RACE_NUM_GATES,), RACE_GATE_INIT_LOGIT))
+            # Eq. 3's head: W_f, a cross-attention, a self-attention and w_p. Our choices where the paper is
+            # silent: flax's default initialisers, biases on every projection, float32 throughout.
+            self.race_head_proj = nnx.Linear(width, prefix_width, rngs=rngs)
+            self.race_head_cross = nnx.MultiHeadAttention(RACE_HEAD_NUM_HEADS, prefix_width, decode=False, rngs=rngs)
+            self.race_head_self = nnx.MultiHeadAttention(RACE_HEAD_NUM_HEADS, prefix_width, decode=False, rngs=rngs)
+            self.race_head_out = nnx.Linear(prefix_width, 1, rngs=rngs)
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -262,8 +297,27 @@ class Pi0(_model.BaseModel):
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
+        """The flow-matching loss per action row (RACE's L_full for a RACE model)."""
         if actions.ndim == 4:
             return self._compute_loss_branches(rng, observation, actions, train=train)
+        return self._compute_losses(rng, observation, actions, train=train)[0]
+
+    @override
+    def training_loss(
+        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
+    ) -> tuple[at.Float[at.Array, ""], dict[str, at.Array]]:
+        if not self.race:
+            return super().training_loss(rng, observation, actions)
+        full, aux, timing = self._compute_losses(rng, observation, actions, train=True)
+        flow_loss, aux_loss = jnp.mean(full), jnp.mean(aux)
+        # Sec. 3.3: L = L_full + lambda_aux L_aux + lambda_timing L_timing.
+        loss = flow_loss + self.race_aux_weight * aux_loss + self.race_timing_weight * timing
+        return loss, {"flow_loss": flow_loss, "aux_loss": aux_loss, "timing_loss": timing}
+
+    def _compute_losses(
+        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool
+    ):
+        """(L_full per row, L_aux per row, L_timing); the last two are None for a model without RACE."""
         preprocess_rng, noise_rng, time_rng, mask_rng = jax.random.split(rng, 4)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train, image_keys=self.image_keys)
 
@@ -311,12 +365,36 @@ class Pi0(_model.BaseModel):
         # # safe_print("x2, x3 = {}", attn_mask[0, 768*2:768*3, 768*3:768*3 + 10].sum())
         # safe_print("x3, x2 = {}", attn_mask[0, 768*3:768*3 + 10, 768*2:768*3].sum())
 
-        (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-            [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
+        race_cond = None
+        if self.race:
+            # Sec. 3.3 / alg. 1: the full pass is conditioned on the jittered target (teacher forcing), with
+            # the gate of the denoising step whose interval contains the sampled flow time.
+            race_cond = self.race_conditioning(self._race_teacher_prior(rng, observation, train=train),
+                                               self._race_gate_for_training(time[:, 0]))
+
+        (prefix_out, suffix_out), kv_cache = self.PaliGemma.llm(
+            [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond],
+            race_cond=race_cond,
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        full = jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        if not self.race:
+            return full, None, None
+
+        # Sec. 3.2 / alg. 1 lines 5-10: the auxiliary pass, one unmodulated step from the same noise at the
+        # paper's s = 0 (t = 1 here), over the prefix this pass just cached -- the inference path's own shape.
+        # Prefix tokens never attend to the suffix, so their cached keys and values are the prefix's alone.
+        prefix_len = prefix_tokens.shape[1]
+        prefix_mask = input_mask[:, :prefix_len]
+        prefix_kv = jax.tree.map(lambda cache: cache[:, :, :prefix_len], kv_cache)
+        v_aux, hidden = self._suffix_pass(observation, prefix_mask, prefix_kv, noise, jnp.ones_like(time))
+        aux = jnp.mean(jnp.square(v_aux - u_t), axis=-1)
+        # The head reads the current frame only: the last of the T frame blocks, as a serve call's prefix is.
+        current = (T - 1) * num_img_tokens
+        logits = self._race_head_logits(hidden, self._race_prefix_values(prefix_kv, current, num_img_tokens),
+                                        prefix_mask[:, current:])
+        return full, aux, self._race_timing_loss(logits, observation)
 
     def _compute_loss_branches(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: at.Float[at.Array, "b n ah ad"],
@@ -499,40 +577,16 @@ class Pi0(_model.BaseModel):
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions, kv_cache=memory_kv_cache)
         self.save_memory(prefix_tokens, prefix_mask, num_visual_tokens, num_text_tokens, kv_cache, memory)
 
+        # RACE (alg. 2): the prior, once per call, from this call's prefix and the noise the loop starts from.
+        prior = None
+        if self.race:
+            prior = self.race_prior(observation, prefix_mask, kv_cache, noise, current_prefix_len=prefix_tokens.shape[1])
+
         def step(carry):
             x_t, time = carry
             time_ = jnp.broadcast_to(time, batch_size)  # (b, )
-            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-                observation, x_t, time_[:, None]
-            )
-            # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
-            # other
-            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
-            # `prefix_attn_mask` is shape (b, suffix_len, prefix_len) indicating how the suffix tokens can attend to the
-            # prefix tokens
-            prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
-            # `combined_mask` is shape (b, suffix_len, prefix_len + suffix_len) indicating how the suffix tokens (which
-            # generate the queries) can attend to the full prefix + suffix sequence (which generates the keys and values)
-            full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
-            # assert full_attn_mask.shape == (
-            #     batch_size,
-            #     suffix_tokens.shape[1],
-            #     prefix_tokens.shape[1] + suffix_tokens.shape[1],
-            # )
-            # print(full_attn_mask.shape)
-            # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens
-            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
-
-            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-                [None, suffix_tokens],
-                mask=full_attn_mask,
-                positions=positions,
-                kv_cache=kv_cache,
-                adarms_cond=[None, adarms_cond],
-            )
-            assert prefix_out is None
-            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
-
+            race_cond = None if prior is None else self.race_step_conditioning(prior, time, num_steps)
+            v_t, _ = self._suffix_pass(observation, prefix_mask, kv_cache, x_t, time_[:, None], race_cond)
             return x_t + dt * v_t, time + dt
 
         def cond(carry):
@@ -542,4 +596,137 @@ class Pi0(_model.BaseModel):
 
         with at.disable_typechecking():
             x_0, _ = jax.lax.while_loop(cond, step, (noise, jnp.float32(1.0)))
-        return x_0, memory
+        if prior is None:
+            return x_0, memory
+        # A RACE model also returns the head's scores for the rows of x_0 (Policy.infer: "transition_scores").
+        return x_0, memory, prior
+
+    def _suffix_pass(self, observation, prefix_mask, kv_cache, x_t, timestep, race_cond=None):
+        """One action-expert pass over a cached prefix: (velocity, the final-layer hidden states of the action
+        rows). `observation` is preprocessed; `prefix_mask` (b, cached tokens) covers every cached token."""
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, timestep)
+        # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
+        # other
+        suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+        # `prefix_attn_mask` is shape (b, suffix_len, prefix_len) indicating how the suffix tokens can attend to the
+        # prefix tokens
+        prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+        # `combined_mask` is shape (b, suffix_len, prefix_len + suffix_len) indicating how the suffix tokens (which
+        # generate the queries) can attend to the full prefix + suffix sequence (which generates the keys and values)
+        full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
+        # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens
+        positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+
+        (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+            [None, suffix_tokens],
+            mask=full_attn_mask,
+            positions=positions,
+            kv_cache=kv_cache,
+            adarms_cond=[None, adarms_cond],
+            race_cond=race_cond,
+        )
+        assert prefix_out is None
+        hidden = suffix_out[:, -self.action_horizon :]
+        return self.action_out_proj(hidden), hidden
+
+    # --- RACE. The public methods are the API an external denoising loop (e.g. a guided RTC sampler) uses:
+    #   prior = model.race_prior(obs, prefix_mask, kv_cache, noise, current_prefix_len=...)   # once per call
+    #   race_cond = model.race_step_conditioning(prior, time, num_steps)                     # every step
+    #   model.PaliGemma.llm([None, suffix_tokens], ..., race_cond=race_cond)
+
+    def race_prior(
+        self,
+        observation: _model.Observation,
+        prefix_mask: at.Bool[at.Array, "b p"],
+        kv_cache,
+        noise: at.Float[at.Array, "b ah ad"],
+        *,
+        current_prefix_len: int,
+    ) -> at.Float[at.Array, "b ah"]:
+        """Alg. 2 lines 5-7: the transition-timing prior p in [0, 1]^H for one policy call. `observation` is
+        preprocessed; `prefix_mask` and `kv_cache` are the prefix pass's (streaming memory first, then this
+        call's prefix, which is the last `current_prefix_len` cached tokens -- the head reads only those);
+        `noise` is the A^0 the denoising loop starts from."""
+        _v_aux, hidden = self._suffix_pass(
+            observation, prefix_mask, kv_cache, noise, jnp.ones(noise.shape[:2], dtype=jnp.float32))
+        current = prefix_mask.shape[1] - current_prefix_len
+        logits = self._race_head_logits(
+            hidden, self._race_prefix_values(kv_cache, current, current_prefix_len), prefix_mask[:, current:])
+        return jax.nn.sigmoid(logits)
+
+    def race_step_conditioning(
+        self, prior: at.Float[at.Array, "b ah"], time, num_steps
+    ) -> at.Float[at.Array, "b ah emb"]:
+        """Eq. 5's U^k for the Euler step of a `num_steps`-step loop that starts at flow time `time` (this
+        repo's convention, 1 = noise): pass it to the action expert as `race_cond`."""
+        return self.race_conditioning(prior, race_gate_index(time, num_steps))
+
+    def race_conditioning(self, prior: at.Float[at.Array, "b ah"], gate) -> at.Float[at.Array, "b ah emb"]:
+        """Eq. 5: U^k = alpha^k p (outer) e_trans, for gate index `gate` (a scalar or one per sample)."""
+        alpha = jnp.broadcast_to(jax.nn.sigmoid(self.race_gate_logits.value)[gate], prior.shape[:1])
+        return (alpha[:, None] * prior)[..., None] * self.race_embedding.value
+
+    @staticmethod
+    def _race_gate_for_training(time: at.Float[at.Array, " b"]) -> at.Int[at.Array, " b"]:
+        """Alg. 1 line 13, k = floor(K s) + 1 with s = 1 - t (the paper's flow time runs noise 0 -> data 1)."""
+        return jnp.clip(jnp.floor(RACE_NUM_GATES * (1.0 - time)).astype(jnp.int32), 0, RACE_NUM_GATES - 1)
+
+    @staticmethod
+    def _race_prefix_values(kv_cache, start: int, length: int) -> at.Float[at.Array, "b s d"]:
+        """z_hat: the VLM's final-layer cached values of tokens [start, start + length), (b, length, d_z)."""
+        values = kv_cache[1][-1][:, start : start + length]
+        return values.reshape(*values.shape[:2], -1)
+
+    def _race_head_logits(self, action_hidden, prefix_values, prefix_values_mask) -> at.Float[at.Array, "b ah"]:
+        """Eq. 3 up to the sigmoid: F_hat = F W_f; F_bar = F_hat + CrossAttn(F_hat, z, z); F_tilde = F_bar +
+        SelfAttn(F_bar); logits = F_tilde w_p."""
+        features = self.race_head_proj(action_hidden.astype(jnp.float32))
+        prefix_values = prefix_values.astype(jnp.float32)
+        features = features + self.race_head_cross(
+            features, prefix_values, prefix_values, mask=prefix_values_mask[:, None, None, :])
+        features = features + self.race_head_self(features)
+        return self.race_head_out(features)[..., 0]
+
+    def _race_window(self, observation: _model.Observation) -> tuple[at.Float[at.Array, "b r"], at.Bool[at.Array, "b r"]]:
+        if observation.transition_window is None or observation.transition_window_mask is None:
+            raise ValueError("a RACE model trains on transition targets: set the data config's race_targets_dir")
+        if observation.transition_window.shape[-1] != self.action_horizon + 2:
+            raise ValueError(f"transition_window has {observation.transition_window.shape[-1]} rows; a RACE model "
+                             f"of horizon {self.action_horizon} needs {self.action_horizon + 2} (rows i-1 .. i+H)")
+        return observation.transition_window.astype(jnp.float32), observation.transition_window_mask
+
+    def _race_teacher_prior(self, rng, observation: _model.Observation, *, train: bool) -> at.Float[at.Array, "b ah"]:
+        """Sec. 3.3 / app. C.4: training conditions on the target (teacher forcing), shifted by one row with
+        probability 0.5 when `train` (jittering). A frame outside the anchor's episode conditions as 0 (app. A.4:
+        steps beyond the end of an episode "receive a score of zero")."""
+        window, inside = self._race_window(observation)
+        window = jnp.where(inside, window, 0.0)
+        batch = window.shape[0]
+        shift = jnp.zeros((batch,), dtype=jnp.int32)
+        if train:
+            jitter_rng, direction_rng = jax.random.split(jax.random.fold_in(rng, _RACE_JITTER_STREAM))
+            forward = jax.random.bernoulli(direction_rng, RACE_JITTER_FORWARD_PROB, (batch,))
+            shift = jnp.where(jax.random.bernoulli(jitter_rng, RACE_JITTER_PROB, (batch,)),
+                              jnp.where(forward, 1, -1), 0)
+        # Row h of the conditioning is target row h - shift; the window's row h + 1 is target row h.
+        rows = jnp.arange(self.action_horizon)[None, :] + 1 - shift[:, None]
+        return jnp.take_along_axis(window, rows, axis=1)
+
+    def _race_timing_loss(self, logits: at.Float[at.Array, "b ah"], observation: _model.Observation):
+        """Eq. 4: the binary cross-entropy of the prior against the unjittered soft target, averaged over the
+        chunk rows inside the anchor's episode. Our contract leaves rows past the episode end out of the loss;
+        the paper instead scores them 0 (app. A.4)."""
+        window, inside = self._race_window(observation)
+        target = window[:, 1 : self.action_horizon + 1]
+        counted = inside[:, 1 : self.action_horizon + 1]
+        bce = -(target * jax.nn.log_sigmoid(logits) + (1.0 - target) * jax.nn.log_sigmoid(-logits))
+        return jnp.sum(jnp.where(counted, bce, 0.0)) / jnp.maximum(jnp.sum(counted), 1)
+
+
+def race_gate_index(time, num_steps):
+    """The gate of the Euler step that starts at flow time `time` (1 = noise) in a `num_steps`-step loop: that
+    step starts at the paper's s = (k-1)/num_steps, and its gate is the one whose [(j-1)/K, j/K) contains s
+    (sec. 3.1). The step index is recovered by rounding, so the loop's accumulated float error in `time` can
+    never move a step across a gate boundary."""
+    step = jnp.round((1.0 - jnp.asarray(time, dtype=jnp.float32)) * num_steps).astype(jnp.int32)
+    return jnp.clip((RACE_NUM_GATES * step) // num_steps, 0, RACE_NUM_GATES - 1)

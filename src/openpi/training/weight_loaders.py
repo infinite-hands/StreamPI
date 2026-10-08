@@ -7,6 +7,7 @@ import flax.traverse_util
 import numpy as np
 
 import openpi.models.model as _model
+from openpi.models.pi0_config import RACE_PARAMS_REGEX
 import openpi.shared.array_typing as at
 import openpi.shared.download as download
 
@@ -50,9 +51,11 @@ class CheckpointWeightLoader(WeightLoader):
     def load(self, params: at.Params) -> at.Params:
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
         loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
-        # Add all missing LoRA weights, and pi0.5's optional state-conditioning MLP (Pi0Config.state_cond),
-        # which a base checkpoint does not carry and which starts at zero.
-        return _merge_params(loaded_params, params, missing_regex=".*lora.*|.*state_(proj|mlp_in|mlp_out).*")
+        # Add all missing LoRA weights, pi0.5's optional state-conditioning MLP (Pi0Config.state_cond) and RACE's
+        # weights (Pi0Config.race), which a base checkpoint does not carry; the latter two start the model as the
+        # checkpoint was (zero-initialised outputs).
+        return _merge_params(loaded_params, params,
+                             missing_regex=f".*lora.*|.*state_(proj|mlp_in|mlp_out).*|{RACE_PARAMS_REGEX}")
 
 
 @dataclasses.dataclass(frozen=True)

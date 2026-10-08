@@ -109,12 +109,16 @@ class Policy(BasePolicy):
         # if jax.process_index() == 0:
         #     jax.debug.print("x2, {}, {}", step, is_start)
        
-        actions, self.memory = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs, memory=self.memory)
+        sampled = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs, memory=self.memory)
+        actions, self.memory = sampled[:2]
 
         outputs = {
             "state": inputs["state"],
             "actions": actions,
         }
+        if len(sampled) == 3:
+            # A RACE model (Pi0Config.race): its head's transition score for each returned action row, in [0, 1].
+            outputs[_transforms.TRANSITION_SCORES_KEY] = sampled[2]
         model_time = time.monotonic() - start_time
         if self._is_pytorch_model:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)

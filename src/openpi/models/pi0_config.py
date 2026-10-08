@@ -49,6 +49,15 @@ class Pi0Config(_model.BaseModelConfig):
     # a real token's position -- so skipping them is the same model with fewer SigLIP passes and a
     # shorter prefix. Checkpoints carry no per-camera weights, so they load under either setting.
     image_keys: tuple[str, ...] = _model.IMAGE_KEYS
+    # RACE (arXiv 2610.05719): a transition-timing head reads an auxiliary one-step denoising pass and the
+    # current call's final-layer VLM features, and its prior modulates every adaptive RMSNorm of the action
+    # expert (zero-initialised, so a checkpoint without RACE weights starts as the base model). Trains on
+    # Observation.transition_window (DataConfig.race_targets_dir) with L_full + race_aux_weight * L_aux +
+    # race_timing_weight * L_timing.
+    race: bool = False
+    # Sec. 4.1: "we set lambda_aux = 0.1 and lambda_timing = 0.05".
+    race_aux_weight: float = 0.1
+    race_timing_weight: float = 0.05
 
     def __post_init__(self):
         if self.max_token_len is None:
@@ -67,6 +76,10 @@ class Pi0Config(_model.BaseModelConfig):
             raise ValueError("vlash_branches needs state_cond: a shared prompt cannot carry one state per branch")
         if self.state_cond_dims is not None and not self.state_cond:
             raise ValueError("state_cond_dims masks the conditioning state; it needs state_cond")
+        if self.race and not self.pi05:
+            raise ValueError("race modulates pi0.5's adaptive RMSNorm; pi0 has none")
+        if self.race and self.vlash_branches:
+            raise ValueError("race is wired for one action chunk per sample, not vlash_branches")
 
     @property
     @override
@@ -130,7 +143,14 @@ class Pi0Config(_model.BaseModelConfig):
             )
         if not filters:
             return nnx.Nothing
+        if self.race:
+            # RACE's weights are new and always trained, including the modulation inside the frozen LLM.
+            filters.append(nnx.Not(nnx_utils.PathRegex(RACE_PARAMS_REGEX)))
         return nnx.All(*filters)
+
+
+# Every RACE parameter's path contains this (Pi0's race_* attributes, gemma's race_modulation).
+RACE_PARAMS_REGEX = ".*race_.*"
 
 
 @dataclasses.dataclass(frozen=True)
