@@ -116,6 +116,14 @@ class DataConfig:
     # meta.json + episode_index/frame_index/transition/weight .npy by global frame index). Frames are then drawn
     # with probability proportional to its weight. None: no RACE targets, uniform sampling.
     race_targets_dir: str | None = None
+    # TEMPO (openpi.policies.tempo_history). None = off. The cache holds tokens/episode_N.npy, one
+    # camera's SAM2 tokens (T, 64, 256), and actions/episode_N.npy, the raw action column (T, A); each
+    # history unit reads them at the frame TemporalJitter chose for `tempo_hist_key`, the same camera.
+    tempo_cache_dir: str | None = None
+    tempo_hist_key: str | None = None
+    tempo_action_dims: tuple[int, ...] | None = None
+    tempo_action_history_steps: int = 10
+    tempo_frames_per_bucket: int = 30
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False

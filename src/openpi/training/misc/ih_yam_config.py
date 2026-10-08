@@ -49,6 +49,18 @@ ACTION_HORIZON = 30
 VLASH_REFERENCE_MAX_OFFSET = 8
 # A longer range for a deploy whose round trip runs past 8 rows (~270 ms at 30 Hz): the `_vlash12mpc` twin.
 VLASH_LONG_MAX_OFFSET = 12
+# --- TEMPO on the single-arm recipes (openpi.models.tempo, openpi.policies.tempo_history) ---
+# Written by infinite-hands' models.vla.tempo prepare step (paths.tempo_stream_cache): one cache per
+# dataset and camera, holding tokens/ and actions/. The two repos must agree on this root.
+TEMPO_CACHE_ROOT = "/misc/tempo-caches/stream"
+# The single-arm production checkpoints the TEMPO pair (channels on / matched control) warm-starts from.
+LEFT_REAL_WARM_START = "/checkpoints/fine-tuned/pi05_yam_stream5_i20_bagging_left_real/left-real-i20-run3/15499/params"
+RIGHT_REAL_WARM_START = "/checkpoints/fine-tuned/pi05_yam_stream5_i20_bagging_right_real/right-real-i20-run1/19999/params"
+TEMPO_WARM_STEPS = 5_000  # upstream TEMPO's warm-started rung length; the control trains exactly as long
+TEMPO_WARMUP_STEPS = 500  # upstream TEMPO's warmup for that rung; peak and floor stay this recipe's own
+TEMPO_NEW_MODULES = ".*lora.*|.*(sam2_fusion|action_history_tokens|action_history_cond).*"
+# The inputs LoadTempoHistory attaches before repacking.
+TEMPO_INPUT_KEYS = ("sam2_tokens", "action_history", "action_history_is_pad")
 # The YAM LeRobot layout: three cameras, 14-dim state/action [L j0..5, L grip, R j0..5, R grip].
 YAM_CAMERAS = ("cam_high", "cam_left_wrist", "cam_right_wrist")
 # RACE twins (arXiv 2610.05719) read their transition targets from <this>/<dataset repo id> on the misc Volume,
@@ -60,9 +72,10 @@ RACE_TWIN_BASES: tuple[str, ...] = ("pi05_yam_stream5_i20_bagging_right_real",
 
 
 def yam_repack(cameras: tuple[str, ...] = YAM_CAMERAS, *, vlash_cond_now: bool = False,
-               race: bool = False) -> _transforms.Group:
+               race: bool = False, tempo: bool = False) -> _transforms.Group:
     extras = {key: key for key in (_transforms.NOW_STATE_KEY, _transforms.DELTA_KEY)} if vlash_cond_now else {}
     race_targets = {key: key for key in _transforms.RACE_TARGET_KEYS} if race else {}
+    tempo_inputs = {key: key for key in TEMPO_INPUT_KEYS} if tempo else {}
     return _transforms.Group(
         inputs=[
             _transforms.RepackTransform(
@@ -72,6 +85,7 @@ def yam_repack(cameras: tuple[str, ...] = YAM_CAMERAS, *, vlash_cond_now: bool =
                     "actions": "action",
                     **extras,
                     **race_targets,
+                    **tempo_inputs,
                 }
             )
         ]
@@ -89,7 +103,7 @@ def vlash_cond_dims(active_state_dims: tuple[int, ...]) -> tuple[int, ...]:
 
 def get_ih_yam_configs():
     # Deferred: config.py imports this module while building its registry.
-    from openpi.training.config import DataConfig, LeRobotAgilexDataConfig, TrainConfig
+    from openpi.training.config import AssetsConfig, DataConfig, LeRobotAgilexDataConfig, TrainConfig
 
     @dataclasses.dataclass(frozen=True)
     class LeRobotYamStreamDataConfig(LeRobotAgilexDataConfig):
@@ -139,7 +153,14 @@ def get_ih_yam_configs():
                       vlash_state_source: str = "action", vlash_cond_now: bool = False,
                       num_train_steps: int = 20_000,
                       encode_only_active_cameras: bool = False,
-                      race: bool = False, norm_stats_config: str | None = None):
+                      race: bool = False, norm_stats_config: str | None = None,
+                      warm_start: str | None = None,
+                      tempo_camera: str | None = None):
+        # tempo_camera (a dataset camera role) turns TEMPO's channels on: that camera's SAM2 cue and
+        # the driven arm's (active_state_dims') action history. A warm start continues an existing
+        # checkpoint for TEMPO_WARM_STEPS instead of training 20k from pi05_base.
+        tempo_image_key = {"cam_high": "base_0_rgb", "cam_left_wrist": "left_wrist_0_rgb",
+                           "cam_right_wrist": "right_wrist_0_rgb"}.get(tempo_camera, "base_0_rgb")
         # A masked camera's tokens are padding, so a recipe may skip decoding and encoding them: the same
         # model, one SigLIP pass per frame instead of three and a third of the prefix. Opt-in per config
         # because it changes the model's input layout (not its weights).
@@ -161,6 +182,10 @@ def get_ih_yam_configs():
             vlash_branches=vlash_branches,
             image_keys=image_keys,
             race=race,
+            tempo_sam2=tempo_camera is not None,
+            tempo_sam2_image_key=tempo_image_key,
+            tempo_action_history=tempo_camera is not None,
+            tempo_action_history_dim=len(active_state_dims) if active_state_dims else 14,
         )
         return TrainConfig(
             name=name,
@@ -171,7 +196,8 @@ def get_ih_yam_configs():
                 active_image_keys=active_image_keys,
                 active_state_dims=active_state_dims,
                 held_action_dims=held_action_dims,
-                repack_transforms=yam_repack(kept_cameras, vlash_cond_now=vlash_cond_now, race=race),
+                repack_transforms=yam_repack(kept_cameras, vlash_cond_now=vlash_cond_now, race=race,
+                                         tempo=tempo_camera is not None),
                 norm_stats_config=norm_stats_config,
                 race_targets_root=RACE_TARGETS_ROOT if race else None,
                 hist_sequence_keys=tuple(f"observation.images.{camera}" for camera in kept_cameras),
@@ -185,9 +211,14 @@ def get_ih_yam_configs():
                     vlash_state_source=vlash_state_source,
                     vlash_cond_now=vlash_cond_now,
                     decode_only_hist_cameras=encode_only_active_cameras,
+                    tempo_cache_dir=f"{TEMPO_CACHE_ROOT}/{repo_id}/{tempo_camera}" if tempo_camera else None,
+                    tempo_hist_key=f"observation.images.{tempo_camera}" if tempo_camera else None,
+                    tempo_action_dims=active_state_dims if tempo_camera else None,
                 ),
             ),
-            weight_loader=weight_loaders.CheckpointWeightLoader(PI05_BASE_PARAMS),
+            weight_loader=weight_loaders.CheckpointWeightLoader(
+                warm_start or PI05_BASE_PARAMS,
+                **({"missing_regex": TEMPO_NEW_MODULES} if tempo_camera else {})),
             # LoRA fits one H100 (make_mesh refuses a device count the FSDP count does not divide).
             # The FULL fine-tune does not: at batch 32 with T=5 it ran out of memory on one 80 GB
             # H100 (a 24 GB allocation on top of ~53 GB of fp32 params + grads + Adam state), so it
@@ -201,7 +232,8 @@ def get_ih_yam_configs():
             num_workers=24,
             num_train_steps=num_train_steps,
             # Annealed over the run's own length: a shorter run that kept the 20k schedule stopped at near-peak LR.
-            lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=num_train_steps),
+            lr_schedule=(_optimizer.CosineDecaySchedule(warmup_steps=TEMPO_WARMUP_STEPS, decay_steps=num_train_steps)
+                         if warm_start else _optimizer.CosineDecaySchedule(decay_steps=num_train_steps)),
             save_interval=1_000,
             keep_period=5_000,
             freeze_filter=model.get_freeze_filter(),
@@ -294,8 +326,25 @@ def get_ih_yam_configs():
                 "encode_only_active_cameras": recipe.get("active_image_keys") is not None}
 
     race_twins = [race_twin(recipe) for recipe in recipes if recipe["name"] in RACE_TWIN_BASES]
+    # TEMPO on each single-arm recipe, warm-started from its production checkpoint, and the matched control:
+    # the same checkpoint, data and schedule with the channels off. Built after the twins, so none derives from them.
+    tempo_recipes = [
+        dict(name=f"pi05_yam_stream5_i20_bagging_{arm}_real_{variant}", repo_id=repo_id, prompt=BAGGING_PROMPT,
+             lora=True, hist_interval=HIST_INTERVAL_WIDE,
+             active_image_keys=frozenset({f"{arm}_wrist_0_rgb"}),
+             active_state_dims=driven, held_action_dims=held, warm_start=warm_start,
+             norm_stats_config=f"pi05_yam_stream5_i20_bagging_{arm}_real",
+             num_train_steps=TEMPO_WARM_STEPS,
+             tempo_camera=f"cam_{arm}_wrist" if variant == "tempo" else None)
+        for arm, repo_id, driven, held, warm_start in (
+            ("left", BAGGING_LEFT_REAL_REPO_ID, LEFT_ARM_DIMS, RIGHT_ARM_DIMS, LEFT_REAL_WARM_START),
+            ("right", BAGGING_RIGHT_REAL_REPO_ID, RIGHT_ARM_DIMS, LEFT_ARM_DIMS, RIGHT_REAL_WARM_START),
+        )
+        for variant in ("tempo", "tempo_ctrl")
+    ]
     return [stream_config(**recipe) for recipe in
             recipes + [vlash_twin(recipe) for recipe in recipes] + [vlash_reference_twin(recipe) for recipe in recipes]
             + [vlash_measured_twin(recipe) for recipe in recipes] + [vlash_packed_measured_twin(recipe) for recipe in recipes]
             + [vlash_conditioned_twin(recipe) for recipe in recipes] + [vlash_long_conditioned_twin(recipe) for recipe in recipes]
-            + [vlash_packed_twin(recipe) for recipe in recipes] + race_twins]
+            + [vlash_packed_twin(recipe) for recipe in recipes] + race_twins
+            + tempo_recipes]

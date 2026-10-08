@@ -113,6 +113,11 @@ class Observation(Generic[ArrayT]):
     # those frames lie inside the anchor's episode.
     transition_window: at.Float[ArrayT, "#b race_rows"] | None = None
     transition_window_mask: at.Bool[ArrayT, "#b race_rows"] | None = None
+    # TEMPO: per history unit, the SAM2 memory-attention tokens of one camera's frame and the
+    # bucket-mean past actions at that frame (raw units), with buckets entirely before the episode marked.
+    sam2_tokens: at.Float[ArrayT, "#b t n d"] | None = None
+    action_history: at.Float[ArrayT, "#b t k a"] | None = None
+    action_history_is_pad: at.Bool[ArrayT, "#b t k"] | None = None
 
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
@@ -145,6 +150,9 @@ class Observation(Generic[ArrayT]):
             token_loss_mask=data.get("token_loss_mask"),
             transition_window=data.get("transition_window"),
             transition_window_mask=data.get("transition_window_mask"),
+            sam2_tokens=data.get("sam2_tokens"),
+            action_history=data.get("action_history"),
+            action_history_is_pad=data.get("action_history_is_pad"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -229,6 +237,9 @@ def preprocess_observation(
         token_loss_mask=observation.token_loss_mask,
         transition_window=observation.transition_window,
         transition_window_mask=observation.transition_window_mask,
+        sam2_tokens=observation.sam2_tokens,
+        action_history=observation.action_history,
+        action_history_is_pad=observation.action_history_is_pad,
     )
 
 

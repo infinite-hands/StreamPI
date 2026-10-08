@@ -58,6 +58,18 @@ class Pi0Config(_model.BaseModelConfig):
     # Sec. 4.1: "we set lambda_aux = 0.1 and lambda_timing = 0.05".
     race_aux_weight: float = 0.1
     race_timing_weight: float = 0.05
+    # TEMPO (arXiv:2609.16864), ported from tempo-robot/TEMPO's PyTorch pi0. Off by default: every
+    # existing config builds the same model. tempo_sam2_image_key names the camera whose visual tokens
+    # receive the SAM2 cue in each history unit; the action history is one block per unit (each frame's
+    # own past actions) plus a residual on the current unit's history into the action expert's adaRMS.
+    tempo_sam2: bool = False
+    tempo_sam2_image_key: str = "base_0_rgb"
+    tempo_sam2_token_dim: int = 256
+    tempo_sam2_num_tokens: int = 64
+    tempo_sam2_heads: int = 8
+    tempo_action_history: bool = False
+    tempo_action_history_steps: int = 10
+    tempo_action_history_dim: int = 14
 
     def __post_init__(self):
         if self.max_token_len is None:

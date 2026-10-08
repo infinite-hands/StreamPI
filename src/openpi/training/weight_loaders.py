@@ -47,15 +47,16 @@ class CheckpointWeightLoader(WeightLoader):
     """
 
     params_path: str
+    # Weights the checkpoint may lack, taken from the freshly initialised model instead. By default LoRA's,
+    # pi0.5's optional state-conditioning MLP (Pi0Config.state_cond) and RACE's (Pi0Config.race), which a base
+    # checkpoint does not carry; the latter two start the model as the checkpoint was (zero-initialised outputs).
+    # A warm start that adds modules (TEMPO's) names those too.
+    missing_regex: str = f".*lora.*|.*state_(proj|mlp_in|mlp_out).*|{RACE_PARAMS_REGEX}"
 
     def load(self, params: at.Params) -> at.Params:
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
         loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
-        # Add all missing LoRA weights, pi0.5's optional state-conditioning MLP (Pi0Config.state_cond) and RACE's
-        # weights (Pi0Config.race), which a base checkpoint does not carry; the latter two start the model as the
-        # checkpoint was (zero-initialised outputs).
-        return _merge_params(loaded_params, params,
-                             missing_regex=f".*lora.*|.*state_(proj|mlp_in|mlp_out).*|{RACE_PARAMS_REGEX}")
+        return _merge_params(loaded_params, params, missing_regex=self.missing_regex)
 
 
 @dataclasses.dataclass(frozen=True)
