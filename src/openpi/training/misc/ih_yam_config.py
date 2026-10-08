@@ -55,7 +55,7 @@ YAM_CAMERAS = ("cam_high", "cam_left_wrist", "cam_right_wrist")
 # which training containers mount at /misc.
 RACE_TARGETS_ROOT = "/misc/race-targets"
 # The recipes that get a `_race` twin (race_twin).
-RACE_TWIN_BASES: tuple[str, ...] = ()
+RACE_TWIN_BASES: tuple[str, ...] = ("pi05_yam_stream5_i20_bagging_right_real",)
 
 
 def yam_repack(cameras: tuple[str, ...] = YAM_CAMERAS, *, vlash_cond_now: bool = False,
