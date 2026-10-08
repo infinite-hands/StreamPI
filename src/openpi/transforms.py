@@ -182,6 +182,9 @@ class Unnormalize(DataTransformFn):
         return (x + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01
 
 
+HIST_OFFSETS_SUFFIX = ".hist_offsets"
+
+
 @dataclasses.dataclass(frozen=True)
 class TemporalJitter(DataTransformFn):
     jitter_range: None
@@ -189,6 +192,9 @@ class TemporalJitter(DataTransformFn):
     hist_horizon: int
     hist_sequence_keys: list
     enable_jitter: bool
+    # Also store, per key, each kept frame's offset from the current frame (oldest first) under
+    # key + HIST_OFFSETS_SUFFIX, so later transforms can read other data at the same frames. False: no-op.
+    record_offsets: bool = False
 
     def __call__(self, data: DataDict) -> DataDict:
         for key in self.hist_sequence_keys:
@@ -196,6 +202,7 @@ class TemporalJitter(DataTransformFn):
             T = full_seq.shape[0]
             
             sampled_frames = []
+            offsets = []
             if self.enable_jitter:
                 base_offset = random.choice(self.jitter_range)
             else:
@@ -206,8 +213,11 @@ class TemporalJitter(DataTransformFn):
 
                 frame_idx = np.clip(frame_idx, 0, T - 1)
                 sampled_frames.append(full_seq[frame_idx])
+                offsets.append(frame_idx - (T - 1))
 
             data[key] = np.stack(sampled_frames[::-1], axis=0)
+            if self.record_offsets:
+                data[key + HIST_OFFSETS_SUFFIX] = np.asarray(offsets[::-1], dtype=np.int64)
 
         # import cv2
         # T, H, W, _ = data[self.hist_sequence_keys[0]].shape

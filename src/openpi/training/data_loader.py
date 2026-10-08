@@ -16,6 +16,7 @@ import torch
 import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
+import openpi.policies.tempo_history as _tempo_history
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
@@ -170,7 +171,13 @@ def create_torch_dataset(
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 
-    dataset = TransformedDataset(dataset, [_transforms.TemporalJitter(jitter_range, hist_interval, hist_horizon, data_config.hist_sequence_keys, enable_jitter)])
+    history_transforms = [_transforms.TemporalJitter(jitter_range, hist_interval, hist_horizon, data_config.hist_sequence_keys,
+                                                     enable_jitter, record_offsets=data_config.tempo_cache_dir is not None)]
+    if data_config.tempo_cache_dir is not None:
+        history_transforms.append(_tempo_history.LoadTempoHistory(
+            data_config.tempo_cache_dir, data_config.tempo_hist_key, tuple(data_config.tempo_action_dims),
+            data_config.tempo_action_history_steps, data_config.tempo_frames_per_bucket))
+    dataset = TransformedDataset(dataset, history_transforms)
 
     return dataset
 
