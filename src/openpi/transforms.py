@@ -16,6 +16,16 @@ from openpi.shared import normalize as _normalize
 DataDict: TypeAlias = at.PyTree
 NormStats: TypeAlias = _normalize.NormStats
 
+# RACE (Pi0Config.race). The sidecar a recipe's DataConfig.race_targets_dir names holds meta.json and these
+# arrays, each indexed by the LeRobot dataset's global frame index (its "index" column).
+RACE_STORE_ARRAYS = {"episode_index": np.int32, "frame_index": np.int32, "transition": np.float32,
+                     "weight": np.float32}
+# The training targets RaceTargets adds to a sample (Observation.transition_window / transition_window_mask).
+RACE_TARGET_KEYS = ("transition_window", "transition_window_mask")
+# A RACE model's served output: its head's transition score for each returned action row.
+TRANSITION_SCORES_KEY = "transition_scores"
+_RACE_STORES: dict[str, dict[str, np.ndarray]] = {}
+
 
 T = TypeVar("T")
 S = TypeVar("S")
@@ -282,6 +292,45 @@ class TemporalOffset(DataTransformFn):
         if self.state_source == "state":
             return states[delta]
         return states if delta == 0 else actions[delta - 1]
+
+
+def race_store(directory: str) -> dict[str, np.ndarray]:
+    """A RACE sidecar's arrays, memory-mapped once per process (each data-loader worker maps its own)."""
+    if directory not in _RACE_STORES:
+        _RACE_STORES[directory] = {name: np.load(f"{directory}/{name}.npy", mmap_mode="r")
+                                   for name in RACE_STORE_ARRAYS}
+    return _RACE_STORES[directory]
+
+
+@dataclasses.dataclass(frozen=True)
+class RaceTargets(DataTransformFn):
+    """RACE's training targets for a LeRobot sample anchored at global frame i (its "index"), whose action rows
+    are frames i .. i+H-1: the soft transition target of frames i-1 .. i+H ("transition_window", the rows plus
+    one neighbour each side for the conditioning jitter) and which of those frames lie inside the anchor's
+    episode ("transition_window_mask"). A frame outside the episode reads 0. Runs on the raw LeRobot sample."""
+
+    directory: str
+    action_horizon: int
+
+    def __call__(self, data: DataDict) -> DataDict:
+        store = race_store(self.directory)
+        episodes = store["episode_index"]
+        index = int(data["index"])
+        if not 0 <= index < episodes.shape[0]:
+            raise ValueError(f"frame {index} is outside the race targets at {self.directory} "
+                             f"({episodes.shape[0]} frames)")
+        episode = int(episodes[index])
+        if int(data["episode_index"]) != episode or int(data["frame_index"]) != int(store["frame_index"][index]):
+            raise ValueError(
+                f"race targets at {self.directory} disagree with the dataset at frame {index}: they say episode "
+                f"{episode} frame {int(store['frame_index'][index])}, the dataset episode "
+                f"{int(data['episode_index'])} frame {int(data['frame_index'])}")
+        frames = np.arange(index - 1, index + self.action_horizon + 1)
+        held = np.clip(frames, 0, episodes.shape[0] - 1)
+        inside = (frames >= 0) & (frames < episodes.shape[0]) & (episodes[held] == episode)
+        data["transition_window"] = np.where(inside, store["transition"][held], 0.0).astype(np.float32)
+        data["transition_window_mask"] = inside
+        return data
 
 
 @dataclasses.dataclass(frozen=True)
