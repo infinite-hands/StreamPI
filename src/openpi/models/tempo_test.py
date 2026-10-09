@@ -138,9 +138,6 @@ def test_loss_and_streaming_sample_run_with_both_channels():
     assert float(jnp.abs(grads.sam2_fusion.gate.value).max()) > 0
     assert float(jnp.abs(grads.action_history_tokens.proj.kernel.value).max()) > 0
 
-    shut = _shared_base(config.create(jax.random.key(0)), _with_open_gates(_config_for().create(jax.random.key(0))))
-    grads = nnx.grad(lambda m: jnp.mean(m.compute_loss(jax.random.key(1), obs, jnp.ones((BATCH, HORIZON, config.action_dim)))))(shut)
-    assert float(jnp.abs(grads.action_history_tokens.gate.value).max()) > 0, "a shut history gate still learns to open"
 
     memory = {"memory_tokens": None, "memory_kv_cache": None, "memory_prefix_mask": None}
     one_unit = jax.tree.map(lambda x: x[:, -1:] if x.ndim >= 3 and x.shape[1] == UNITS else x, obs)
@@ -149,11 +146,12 @@ def test_loss_and_streaming_sample_run_with_both_channels():
         assert actions.shape == (BATCH, HORIZON, config.action_dim) and bool(jnp.isfinite(actions).all())
 
 
-def test_history_tokens_start_at_zero():
+def test_history_tokens_are_live_at_init():
     config = _config_for(tempo_action_history=True)
     model = config.create(jax.random.key(0))
     obs = _observation(config)
-    assert not bool(jnp.any(model.action_history_tokens(obs.action_history[:, -1]))), "a zero gate silences the tokens"
+    assert bool(jnp.any(model.action_history_tokens(obs.action_history[:, -1]))), \
+        "an all-zero history stream makes RMSNorm's backward 1/sqrt(eps) per layer: NaN on Gemma 2B"
 
 
 def test_history_is_invisible_to_image_and_prompt_tokens():
