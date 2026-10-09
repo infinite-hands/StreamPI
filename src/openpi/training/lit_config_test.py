@@ -94,7 +94,12 @@ def test_the_rows_share_the_recipes_data_prompt_cameras_and_cadence():
             base.model.hist_horizon,
         )
         assert row.model.dtype == base.model.dtype and row.model.max_token_len == base.model.max_token_len
-        assert (row.num_train_steps, row.lr_schedule) == (base.num_train_steps, base.lr_schedule)
+        # the hyperparameters the rows' comments call the BASE recipe's (not LIT's own release)
+        assert (row.num_train_steps, row.lr_schedule, row.optimizer) == (
+            base.num_train_steps,
+            base.lr_schedule,
+            base.optimizer,
+        )
 
 
 def test_the_training_knobs_of_every_row():

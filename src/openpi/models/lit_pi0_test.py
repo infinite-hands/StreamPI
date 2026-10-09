@@ -1383,7 +1383,9 @@ def test_train_and_serve_compute_the_same_velocity_in_bfloat16(capsys):
 # Measured (this CPU, tiny dummy variant, bfloat16, batch 2, velocity scale 3.07): the training and the sampling path,
 # both eager, agree exactly (0.0). The sampling path under jit differs from the eager training path by at most 1.086e-2
 # (3.5e-3 of the scale; bfloat16 spaces values in [2, 4) by 1.56e-2, so this is under one rounding step of the largest
-# entries: XLA fuses the jitted program differently). The bound is twice that measurement.
+# entries: XLA fuses the jitted program differently). The jit bound is a margin, not a measurement: twice that one
+# measurement, taken once on one toolchain (arm64 CPU, jax 0.5.3, flax 0.10.2), so it says "no worse than a rounding
+# step or two", not what the difference is elsewhere. The eager bound is the measurement itself.
 _BF16_EAGER_ABS = 0.0
 _BF16_JIT_ABS = 2.2e-2
 
