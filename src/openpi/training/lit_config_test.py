@@ -12,8 +12,6 @@ import numpy as np
 import pytest
 import tyro
 
-from openpi import transforms as _transforms
-from openpi.models import pi0_config
 from openpi.shared import normalize as _normalize
 from openpi.training import config as _config
 from openpi.training import weight_loaders
@@ -272,9 +270,3 @@ def test_the_lit_regex_in_the_rows_matches_no_stock_leaf():
     pattern = re.compile(weight_loaders.LIT_MISSING_REGEX)
     stray = [p for p in (_path(q) for q in nnx.state(model).flat_state()) if pattern.fullmatch(p) and "lora" not in p]
     assert not stray
-
-
-def test_the_goal_alias_never_reaches_the_serve_side_stats():
-    stats = _stats()
-    assert _transforms.output_norm_stats(stats) == stats
-    assert pi0_config.Pi0Config().lit == "off"

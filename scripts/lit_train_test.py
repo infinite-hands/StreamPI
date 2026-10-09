@@ -27,7 +27,6 @@ import pytest
 os.environ["JAX_PLATFORMS"] = "cpu"
 
 from openpi.models import lit_test_utils as _utils
-from openpi.models import model as _model
 from openpi.models import pi0
 from openpi.shared import nnx_utils
 from openpi.training import checkpoints as _checkpoints
