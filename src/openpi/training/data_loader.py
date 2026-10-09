@@ -20,6 +20,9 @@ import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
 
+# The LeRobot state column every config's repack reads; LIT fetches it at two frames (SplitLitGoal splits them).
+LIT_STATE_KEY = "observation.state"
+
 
 class Dataset(Protocol[T_co]):
     """Interface for a dataset with random access."""
@@ -144,6 +147,14 @@ def create_torch_dataset(
     delta_timestamps = {
         key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
     }
+    lit = getattr(model_config, "lit", "off") != "off"
+    if lit:
+        if getattr(data_config, "vlash_max_offset", 0) or getattr(data_config, "vlash_branches", 0):
+            raise ValueError(
+                "lit is not supported with vlash temporal offsets: the goal is the state at t + action_horizon."
+            )
+        # The goal is the state action_horizon steps ahead, beside the current one (SplitLitGoal).
+        delta_timestamps[LIT_STATE_KEY] = [0.0, action_horizon / dataset_meta.fps]
 
     hist_interval = data_config.hist_interval
     hist_horizon = data_config.hist_horizon
@@ -171,6 +182,9 @@ def create_torch_dataset(
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 
     dataset = TransformedDataset(dataset, [_transforms.TemporalJitter(jitter_range, hist_interval, hist_horizon, data_config.hist_sequence_keys, enable_jitter)])
+
+    if lit:
+        dataset = TransformedDataset(dataset, [_transforms.SplitLitGoal(LIT_STATE_KEY)])
 
     return dataset
 
@@ -326,6 +340,15 @@ class DistributedTorchDataLoader:
                 yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
 
 
+def _with_aliases(norm_stats: dict, aliases) -> dict:
+    """`norm_stats` plus each alias key under the statistics of the key it names (DataConfig.norm_aliases)."""
+    if not aliases:
+        return norm_stats
+    if missing := {source for source in aliases.values() if source not in norm_stats}:
+        raise ValueError(f"norm_aliases name statistics the norm stats do not have: {sorted(missing)}.")
+    return {**norm_stats, **{key: norm_stats[source] for key, source in aliases.items()}}
+
+
 def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:
     """Transform the dataset by applying the data transforms."""
     norm_stats = {}
@@ -335,7 +358,7 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
                 "Normalization stats not found. "
                 "Make sure to run `scripts/compute_norm_stats.py --config-name=<your-config>`."
             )
-        norm_stats = data_config.norm_stats
+        norm_stats = _with_aliases(data_config.norm_stats, data_config.norm_aliases)
 
     return TransformedDataset(
         dataset,

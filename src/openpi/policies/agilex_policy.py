@@ -312,6 +312,12 @@ class AgilexInputs(transforms.DataTransformFn):
         if "action_prefix" in data:
             inputs["action_prefix"] = data["action_prefix"]
 
+        # LIT's goal and its mask (transforms.SplitLitGoal): this transform builds a fresh dict, so they are forwarded
+        # by name or they are dropped here.
+        for key in (transforms.LIT_GOAL_KEY, transforms.LIT_GOAL_MASK_KEY):
+            if key in data:
+                inputs[key] = np.asarray(data[key])
+
         return inputs
 
 
