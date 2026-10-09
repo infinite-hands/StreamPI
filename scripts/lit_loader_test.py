@@ -114,17 +114,40 @@ def test_the_trainer_loader_refuses_a_lit_checkpoint_in_a_stock_model_and_every_
 
 def test_the_opt_in_regex_lets_a_stage2_config_take_a_checkpoint_without_its_lit_modules(stub, tmp_path):
     shapes = _shapes("stage2")
-    for source in ("off", "stage1"):  # a pi05_base-like stock tree, and a stage-1 checkpoint (goal encoder dropped)
-        path, params = _checkpoint(tmp_path, source)
-        loader = weight_loaders.CheckpointWeightLoader(path, missing_regex=weight_loaders.LIT_MISSING_REGEX)
-        loaded = _flat(train._load_weights_and_validate(loader, shapes))
-        expected = {k for k in _flat(shapes) if not k.startswith("lit_")}
-        assert set(loaded) == expected
-        for key, value in loaded.items():
-            np.testing.assert_array_equal(value, _flat(params)[key])
+    path, params = _checkpoint(tmp_path, "off")  # a pi05_base-like stock tree
+    loader = weight_loaders.CheckpointWeightLoader(path, missing_regex=weight_loaders.LIT_MISSING_REGEX)
+    loaded = _flat(train._load_weights_and_validate(loader, shapes))
+    assert set(loaded) == {k for k in _flat(shapes) if not k.startswith("lit_")}
+    for key, value in loaded.items():
+        np.testing.assert_array_equal(value, _flat(params)[key])
     # the default stays LoRA-only
     assert weight_loaders.CheckpointWeightLoader("x").missing_regex == ".*lora.*"
     assert weight_loaders.CheckpointWeightLoader("x") == weight_loaders.CheckpointWeightLoader("x", ".*lora.*")
+
+
+def test_the_regex_loader_refuses_a_stage1_checkpoint_unless_the_target_is_stage1(stub, tmp_path):
+    """litlite takes --weight-loader.params-path: a stage-1 checkpoint handed to it would lose its goal encoder
+    silently (the handoff loader's fingerprint does not run on the generic loader)."""
+    path, _ = _checkpoint(tmp_path, "stage1")
+    for regex in (weight_loaders.LIT_MISSING_REGEX, ".*"):
+        loader = weight_loaders.CheckpointWeightLoader(path, missing_regex=regex)
+        with pytest.raises(ValueError, match="stage-1 one.*LitStage1WeightLoader"):
+            loader.load(_shapes("stage2"))
+    loader = weight_loaders.CheckpointWeightLoader(path, missing_regex=weight_loaders.LIT_MISSING_REGEX)
+    assert "lit_goal_encoder" in loader.load(_shapes("stage1")), "a stage-1 target keeps its checkpoint's encoder"
+    stage2_path, _ = _checkpoint(tmp_path, "stage2")
+    stage2_loader = weight_loaders.CheckpointWeightLoader(stage2_path, missing_regex=weight_loaders.LIT_MISSING_REGEX)
+    assert "lit_aggregator" in stage2_loader.load(_shapes("stage2"))
+
+
+def test_only_a_regex_that_admits_lit_modules_gets_the_stage1_refusal(stub, tmp_path):
+    """The default loader keeps its behaviour (its stage-1 -> stage-2 refusal is the trainer's pytree check)."""
+    assert weight_loaders._admits_lit_modules(weight_loaders.LIT_MISSING_REGEX)
+    assert weight_loaders._admits_lit_modules(".*")
+    assert not weight_loaders._admits_lit_modules(weight_loaders.CheckpointWeightLoader("x").missing_regex)
+    path, _ = _checkpoint(tmp_path, "stage1")
+    with pytest.raises(ValueError, match="PyTrees have different structure"):
+        train._load_weights_and_validate(weight_loaders.CheckpointWeightLoader(path), _shapes("stage2"))
 
 
 def test_the_lit_missing_regex_is_anchored():
@@ -193,6 +216,51 @@ def test_the_handoff_loader_refuses_a_target_that_is_not_stage2(stub, tmp_path, 
         weight_loaders.LitStage1WeightLoader(path).load(_shapes(target))
 
 
+def _save_flat(tmp_path, name, flat) -> str:
+    path = tmp_path / name / "params"
+    with ocp.PyTreeCheckpointer() as checkpointer:
+        checkpointer.save(path, {"params": traverse_util.unflatten_dict(flat, sep="/")})
+    return str(path)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "PaliGemma/llm/layers/attn/some_extra_module/kernel",  # a module the model does not have
+        "PaliGemma/llm/layers/attn/q_einsum/lora_a",  # LoRA leaves of a LoRA checkpoint, in a full fine-tune model
+        "race_embedding",  # a foreign top-level module, e.g. from a merged branch
+    ],
+)
+def test_the_handoff_loader_refuses_a_checkpoint_leaf_the_model_does_not_have(stub, tmp_path, extra):
+    """The merge keeps only the model's leaves and its self-check iterates the model's leaves, so a leaf the checkpoint
+    has and the model lacks used to vanish without a word; only the stage-1 goal encoder is meant to."""
+    _, params = _checkpoint(tmp_path, "stage1")
+    shapes = _shapes("stage2")
+    honest = weight_loaders.LitStage1WeightLoader(_save_flat(tmp_path, "honest", _flat(params)))
+    assert honest.load(shapes)
+    path = _save_flat(tmp_path, "extra", {**_flat(params), extra: np.zeros((3, 3), np.float32)})
+    with pytest.raises(ValueError, match=r"has 1 leaves the stage-2 model does not have.*dropped silently") as error:
+        weight_loaders.LitStage1WeightLoader(path).load(shapes)
+    assert extra in str(error.value)
+
+
+def test_a_params_path_one_level_off_says_it_must_end_in_step_params(stub, tmp_path):
+    """The step directory and the experiment directory made orbax raise a FileNotFoundError about `_METADATA` after the
+    container had started; a missing path gets the same hint. Both loaders."""
+    path, _ = _checkpoint(tmp_path, "stage1", name="exp/7")
+    step_dir, experiment = os.path.dirname(path), os.path.dirname(os.path.dirname(path))
+    nowhere = os.path.join(experiment, "8", "params")
+    for loader_for in (
+        weight_loaders.LitStage1WeightLoader,
+        lambda p: weight_loaders.CheckpointWeightLoader(p, missing_regex=weight_loaders.LIT_MISSING_REGEX),
+    ):
+        for wrong in (step_dir, experiment, nowhere):
+            with pytest.raises(FileNotFoundError, match=r"must end in <step>/params") as error:
+                loader_for(wrong).load(_shapes("stage2"))
+            assert wrong in str(error.value)
+    assert weight_loaders.LitStage1WeightLoader(path).load(_shapes("stage2"))
+
+
 def _expert_and_backbone_keys(tree):
     keys = [k for k in _flat(tree) if k.startswith("PaliGemma/llm/")]
     return next(k for k in keys if "_1" in k), next(k for k in keys if "_1" not in k)
@@ -242,11 +310,8 @@ def test_the_fingerprint_catches_a_merge_that_does_not_hand_off_what_it_should(s
     # a checkpoint that lacks a backbone leaf: neither loaded nor LoRA, so the handoff is incomplete (not left to the
     # trainer's later structure error)
     incomplete = {k: v for k, v in _flat(params).items() if k != backbone}
-    short_path = tmp_path / "short" / "params"
-    with ocp.PyTreeCheckpointer() as checkpointer:
-        checkpointer.save(short_path, {"params": traverse_util.unflatten_dict(incomplete, sep="/")})
     with pytest.raises(ValueError, match="incomplete"):
-        weight_loaders.LitStage1WeightLoader(str(short_path)).load(shapes)
+        weight_loaders.LitStage1WeightLoader(_save_flat(tmp_path, "short", incomplete)).load(shapes)
 
 
 # ---- end to end through the trainer: a real stage-1 run, then a stage-2 train state initialised from it ----
