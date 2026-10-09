@@ -258,6 +258,14 @@ class BaseModelConfig(abc.ABC):
         model = nnx.eval_shape(self.create, jax.random.key(0))
         graphdef, state = nnx.split(model)
         if remove_extra_params:
+            # Extra leaves are dropped without a word below; LIT modules are the one thing that must never be: a
+            # stock model loaded from a LIT checkpoint runs on weights trained to work with them.
+            lit_roots = sorted(str(k) for k in params if str(k).startswith("lit_"))
+            if lit_roots and not any(str(k).startswith("lit_") for k in state.to_pure_dict()):
+                raise ValueError(
+                    f"the params carry LIT modules {lit_roots} but this config has none (lit='off'): refusing to drop "
+                    "them silently. Load a LIT checkpoint with a lit config."
+                )
             params = ocp.transform_utils.intersect_trees(state.to_pure_dict(), params)
         at.check_pytree_equality(expected=state.to_pure_dict(), got=params, check_shapes=True, check_dtypes=False)
         state.replace_by_pure_dict(params)
