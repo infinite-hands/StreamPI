@@ -132,19 +132,26 @@ def stock_source_state() -> dict:
     return {"head": _git("rev-parse", "HEAD").strip(), "pin": PIN, "files_differing_from_pin": changed}
 
 
-def meta() -> dict:
+def toolchain() -> dict:
+    """What the exact-equality fixture is a function of: the first five keys (lit_test_utils.fixture_exact_skip_reason)."""
+    return {
+        "jax": jax.__version__,
+        "flax": flax.__version__,
+        "numpy": np.__version__,
+        "python": sys.version.split()[0],
+        "machine": platform.machine(),
+        "platform": platform.platform(),
+        "jax_platform": jax.default_backend(),
+    }
+
+
+def meta(*, git: bool = True) -> dict:
+    """The fixture's metadata. `git=False` leaves out the git state, which needs a checkout (a test that does not
+    compare it must run without one)."""
     config = _utils.make_tiny_config()
     return {
-        "git": stock_source_state(),
-        "toolchain": {
-            "jax": jax.__version__,
-            "flax": flax.__version__,
-            "numpy": np.__version__,
-            "python": sys.version.split()[0],
-            "machine": platform.machine(),
-            "platform": platform.platform(),
-            "jax_platform": jax.default_backend(),
-        },
+        **({"git": stock_source_state()} if git else {}),
+        "toolchain": toolchain(),
         "seeds": {
             "model": MODEL_SEED,
             "randomize": RANDOMIZE_SEED,

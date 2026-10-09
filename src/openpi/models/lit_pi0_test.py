@@ -13,6 +13,11 @@ What the numbers below were measured as, on this CPU in float32 (not invented):
     invariance is checked directly.
 
 Run the whole file with `-s` to see the freeze-filter counts and the real-dimension LIT parameter count it prints.
+
+Every test compares against measured tolerances or inside one process, so the file runs on any toolchain except the
+ones marked `fixture_exact`: they compare bit for bit (or by sha256) against the lit=off fixture that
+lit_golden/gen_baseline.py generated on arm64 CPU, jax 0.5.3, flax 0.10.2, numpy 1.26.4. Elsewhere they are skipped
+with the mismatch named ("not run: toolchain"), never passed.
 """
 # ruff: noqa: SLF001
 
@@ -35,7 +40,13 @@ from openpi.models import pi0 as _pi0
 from openpi.models import pi0_config
 from openpi.models import pi0_rtc
 from openpi.models.lit_golden import gen_baseline as _gen
+from openpi.shared import nnx_utils
 from openpi.training import weight_loaders
+
+_SKIP_REASON = _utils.fixture_exact_skip_reason(
+    json.loads((_gen.FIXTURE_DIR / "baseline_meta.json").read_text())["toolchain"], _gen.toolchain()
+)
+fixture_exact = pytest.mark.skipif(_SKIP_REASON is not None, reason=_SKIP_REASON or "")
 
 _REL = 1e-5
 B = _utils.BATCH
@@ -220,6 +231,44 @@ def test_vlash_branches_are_refused():
     WithVlash(vlash_branches=2)  # lit off: untouched
 
 
+@dataclasses.dataclass(frozen=True)
+class _MergedConfig(pi0_config.Pi0Config):
+    """A Pi0Config with the fields other branches add, declared as those branches declare them: ih/spatial-forcing
+    (spatial_layer), ih/vlash (state_cond, image_keys), ih/race (race). None of them exists at this pin."""
+
+    spatial_layer: int | None = None
+    state_cond: bool = False
+    image_keys: tuple[str, ...] = _model.IMAGE_KEYS
+    encode_only_active_cameras: bool = False
+    race: bool = False
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        ("spatial_layer", 12, "spatial_layer.*compute_losses"),
+        ("state_cond", True, "state_cond.*adaRMS"),
+        ("image_keys", ("left_wrist_0_rgb",), "every camera embedded"),
+        ("image_keys", ("left_wrist_0_rgb", "base_0_rgb", "right_wrist_0_rgb"), "every camera embedded"),
+        ("encode_only_active_cameras", True, "every camera embedded"),
+        ("race", True, "race.*adaRMS"),
+    ],
+)
+def test_merge_hazards_of_other_branches_are_refused(field, value, match):
+    """Fields that would silently change what a LIT run trains or what its action rows see are rejected through
+    getattr, the way vlash_branches is: git gives no signal for them (spatial forcing's train.py merges cleanly)."""
+    kwargs = {"lit": "stage2", "pi05": True, "lit_goal_dims": GOAL_DIMS, "action_dim": 14}
+    _MergedConfig(**kwargs)  # the defaults are the stock model
+    _MergedConfig(**kwargs, image_keys=list(_model.IMAGE_KEYS))  # the default layout, spelled as a list
+    _MergedConfig(**kwargs, image_keys=tuple(_model.IMAGE_KEYS), spatial_layer=None, state_cond=False)
+    with pytest.raises(ValueError, match=match):
+        _MergedConfig(**kwargs, **{field: value})
+    for stage in ("stage1", "stage2"):
+        with pytest.raises(ValueError, match=match):
+            _MergedConfig(**{**kwargs, "lit": stage}, **{field: value})
+    _MergedConfig(**{field: value})  # lit off: untouched
+
+
 def test_pi0_rtc_refuses_a_lit_config():
     with pytest.raises(ValueError, match="Pi0Rtc"):
         pi0_rtc.Pi0Rtc(_tiny(), nnx.Rngs(0))
@@ -275,6 +324,7 @@ def test_goal_must_be_state_wide(stage2):
 # ---- lit=off is the stock model ----
 
 
+@fixture_exact
 def test_lit_off_equals_the_baseline_fixture_and_never_enters_the_lit_path(monkeypatch):
     def refuse(*args, **kwargs):
         raise AssertionError("the LIT loss ran for lit='off'")
@@ -302,9 +352,18 @@ def test_lit_off_param_tree_is_the_fixture_and_lit_modules_come_last():
         manifest = _stage_model(stage)[0]
         base = {p: v for p, v in manifest.items() if not _is_lit_path(p)}
         assert sorted(base) == sorted(expected), stage
-        moved = [p for p in expected if base[p]["sha256"] != expected[p]["sha256"]]
-        assert not moved, f"adding the lit_* modules moved the init of {moved}"
         assert all(_is_lit_path(p) for p in manifest if p not in expected)
+        for path, want in expected.items():
+            assert (base[path]["shape"], base[path]["dtype"]) == (want["shape"], want["dtype"]), path
+
+
+@fixture_exact
+def test_adding_the_lit_modules_does_not_move_the_init_of_the_stock_leaves():
+    expected = json.loads((_gen.FIXTURE_DIR / "baseline_params.json").read_text())["float32"]
+    for stage in ("stage1", "stage2"):
+        manifest = _stage_model(stage)[0]
+        moved = [p for p in expected if manifest[p]["sha256"] != expected[p]["sha256"]]
+        assert not moved, f"adding the lit_* modules moved the init of {moved}"
 
 
 # ---- the prefix layout: roles and visibility ----
@@ -1066,6 +1125,7 @@ def _valid_per_block(masked=_utils.DEFAULT_MASKED):
     return [CAMERAS * IMAGE_TOKENS + TEXT_LENGTHS[i] - lost[i] for i in range(B)]
 
 
+@fixture_exact
 def test_lit_off_sampling_equals_the_baseline_fixture_and_never_enters_the_lit_path(monkeypatch):
     def refuse(*args, **kwargs):
         raise AssertionError("the LIT sampling path ran for lit='off'")
@@ -1118,8 +1178,29 @@ def test_memory_over_two_calls_is_the_stock_memory_and_never_holds_a_latent():
         assert memory["memory_kv_cache"][0].shape == (4, B, call * _PREFIX_LEN, 1, 16)
         assert memory["memory_prefix_mask"].shape == (B, call * _PREFIX_LEN)
         assert memory["memory_tokens"].shape[1] == _PREFIX_LEN
-        # and it is bit for bit the memory of the stock model (same backbone parameters, same inputs)
+        # the stock memory's layout (shape and dtype of every array)
+        summary = _utils.memory_summary(memory)
+        assert {k: _shape_dtype(v) for k, v in summary.items()} == {
+            k: _shape_dtype(v) for k, v in expected[f"call{call}"].items()
+        }
+
+
+@fixture_exact
+def test_memory_over_two_calls_is_bit_for_bit_the_stock_memory():
+    """(same backbone parameters, same inputs) the sha256 of every array equals the stock model's."""
+    _, memories = _sampled(open_masks=False)
+    expected = json.loads((_gen.FIXTURE_DIR / "baseline_memory.json").read_text())["f32_rand_eager"]
+    for call, memory in enumerate(memories, start=1):
         assert _utils.memory_summary(memory) == expected[f"call{call}"]
+
+
+def _shape_dtype(summary):
+    """The (shape, dtype) of a memory summary entry: one digest, or a list of them (the kv cache), or None."""
+    if summary is None:
+        return None
+    if isinstance(summary, list):
+        return [_shape_dtype(item) for item in summary]
+    return summary["shape"], summary["dtype"]
 
 
 def test_lit_prefix_returns_a_new_memory_and_leaves_the_one_it_was_given_alone():
@@ -1270,6 +1351,41 @@ def test_train_and_serve_compute_the_same_velocity():
         f"train vs serve velocity: max |difference| {_differs(serve, train):.3e}, scale {float(jnp.max(jnp.abs(train))):.3e}"
     )
     _equal(serve, train)
+
+
+def test_train_and_serve_compute_the_same_velocity_in_bfloat16(capsys):
+    """The float32 test above is exact. In bfloat16 (the serving dtype) the training path runs eagerly here and the
+    sampling path both eagerly and under jit (as Policy runs it): the differences are measured and recorded below."""
+    model = _stage_model("stage2", dtype="bfloat16")[1]
+    observation = _pre(_BASE)
+    x_t, time = _x_t_and_time()
+    prefix = model._lit_prefix_pass(observation, mask_num=0)
+    train = model._suffix_velocity(observation, x_t, time, prefix.kv_cache, prefix.visible, prefix.offset, prefix.extra)
+    visible, cache, offset, _ = model.lit_prefix(observation, _utils.empty_memory())
+    eager = model._suffix_velocity(observation, x_t, time, cache, visible, offset)
+    visible_j, cache_j, offset_j, _ = nnx_utils.module_jit(model.lit_prefix)(observation, _utils.empty_memory())
+    jitted = nnx_utils.module_jit(model._suffix_velocity)(observation, x_t, time, cache_j, visible_j, offset_j)
+    scale = float(jnp.max(jnp.abs(train.astype(jnp.float32))))
+    eager_diff = _differs(eager.astype(jnp.float32), train.astype(jnp.float32))
+    jit_diff = _differs(jitted.astype(jnp.float32), train.astype(jnp.float32))
+    with capsys.disabled():
+        print(
+            f"\nbf16 train vs serve velocity (scale {scale:.3e}): eager max |diff| {eager_diff:.3e} "
+            f"({eager_diff / scale:.2e} of scale), jit max |diff| {jit_diff:.3e} ({jit_diff / scale:.2e} of scale)"
+        )
+    assert train.dtype == eager.dtype == jitted.dtype
+    np.testing.assert_array_equal(np.asarray(visible_j), np.asarray(visible))
+    np.testing.assert_array_equal(np.asarray(offset_j), np.asarray(offset))
+    assert eager_diff <= _BF16_EAGER_ABS
+    assert jit_diff <= _BF16_JIT_ABS
+
+
+# Measured (this CPU, tiny dummy variant, bfloat16, batch 2, velocity scale 3.07): the training and the sampling path,
+# both eager, agree exactly (0.0). The sampling path under jit differs from the eager training path by at most 1.086e-2
+# (3.5e-3 of the scale; bfloat16 spaces values in [2, 4) by 1.56e-2, so this is under one rounding step of the largest
+# entries: XLA fuses the jitted program differently). The bound is twice that measurement.
+_BF16_EAGER_ABS = 0.0
+_BF16_JIT_ABS = 2.2e-2
 
 
 def test_the_training_loss_is_the_sampling_velocity_against_the_target():
@@ -1524,3 +1640,42 @@ def test_a_goal_without_its_mask_is_refused(stage1, stage2):
         stage1.compute_loss(RNG, unmasked, actions)
     with pytest.raises(ValueError, match="lit_goal_mask"):
         stage2.compute_loss_and_aux(RNG, unmasked, actions)
+
+
+# ---- the training pass and the sampling pass take the same RoPE offset ----
+
+
+def _offset_observations(base):
+    """Observations whose valid-token counts differ per sample: prompt lengths of their own, a camera missing for one
+    sample, a different camera missing for the other (base already has the right wrist missing for sample 1)."""
+    return {
+        "base": base,
+        "prompts 7 and 4": _with_prompt_lengths(base, (TEXT - 1, TEXT - 4)),
+        "prompts 2 and 8": _with_prompt_lengths(base, (2, TEXT)),
+        "camera 0 off for sample 0": _with_camera_off(base, "base_0_rgb", 0),
+        "two cameras off for sample 0, prompt 3": _with_prompt_lengths(
+            _with_camera_off(_with_camera_off(base, "base_0_rgb", 0), "left_wrist_0_rgb", 0), (3, TEXT - 3)
+        ),
+    }
+
+
+@pytest.mark.parametrize(("mask_image", "mask_language"), [(True, True), (True, False), (False, True), (False, False)])
+def test_the_training_pass_and_the_sampling_pass_start_the_action_rows_from_the_same_offset(mask_image, mask_language):
+    """`_lit_prefix_pass` (training) and `lit_prefix` (sampling) are two code paths and both must take the offset from
+    `_lit_suffix_offset`: for the same observation (no memory) they agree on the valid-token count and on the offset,
+    which is the count, or the constant 0 when both masks hide the whole prefix. The offset depends on the masks and
+    not on any activation, so the image tower is the one-Dense stub here (the harness's opt-in encoder)."""
+    config = _utils.make_tiny_config(lit="stage2", lit_mask_image=mask_image, lit_mask_language=mask_language)
+    with _utils.stub_image_encoder():
+        model = _utils.randomize_zero_init(_utils.build_model(config))
+        hard = mask_image and mask_language
+        counts = set()
+        for name, observation in _offset_observations(_BASE).items():
+            trained = model._lit_prefix_pass(_pre(observation), mask_num=0)
+            _, _, served, memory = model.lit_prefix(_pre(observation), _utils.empty_memory())
+            serve_count = jnp.sum(memory["memory_prefix_mask"], axis=-1)
+            _equal(trained.count, serve_count)
+            _equal(trained.offset, served)
+            _equal(served, jnp.zeros_like(serve_count) if hard else serve_count)
+            counts.add(tuple(np.asarray(serve_count).tolist()))
+    assert len(counts) > 1, "the variants must actually change the valid-token count"

@@ -36,6 +36,15 @@ HIST_INTERVAL = 10
 # token count and KV-cache size -- so fsdp_devices and batch_size below are unchanged.
 HIST_INTERVAL_WIDE = 20
 ACTION_HORIZON = 30
+# LIT (Latent Interface Training) on the left-real recipe. The driven arm is the left one: dims 0-6 of the 14-dim
+# state, the complement of the right arm the recipe holds still (RIGHT_ARM_DIMS) and exactly the dims the recipe
+# leaves visible to the model (LEFT_ARM_DIMS as active_state_dims), so the pose loss and the goal encoder never see the
+# held arm's drift. Dims 14-31 of the 32-wide model state are zero padding.
+LIT_BASE_CONFIG = "pi05_yam_stream5_i20_bagging_left_real"
+LIT_GOAL_DIMS = LEFT_ARM_DIMS
+# The four LIT rows share one set of norm statistics, the control's, so the arms differ in nothing but the method: the
+# pin follows ih/openpi's convention (assets_dir is the Modal volume's /checkpoints/assets/<config>, asset_id the repo).
+LIT_NORM_ASSETS_DIR = f"/checkpoints/assets/{LIT_BASE_CONFIG}_litctl"
 # The YAM LeRobot layout: three cameras, 14-dim state/action [L j0..5, L grip, R j0..5, R grip].
 YAM_REPACK = _transforms.Group(
     inputs=[
@@ -56,7 +65,7 @@ YAM_REPACK = _transforms.Group(
 
 def get_ih_yam_configs():
     # Deferred: config.py imports this module while building its registry.
-    from openpi.training.config import DataConfig, LeRobotAgilexDataConfig, TrainConfig
+    from openpi.training.config import AssetsConfig, DataConfig, LeRobotAgilexDataConfig, TrainConfig
 
     @dataclasses.dataclass(frozen=True)
     class LeRobotYamStreamDataConfig(LeRobotAgilexDataConfig):
@@ -124,6 +133,30 @@ def get_ih_yam_configs():
             ema_decay=None if lora else 0.99,
         )
 
+    def lit_config(suffix: str, *, lit: str, lora: bool, weight_loader, ema_decay: float | None):
+        """A LIT row: the left-real recipe with the model switched to `lit`. Everything else (dataset, prompt, cameras,
+        horizons, cadence, norm statistics) is the recipe's; the full fine-tune rows run batch 32 over four devices and
+        the LoRA row batch 16 on one, as the recipe's own full and LoRA rows do."""
+        row = stream_config(
+            f"{LIT_BASE_CONFIG}_{suffix}", BAGGING_LEFT_REAL_REPO_ID, BAGGING_PROMPT, lora=lora,
+            hist_interval=HIST_INTERVAL_WIDE,
+            active_image_keys=frozenset({"left_wrist_0_rgb"}),
+            active_state_dims=LEFT_ARM_DIMS,
+            held_action_dims=RIGHT_ARM_DIMS,
+        )
+        model = dataclasses.replace(row.model, lit=lit, lit_goal_dims=LIT_GOAL_DIMS if lit != "off" else ())
+        return dataclasses.replace(
+            row,
+            model=model,
+            data=dataclasses.replace(
+                row.data,
+                assets=AssetsConfig(assets_dir=LIT_NORM_ASSETS_DIR, asset_id=BAGGING_LEFT_REAL_REPO_ID),
+            ),
+            weight_loader=weight_loader,
+            freeze_filter=model.get_freeze_filter(),
+            ema_decay=ema_decay,
+        )
+
     return [
         stream_config("pi05_yam_stream5_bagging", BAGGING_REPO_ID, BAGGING_PROMPT, lora=True),
         stream_config("pi05_yam_stream5_bagging_full", BAGGING_REPO_ID, BAGGING_PROMPT, lora=False),
@@ -146,4 +179,25 @@ def get_ih_yam_configs():
                       active_image_keys=frozenset({"left_wrist_0_rgb"}),
                       active_state_dims=LEFT_ARM_DIMS,
                       held_action_dims=RIGHT_ARM_DIMS),
+        # LIT (Latent Interface Training) on that recipe:
+        #  _litctl   the matched control: lit off, FULL fine-tune, PaliGemma init with a random expert (LIT's tested
+        #            protocol). Its norm statistics (compute_norm_stats on this config) are the ones all four use.
+        #  _lit1     stage 1: no images reach the model, expert + goal encoder train, backbone frozen. The loader still
+        #            decodes all three cameras (compute_loss needs the images dict) and the cameras are masked as in
+        #            the recipe. No EMA: the backbone is frozen.
+        #  _lit2     stage 2, full fine-tune, from a stage-1 checkpoint: pass --weight-loader.params-path=<the stage-1
+        #            run's params directory>.
+        #  _litlite  stage 2 with LoRA on the backbone and the expert and full lit_* modules, warm start from pi05_base:
+        #            a labelled deviation (LIT's tested protocol is the full fine-tune).
+        # lit_groups=6 divides the 18 layers (3 per group); lit_goal_dims is the left arm, dims 0-6.
+        lit_config("litctl", lit="off", lora=False, weight_loader=weight_loaders.PaliGemmaWeightLoader(),
+                   ema_decay=0.99),
+        lit_config("lit1", lit="stage1", lora=False, weight_loader=weight_loaders.PaliGemmaWeightLoader(),
+                   ema_decay=None),
+        lit_config("lit2", lit="stage2", lora=False, weight_loader=weight_loaders.LitStage1WeightLoader(),
+                   ema_decay=0.99),
+        lit_config("litlite", lit="stage2", lora=True,
+                   weight_loader=weight_loaders.CheckpointWeightLoader(
+                       PI05_BASE_PARAMS, missing_regex=weight_loaders.LIT_MISSING_REGEX),
+                   ema_decay=None),
     ]
