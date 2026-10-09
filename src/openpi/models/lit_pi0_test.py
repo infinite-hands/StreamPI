@@ -346,6 +346,7 @@ def test_lit_off_equals_the_baseline_fixture_and_never_enters_the_lit_path(monke
             assert aux == {}
 
 
+@fixture_exact
 def test_lit_off_param_tree_is_the_fixture_and_lit_modules_come_last():
     expected = json.loads((_gen.FIXTURE_DIR / "baseline_params.json").read_text())["float32"]
     for stage in ("stage1", "stage2"):
@@ -1319,6 +1320,7 @@ def test_with_the_masks_off_the_action_rows_do_read_the_prefix_and_the_memory():
         assert _differs(fixed, reference) > 0.0
 
 
+@fixture_exact
 def test_two_pass_with_no_lit_mask_and_no_latents_equals_the_stock_sampling(capsys):
     """Masks off and the latent columns dropped, the two-pass sampler is the stock joint one: against the fixture
     (generated from the unmodified pin), call 1 with an empty memory and call 2 with the memory carried."""
@@ -1589,8 +1591,11 @@ def test_hard_mask_sampled_actions_are_exactly_independent_of_the_valid_token_co
             for call in range(2):
                 _equal(actions[call], reference[call])
         # the memory length: the second call with an empty memory samples what it samples after the first call
+        # Different cache lengths run differently shaped matmuls, so the last bits depend on the toolchain: bit-equal on
+        # arm64, 3.6e-7 absolute apart on x86 (measured on a Modal CPU container). The invariant is held to the file's
+        # sampling tolerance, relative to the action scale; same-shape comparisons above stay exact.
         alone, _ = _sampled_chain(model, [second], noises[1:])
-        _equal(alone[0], reference[1])
+        assert _differs(alone[0], reference[1]) / float(np.max(np.abs(reference[1]))) <= _SAMPLE_REL
 
         # the probe has power: with the raw count as the start the same chains do differ
         monkeypatch.setattr(_pi0.Pi0, "_lit_suffix_offset", lambda self, count: count)
