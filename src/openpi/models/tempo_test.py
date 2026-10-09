@@ -10,6 +10,7 @@ import pytest
 
 from openpi import transforms
 from openpi.models import model as _model
+from openpi.models import pi0
 from openpi.models import pi0_config
 from openpi.models import tempo
 from openpi.policies import tempo_history
@@ -19,9 +20,9 @@ from openpi.training import weight_loaders
 BATCH, UNITS, HORIZON, ACT_DIM = 1, 2, 4, 7
 
 
-def _config_for(**tempo_fields) -> pi0_config.Pi0Config:
+def _config_for(dtype: str = "bfloat16", **tempo_fields) -> pi0_config.Pi0Config:
     return pi0_config.Pi0Config(pi05=True, paligemma_variant="dummy", action_expert_variant="dummy",
-                                action_horizon=HORIZON, hist_horizon=UNITS, max_token_len=8,
+                                action_horizon=HORIZON, hist_horizon=UNITS, max_token_len=8, dtype=dtype,
                                 tempo_action_history_dim=ACT_DIM, **tempo_fields)
 
 
@@ -63,10 +64,22 @@ def _with_open_gates(model):
     flat = flax.traverse_util.flatten_dict(state.to_pure_dict())
     rng = np.random.default_rng(0)
     for key, value in flat.items():
-        if "llm" in map(str, key) and np.ndim(value) >= 2 and not np.any(value):
+        names = tuple(map(str, key))
+        if "llm" in names and np.ndim(value) >= 2 and not np.any(value):
             flat[key] = jnp.asarray(rng.normal(0, 0.02, np.shape(value)), np.asarray(value).dtype)
+        elif names[-1] == "gate" or "pos_emb" in names or "mlp_out" in names:  # TEMPO's zero-init gates, opened
+            flat[key] = jnp.asarray(rng.normal(0.5, 0.1, np.shape(value)), np.asarray(value).dtype)
     state.replace_by_pure_dict(flax.traverse_util.unflatten_dict(flat))
     return nnx.merge(graph, state)
+
+
+def _prefix_pass(model, obs):
+    """The prefix forward pass compute_loss makes (without its random unit masking): (out, kv_cache)."""
+    tokens, mask, ar_mask, *_ = model.embed_prefix(obs)
+    attn_mask = model.hide_history(pi0.make_attn_mask(mask, ar_mask))
+    positions = jnp.cumsum(model.position_mask(mask), axis=1) - 1
+    (out, _), kv_cache = model.PaliGemma.llm([tokens, None], mask=attn_mask, positions=positions, adarms_cond=[None, None])
+    return out, kv_cache
 
 
 def test_sam2_fusion_is_a_no_op_at_init_and_can_learn():
@@ -125,11 +138,67 @@ def test_loss_and_streaming_sample_run_with_both_channels():
     assert float(jnp.abs(grads.sam2_fusion.gate.value).max()) > 0
     assert float(jnp.abs(grads.action_history_tokens.proj.kernel.value).max()) > 0
 
+    shut = _shared_base(config.create(jax.random.key(0)), _with_open_gates(_config_for().create(jax.random.key(0))))
+    grads = nnx.grad(lambda m: jnp.mean(m.compute_loss(jax.random.key(1), obs, jnp.ones((BATCH, HORIZON, config.action_dim)))))(shut)
+    assert float(jnp.abs(grads.action_history_tokens.gate.value).max()) > 0, "a shut history gate still learns to open"
+
     memory = {"memory_tokens": None, "memory_kv_cache": None, "memory_prefix_mask": None}
     one_unit = jax.tree.map(lambda x: x[:, -1:] if x.ndim >= 3 and x.shape[1] == UNITS else x, obs)
     for _ in range(2):  # the second call reads the first call's unit from the KV cache
         actions, memory = model.sample_actions(jax.random.key(2), one_unit, num_steps=2, memory=memory)
         assert actions.shape == (BATCH, HORIZON, config.action_dim) and bool(jnp.isfinite(actions).all())
+
+
+def test_history_tokens_start_at_zero():
+    config = _config_for(tempo_action_history=True)
+    model = config.create(jax.random.key(0))
+    obs = _observation(config)
+    assert not bool(jnp.any(model.action_history_tokens(obs.action_history[:, -1]))), "a zero gate silences the tokens"
+
+
+def test_history_is_invisible_to_image_and_prompt_tokens():
+    plain = _with_open_gates(_config_for("float32").create(jax.random.key(0)))
+    config = _config_for("float32", tempo_action_history=True)
+    act = _with_open_gates(_shared_base(config.create(jax.random.key(1)), plain))
+    obs = _observation(config)
+    with_history, _ = _prefix_pass(act, obs)
+    without_history, _ = _prefix_pass(plain, obs)
+    slots = act.history_slots(with_history.shape[1])
+    assert bool(jnp.any(with_history[:, slots])), "the history tokens themselves are live once the gate opens"
+    # float32 throughout; the two sequences differ in length, so reductions may differ in the last bits
+    np.testing.assert_allclose(np.asarray(with_history[:, ~slots]), np.asarray(without_history), rtol=1e-5, atol=1e-5)
+
+
+def test_streaming_memory_matches_the_training_pass():
+    config = _config_for("float32", tempo_sam2=True, tempo_sam2_image_key="left_wrist_0_rgb", tempo_action_history=True)
+    model = _with_open_gates(config.create(jax.random.key(0)))
+    obs = _observation(config)
+    _, full_kv = _prefix_pass(model, obs)
+    memory = {"memory_tokens": None, "memory_kv_cache": None, "memory_prefix_mask": None}
+    for t in range(UNITS):
+        unit = jax.tree.map(lambda x, t=t: x[:, t:t + 1] if x.ndim >= 3 and x.shape[1] == UNITS else x, obs)
+        _, memory = model.sample_actions(jax.random.key(2), unit, num_steps=1, memory=memory)
+    # A padded bucket's row is fully masked, so its output averages whatever keys are present: it
+    # differs between the two passes and nothing reads it. Every valid token must match.
+    valid = np.asarray(memory["memory_prefix_mask"][0])
+    for streamed, full in zip(jax.tree.leaves(memory["memory_kv_cache"]), jax.tree.leaves(full_kv), strict=True):
+        assert streamed.shape == full.shape  # (layers, b, tokens, heads, head_dim)
+        np.testing.assert_allclose(np.asarray(streamed, np.float32)[:, :, valid], np.asarray(full, np.float32)[:, :, valid],
+                                   rtol=1e-5, atol=1e-5)
+
+
+def test_action_history_is_normalized_with_the_driven_arms_state_stats():
+    q01, q99 = np.arange(14, dtype=np.float32), np.arange(14, dtype=np.float32) + 2
+    stats = transforms.NormStats(mean=np.zeros(14), std=np.ones(14), q01=q01, q99=q99)
+    dims = tuple(range(7, 14))  # the right arm
+    history = np.broadcast_to(q01[list(dims)] + 1, (UNITS, 3, 7)).astype(np.float32)  # each dim's band midpoint
+    pad = np.zeros((UNITS, 3), bool)
+    pad[0, 0] = True
+    out = tempo_history.NormalizeActionHistory(stats, dims)({"action_history": history, "action_history_is_pad": pad})
+    np.testing.assert_allclose(out["action_history"][~pad], 0.0, atol=1e-5)
+    assert np.array_equal(out["action_history"][0, 0], np.zeros(7)), "a bucket wholly before the episode is zero"
+    with pytest.raises(ValueError, match="state stats"):
+        tempo_history.NormalizeActionHistory(None, dims)({"action_history": history, "action_history_is_pad": pad})
 
 
 def test_missing_inputs_are_refused():

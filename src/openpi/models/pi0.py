@@ -18,6 +18,8 @@ from openpi.shared import array_typing as at
 
 logger = logging.getLogger("openpi")
 
+_SIGLIP_VARIANT = "So400m/14"
+
 
 def make_attn_mask(input_mask, mask_ar):
     """Adapted from big_vision.
@@ -84,7 +86,7 @@ class Pi0(_model.BaseModel):
         img = nnx_bridge.ToNNX(
             _siglip.Module(
                 num_classes=paligemma_config.width,
-                variant="So400m/14",
+                variant=_SIGLIP_VARIANT,
                 pool_type="none",
                 scan=True,
                 dtype_mm=config.dtype,
@@ -124,6 +126,13 @@ class Pi0(_model.BaseModel):
                                         action_expert_config.width, rngs=rngs)
             if config.tempo_action_history and config.pi05 else None
         )
+        # A history unit's length (every camera's patches, the padded prompt, the history tokens): the
+        # history tokens are its last `tempo_action_history_steps` slots, hidden from the image and prompt
+        # tokens and left out of the positions, so those tokens see exactly what the control's do.
+        patch = int(_SIGLIP_VARIANT.split("/")[1])
+        image_tokens = (_model.IMAGE_RESOLUTION[0] // patch) * (_model.IMAGE_RESOLUTION[1] // patch)
+        self.history_steps = config.tempo_action_history_steps if config.tempo_action_history else 0
+        self.unit_len = len(config.fake_obs().images) * image_tokens + config.max_token_len + self.history_steps
 
     def _history_unit(self, obs: _model.Observation, all_image_tokens: dict, t: int, tokenized_inputs):
         """History unit t: every camera's visual tokens (the SAM2 camera's fused with frame t's cue),
@@ -150,7 +159,35 @@ class Pi0(_model.BaseModel):
             tokens.append(history)
             input_mask.append(~obs.action_history_is_pad[:, t])  # buckets entirely before the episode
             ar_mask += [False] * history.shape[1]
-        return jnp.concatenate(tokens, axis=1), jnp.concatenate(input_mask, axis=1), ar_mask
+        tokens = jnp.concatenate(tokens, axis=1)
+        if self.history_steps and tokens.shape[1] != self.unit_len:
+            raise ValueError(f"a history unit is {tokens.shape[1]} tokens, but the model hides history slots "
+                             f"by a unit length of {self.unit_len}")
+        return tokens, jnp.concatenate(input_mask, axis=1), ar_mask
+
+    def history_slots(self, length: int) -> jax.Array:
+        """(length,) True on the action-history tokens of a prefix made of whole history units."""
+        if not self.history_steps:
+            return jnp.zeros((length,), jnp.bool_)
+        if length % self.unit_len:
+            raise ValueError(f"a prefix of {length} tokens is not whole history units of {self.unit_len}")
+        return jnp.arange(length) % self.unit_len >= self.unit_len - self.history_steps
+
+    def position_mask(self, prefix_mask: jax.Array) -> jax.Array:
+        """The prefix tokens that count toward positions: every valid token except the history tokens."""
+        return prefix_mask & ~self.history_slots(prefix_mask.shape[-1])
+
+    def hide_history(self, prefix_attn_mask: jax.Array) -> jax.Array:
+        """Restrict a (b, q, k) prefix attention mask, whose queries are the last q of its k prefix keys:
+        image and prompt tokens never see history tokens; history tokens see only their own unit's."""
+        if not self.history_steps:
+            return prefix_attn_mask
+        q, k = prefix_attn_mask.shape[-2:]
+        slots = self.history_slots(k)
+        unit = jnp.arange(k) // self.unit_len
+        q_slots, q_unit = slots[k - q:], unit[k - q:]
+        allowed = jnp.where(q_slots[:, None], slots[None, :] & (q_unit[:, None] == unit[None, :]), ~slots[None, :])
+        return prefix_attn_mask & allowed[None]
 
     @at.typecheck
     def embed_prefix(
@@ -281,7 +318,11 @@ class Pi0(_model.BaseModel):
         input_mask = input_mask & to_mask[None, :]
 
         attn_mask = make_attn_mask(input_mask, ar_mask)
-        positions = jnp.cumsum(input_mask, axis=1) - 1
+        prefix_len = prefix_mask.shape[1]
+        attn_mask = attn_mask.at[:, :prefix_len, :prefix_len].set(
+            self.hide_history(attn_mask[:, :prefix_len, :prefix_len]))
+        position_mask = input_mask.at[:, :prefix_len].set(self.position_mask(input_mask[:, :prefix_len]))
+        positions = jnp.cumsum(position_mask, axis=1) - 1
 
         def safe_print(fmt, *args):
             if jax.process_index() == 0:
@@ -408,12 +449,11 @@ class Pi0(_model.BaseModel):
             memory_prefix_attn_mask = einops.repeat(memory_prefix_mask, "b p -> b s p", s=prefix_mask.shape[1])
             prefix_attn_mask = jnp.concatenate([memory_prefix_attn_mask, prefix_attn_mask], axis=-1)
             prefix_mask = jnp.concatenate([memory_prefix_mask, prefix_mask], axis=-1)
-        # memory_kv_cache = None
-            # import pdb;pdb.set_trace()
-            positions = jnp.cumsum(prefix_mask, axis=1) - 1
-            positions = positions[..., memory_prefix_mask.shape[-1]:] 
+            positions = jnp.cumsum(self.position_mask(prefix_mask), axis=1) - 1
+            positions = positions[..., memory_prefix_mask.shape[-1]:]
         else:
-            positions = jnp.cumsum(prefix_mask, axis=1) - 1
+            positions = jnp.cumsum(self.position_mask(prefix_mask), axis=1) - 1
+        prefix_attn_mask = self.hide_history(prefix_attn_mask)
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions, kv_cache=memory_kv_cache)
         self.save_memory(prefix_tokens, prefix_mask, num_visual_tokens, num_text_tokens, kv_cache, memory)
 
@@ -439,7 +479,7 @@ class Pi0(_model.BaseModel):
             # )
             # print(full_attn_mask.shape)
             # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens
-            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+            positions = jnp.sum(self.position_mask(prefix_mask), axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
 
             (prefix_out, suffix_out), _ = self.PaliGemma.llm(
                 [None, suffix_tokens],

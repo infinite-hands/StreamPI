@@ -54,15 +54,21 @@ class Sam2CrossAttnFusion(nnx.Module):
 
 class ActionHistoryTokens(nnx.Module):
     """Each bucket-mean past action projected to one VLM token: a shared linear plus a per-bucket
-    position embedding (zero-init)."""
+    position embedding (zero-init), scaled by a zero-init gate.
+
+    The gate is the second deliberate difference from upstream, which trains from pi0.5 base: on a
+    warm-started checkpoint, ungated tokens moved the step-0 loss from 0.0047 to 0.54 (left real arm).
+    Pi0 also hides these tokens from the image and prompt tokens; with the gate at zero they are exactly
+    zero through every Gemma layer (no biases), so the action expert reads zero keys and values."""
 
     def __init__(self, in_dim: int, num_tokens: int, vlm_dim: int, *, rngs: nnx.Rngs):
         self.proj = nnx.Linear(in_dim, vlm_dim, rngs=rngs)
         self.pos_emb = nnx.Param(jnp.zeros((num_tokens, vlm_dim)))
+        self.gate = nnx.Param(jnp.zeros((1,)))
 
     def __call__(self, history: jax.Array) -> jax.Array:
         # (b, k, in_dim) -> (b, k, vlm_dim)
-        return self.proj(history.astype(jnp.float32)) + self.pos_emb.value[None]
+        return self.gate.value * (self.proj(history.astype(jnp.float32)) + self.pos_emb.value[None])
 
 
 class ActionHistoryCondMLP(nnx.Module):

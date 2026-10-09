@@ -3,6 +3,7 @@
 import dataclasses
 
 import openpi.models.pi0_config as pi0_config
+import openpi.policies.tempo_history as _tempo_history
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
@@ -102,13 +103,19 @@ def get_ih_yam_configs():
 
         @override
         def create(self, assets_dirs, model_config):
-            return dataclasses.replace(
+            config = dataclasses.replace(
                 super().create(assets_dirs, model_config),
                 # pi0.5's own default (the AgileX base config forces z-score). The YAM left gripper never
                 # moves in the corpus, so its std is ~1e-3 and z-scoring turns its noise into a loss of
                 # tens of thousands; the quantile band is floored by the stats writer instead.
                 use_quantile_norm=True,
             )
+            dims = config.tempo_action_dims
+            if dims is None:
+                return config
+            normalize = _tempo_history.NormalizeActionHistory((config.norm_stats or {}).get("state"), tuple(dims))
+            return dataclasses.replace(config, model_transforms=_transforms.Group(
+                inputs=[normalize, *config.model_transforms.inputs], outputs=config.model_transforms.outputs))
 
     def stream_config(name: str, repo_id: str, prompt: str, *, lora: bool,
                       hist_interval: int = HIST_INTERVAL,
