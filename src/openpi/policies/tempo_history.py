@@ -66,3 +66,25 @@ class LoadTempoHistory(transforms.DataTransformFn):
             "action_history": np.stack([history for history, _ in histories]),
             "action_history_is_pad": np.stack([pad for _, pad in histories]),
         }
+
+
+@dataclasses.dataclass(frozen=True)
+class NormalizeActionHistory(transforms.DataTransformFn):
+    """Quantile-normalize `action_history` with the STATE stats at `dims`: the history is absolute joint
+    and gripper commands, the space `state` is in (the action stats describe deltas). A bucket that lies
+    wholly before the episode becomes exactly zero, so the adaRMS residual, which reads pad buckets too,
+    sees no offset there. Runs after Normalize, at train and serve time alike."""
+
+    state_stats: transforms.NormStats | None
+    dims: tuple[int, ...]
+
+    def __call__(self, data: dict) -> dict:
+        if "action_history" not in data:
+            return data
+        if self.state_stats is None or self.state_stats.q01 is None:
+            raise ValueError("TEMPO's action history needs the recipe's quantile state stats, and none were loaded")
+        q01 = np.asarray(self.state_stats.q01)[list(self.dims)]
+        q99 = np.asarray(self.state_stats.q99)[list(self.dims)]
+        history = (np.asarray(data["action_history"]) - q01) / (q99 - q01 + 1e-6) * 2.0 - 1.0
+        pad = np.asarray(data["action_history_is_pad"])[..., None]
+        return {**data, "action_history": np.where(pad, 0.0, history).astype(np.float32)}
