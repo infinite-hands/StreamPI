@@ -4,6 +4,7 @@ must not, the driven-arm goal dims, the shared norm statistics, and the freeze-f
 """
 
 import dataclasses
+import pathlib
 import re
 
 import flax.nnx as nnx
@@ -140,14 +141,21 @@ def _stats():
 
 
 def test_the_four_rows_read_one_set_of_norm_statistics(tmp_path):
-    expected = f"/checkpoints/assets/{NAMES['litctl']}"
-    pinned = _config.AssetsConfig(assets_dir=expected, asset_id=_yam.BAGGING_LEFT_REAL_REPO_ID)
+    """All four rows read the PRODUCTION base recipe's stats: the dir the launcher's stats pass writes for the base
+    config name, so no row depends on another having run first (a _lit* name's own pass writes elsewhere)."""
+    production = f"/checkpoints/assets/{BASE}"
+    pinned = _config.AssetsConfig(assets_dir=production, asset_id=_yam.BAGGING_LEFT_REAL_REPO_ID)
     for suffix in SUFFIXES:
         assert _row(suffix).data.assets == pinned, suffix
-    assert _yam.LIT_NORM_ASSETS_DIR == expected
-    # what the pin resolves to: the stats compute_norm_stats wrote for the control (assets_dirs / repo_id)
-    control = _row("litctl")
-    assert control.assets_dirs.name == NAMES["litctl"]
+    assert _yam.LIT_NORM_ASSETS_DIR == production
+    # the pinned file is the one the base recipe itself reads on the volume: assets_dirs (keyed by config name) / repo id
+    base = _config.get_config(BASE)
+    on_volume = dataclasses.replace(base, assets_base_dir="/checkpoints/assets")
+    base_data = on_volume.data.create(on_volume.assets_dirs, on_volume.model)
+    base_reads = pathlib.Path(on_volume.data.assets.assets_dir or on_volume.assets_dirs) / base_data.asset_id
+    assert base_reads == pathlib.Path(pinned.assets_dir) / pinned.asset_id
+    # no _lit* row's own assets dir (where a stats pass for that name would write) is the pinned one
+    assert all(f"/checkpoints/assets/{NAMES[suffix]}" != pinned.assets_dir for suffix in SUFFIXES)
 
     # and with the stats present the four data configs load the very same ones, for the model of each row
     stats = _stats()

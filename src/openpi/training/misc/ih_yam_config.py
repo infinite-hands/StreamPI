@@ -42,9 +42,11 @@ ACTION_HORIZON = 30
 # held arm's drift. Dims 14-31 of the 32-wide model state are zero padding.
 LIT_BASE_CONFIG = "pi05_yam_stream5_i20_bagging_left_real"
 LIT_GOAL_DIMS = LEFT_ARM_DIMS
-# The four LIT rows share one set of norm statistics, the control's, so the arms differ in nothing but the method: the
-# pin follows ih/openpi's convention (assets_dir is the Modal volume's /checkpoints/assets/<config>, asset_id the repo).
-LIT_NORM_ASSETS_DIR = f"/checkpoints/assets/{LIT_BASE_CONFIG}_litctl"
+# The four LIT rows read the PRODUCTION base recipe's norm statistics, the file the launcher's stats pass already wrote
+# for LIT_BASE_CONFIG (/checkpoints/assets/<config name>/<repo id>/norm_stats.json on the Modal volume), so the control
+# and the LIT arms normalise exactly like the production baseline and no row depends on another having run first. The
+# pin follows ih/openpi's convention: assets_dir is the volume's /checkpoints/assets/<config>, asset_id the repo.
+LIT_NORM_ASSETS_DIR = f"/checkpoints/assets/{LIT_BASE_CONFIG}"
 # The YAM LeRobot layout: three cameras, 14-dim state/action [L j0..5, L grip, R j0..5, R grip].
 YAM_REPACK = _transforms.Group(
     inputs=[
@@ -181,7 +183,7 @@ def get_ih_yam_configs():
                       held_action_dims=RIGHT_ARM_DIMS),
         # LIT (Latent Interface Training) on that recipe:
         #  _litctl   the matched control: lit off, FULL fine-tune, PaliGemma init with a random expert (LIT's tested
-        #            protocol). Its norm statistics (compute_norm_stats on this config) are the ones all four use.
+        #            protocol).
         #  _lit1     stage 1: no images reach the model, expert + goal encoder train, backbone frozen. The loader still
         #            decodes all three cameras (compute_loss needs the images dict) and the cameras are masked as in
         #            the recipe. No EMA: the backbone is frozen.
@@ -189,6 +191,8 @@ def get_ih_yam_configs():
         #            run's params directory>.
         #  _litlite  stage 2 with LoRA on the backbone and the expert and full lit_* modules, warm start from pi05_base:
         #            a labelled deviation (LIT's tested protocol is the full fine-tune).
+        # All four read the base recipe's norm statistics (LIT_NORM_ASSETS_DIR above): compute_norm_stats is never run
+        # for a _lit* name, and the file for LIT_BASE_CONFIG must exist before any of them starts.
         # lit_groups=6 divides the 18 layers (3 per group); lit_goal_dims is the left arm, dims 0-6.
         lit_config("litctl", lit="off", lora=False, weight_loader=weight_loaders.PaliGemmaWeightLoader(),
                    ema_decay=0.99),
