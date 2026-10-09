@@ -107,6 +107,12 @@ class Observation(Generic[ArrayT]):
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "#b l"] | None = None
 
+    # LIT (latent interface training) only: the driven arm's state `action_horizon` steps ahead, padded to the state
+    # width and normalised like `state`, and True where it is a real target rather than padding. Never part of `state`
+    # and never tokenized.
+    lit_goal: at.Float[ArrayT, "#b g"] | None = None
+    lit_goal_mask: at.Bool[ArrayT, "#b"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -136,6 +142,8 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            lit_goal=data.get("lit_goal"),
+            lit_goal_mask=data.get("lit_goal_mask"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -218,6 +226,8 @@ def preprocess_observation(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        lit_goal=observation.lit_goal,
+        lit_goal_mask=observation.lit_goal_mask,
     )
 
 
@@ -248,6 +258,14 @@ class BaseModelConfig(abc.ABC):
         model = nnx.eval_shape(self.create, jax.random.key(0))
         graphdef, state = nnx.split(model)
         if remove_extra_params:
+            # Extra leaves are dropped without a word below; LIT modules are the one thing that must never be: a
+            # stock model loaded from a LIT checkpoint runs on weights trained to work with them.
+            lit_roots = sorted(str(k) for k in params if str(k).startswith("lit_"))
+            if lit_roots and not any(str(k).startswith("lit_") for k in state.to_pure_dict()):
+                raise ValueError(
+                    f"the params carry LIT modules {lit_roots} but this config has none (lit='off'): refusing to drop "
+                    "them silently. Load a LIT checkpoint with a lit config."
+                )
             params = ocp.transform_utils.intersect_trees(state.to_pure_dict(), params)
         at.check_pytree_equality(expected=state.to_pure_dict(), got=params, check_shapes=True, check_dtypes=False)
         state.replace_by_pure_dict(params)

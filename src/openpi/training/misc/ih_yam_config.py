@@ -36,6 +36,17 @@ HIST_INTERVAL = 10
 # token count and KV-cache size -- so fsdp_devices and batch_size below are unchanged.
 HIST_INTERVAL_WIDE = 20
 ACTION_HORIZON = 30
+# LIT (Latent Interface Training) on the left-real recipe. The driven arm is the left one: dims 0-6 of the 14-dim
+# state, the complement of the right arm the recipe holds still (RIGHT_ARM_DIMS) and exactly the dims the recipe
+# leaves visible to the model (LEFT_ARM_DIMS as active_state_dims), so the pose loss and the goal encoder never see the
+# held arm's drift. Dims 14-31 of the 32-wide model state are zero padding.
+LIT_BASE_CONFIG = "pi05_yam_stream5_i20_bagging_left_real"
+LIT_GOAL_DIMS = LEFT_ARM_DIMS
+# The four LIT rows read the PRODUCTION base recipe's norm statistics, the file the launcher's stats pass already wrote
+# for LIT_BASE_CONFIG (/checkpoints/assets/<config name>/<repo id>/norm_stats.json on the Modal volume), so the control
+# and the LIT arms normalise exactly like the production baseline and no row depends on another having run first. The
+# pin follows ih/openpi's convention: assets_dir is the volume's /checkpoints/assets/<config>, asset_id the repo.
+LIT_NORM_ASSETS_DIR = f"/checkpoints/assets/{LIT_BASE_CONFIG}"
 # The YAM LeRobot layout: three cameras, 14-dim state/action [L j0..5, L grip, R j0..5, R grip].
 YAM_REPACK = _transforms.Group(
     inputs=[
@@ -56,7 +67,7 @@ YAM_REPACK = _transforms.Group(
 
 def get_ih_yam_configs():
     # Deferred: config.py imports this module while building its registry.
-    from openpi.training.config import DataConfig, LeRobotAgilexDataConfig, TrainConfig
+    from openpi.training.config import AssetsConfig, DataConfig, LeRobotAgilexDataConfig, TrainConfig
 
     @dataclasses.dataclass(frozen=True)
     class LeRobotYamStreamDataConfig(LeRobotAgilexDataConfig):
@@ -124,6 +135,40 @@ def get_ih_yam_configs():
             ema_decay=None if lora else 0.99,
         )
 
+    def lit_config(suffix: str, *, lit: str, lora: bool, weight_loader, ema_decay: float | None):
+        """A LIT row: the left-real recipe with the model switched to `lit`. Everything else (dataset, prompt, cameras,
+        horizons, cadence, norm statistics) is the recipe's; the full fine-tune rows run batch 32 over four devices and
+        the LoRA row batch 16 on one, as the recipe's own full and LoRA rows do.
+
+        The hyperparameters are the BASE recipe's, not LIT's own: the lr schedule (cosine, peak 2.5e-5, 1,000 warmup
+        steps, floor 2.5e-6 at step 20,000), AdamW (weight decay 1e-10, gradient clipping 1.0), 20,000 steps and the
+        batch, except what a row sets itself (ema_decay, weight loader, freeze filter, the lit fields). LIT's own pi0.5
+        release differs (reader reports of its torch launchers on LIBERO, not re-verified here): peak lr 1e-4, warmup
+        4,000 steps for stage 1 and 5,000 for stage 2, weight decay 0.01; the README's "backbone 1e-5" holds only for
+        its MolmoAct2-LIBERO run (its pi0.5 stage 2 trains the whole model at 1e-4). None of those was adopted: the
+        right values for this data are measure-first. The step budget (the control's 20,000 against lit1's 20,000
+        plus lit2's 20,000) is a launch-time decision via --num-train-steps; the cosine's decay_steps is its own field
+        and does not follow it."""
+        row = stream_config(
+            f"{LIT_BASE_CONFIG}_{suffix}", BAGGING_LEFT_REAL_REPO_ID, BAGGING_PROMPT, lora=lora,
+            hist_interval=HIST_INTERVAL_WIDE,
+            active_image_keys=frozenset({"left_wrist_0_rgb"}),
+            active_state_dims=LEFT_ARM_DIMS,
+            held_action_dims=RIGHT_ARM_DIMS,
+        )
+        model = dataclasses.replace(row.model, lit=lit, lit_goal_dims=LIT_GOAL_DIMS if lit != "off" else ())
+        return dataclasses.replace(
+            row,
+            model=model,
+            data=dataclasses.replace(
+                row.data,
+                assets=AssetsConfig(assets_dir=LIT_NORM_ASSETS_DIR, asset_id=BAGGING_LEFT_REAL_REPO_ID),
+            ),
+            weight_loader=weight_loader,
+            freeze_filter=model.get_freeze_filter(),
+            ema_decay=ema_decay,
+        )
+
     return [
         stream_config("pi05_yam_stream5_bagging", BAGGING_REPO_ID, BAGGING_PROMPT, lora=True),
         stream_config("pi05_yam_stream5_bagging_full", BAGGING_REPO_ID, BAGGING_PROMPT, lora=False),
@@ -146,4 +191,34 @@ def get_ih_yam_configs():
                       active_image_keys=frozenset({"left_wrist_0_rgb"}),
                       active_state_dims=LEFT_ARM_DIMS,
                       held_action_dims=RIGHT_ARM_DIMS),
+        # LIT (Latent Interface Training) on that recipe. In every row the lr schedule, warmup, weight decay, clipping,
+        # steps and batch are the BASE recipe's (see lit_config), not LIT's own pi0.5 release (peak lr 1e-4, warmup
+        # 4,000 stage 1 / 5,000 stage 2, weight decay 0.01 per reader reports; "backbone 1e-5" is MolmoAct2-LIBERO
+        # only): measure first. Step budgets are a launch-time decision via --num-train-steps.
+        #  _litctl   the matched control: lit off, FULL fine-tune, PaliGemma init with a random expert (LIT's tested
+        #            protocol). Base-recipe hyperparameters, batch 32, ema 0.99, 20,000 steps unless the launch sets
+        #            the matched budget (the LIT arms spend 20,000 + 20,000).
+        #  _lit1     stage 1: no images reach the model, expert + goal encoder train, backbone frozen. The loader still
+        #            decodes all three cameras (compute_loss needs the images dict) and the cameras are masked as in
+        #            the recipe. No EMA: the backbone is frozen. Base-recipe hyperparameters, batch 32, 20,000 steps
+        #            unless the launch sets another.
+        #  _lit2     stage 2, full fine-tune, from a stage-1 checkpoint: pass --weight-loader.params-path=<the stage-1
+        #            run's params directory>. Base-recipe hyperparameters (LIT's stage 2 uses its own, longer warmup),
+        #            batch 32, ema 0.99, 20,000 steps unless the launch sets another.
+        #  _litlite  stage 2 with LoRA on the backbone and the expert and full lit_* modules, warm start from pi05_base:
+        #            a labelled deviation (LIT's tested protocol is the full fine-tune). Base-recipe hyperparameters
+        #            (the recipe's LoRA row: batch 16, no EMA), 20,000 steps unless the launch sets another.
+        # All four read the base recipe's norm statistics (LIT_NORM_ASSETS_DIR above): compute_norm_stats is never run
+        # for a _lit* name, and the file for LIT_BASE_CONFIG must exist before any of them starts.
+        # lit_groups=6 divides the 18 layers (3 per group); lit_goal_dims is the left arm, dims 0-6.
+        lit_config("litctl", lit="off", lora=False, weight_loader=weight_loaders.PaliGemmaWeightLoader(),
+                   ema_decay=0.99),
+        lit_config("lit1", lit="stage1", lora=False, weight_loader=weight_loaders.PaliGemmaWeightLoader(),
+                   ema_decay=None),
+        lit_config("lit2", lit="stage2", lora=False, weight_loader=weight_loaders.LitStage1WeightLoader(),
+                   ema_decay=0.99),
+        lit_config("litlite", lit="stage2", lora=True,
+                   weight_loader=weight_loaders.CheckpointWeightLoader(
+                       PI05_BASE_PARAMS, missing_regex=weight_loaders.LIT_MISSING_REGEX),
+                   ema_decay=None),
     ]

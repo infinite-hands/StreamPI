@@ -67,6 +67,8 @@ def posemb_sincos(
 
 class Pi0Rtc(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0RtcConfig, rngs: nnx.Rngs):
+        if getattr(config, "lit", "off") != "off":
+            raise ValueError("lit != 'off' is not supported by Pi0Rtc.")
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
         paligemma_config = _gemma.get_config(config.paligemma_variant)

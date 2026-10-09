@@ -4,6 +4,7 @@ import re
 from typing import Protocol, runtime_checkable
 
 import flax.traverse_util
+import jax
 import numpy as np
 
 import openpi.models.model as _model
@@ -46,12 +47,125 @@ class CheckpointWeightLoader(WeightLoader):
     """
 
     params_path: str
+    # Full-match regex over "/"-joined paths: the model leaves the checkpoint may lack, which then keep the model's
+    # own initialisation. The default is LoRA only. A LIT stage-2 config opts in to LIT_MISSING_REGEX; anything else
+    # missing from the checkpoint is an error.
+    missing_regex: str = ".*lora.*"
 
     def load(self, params: at.Params) -> at.Params:
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
-        loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
-        # Add all missing LoRA weights.
-        return _merge_params(loaded_params, params, missing_regex=".*lora.*")
+        loaded_params = _restore(self.params_path)
+        _refuse_unwanted_lit(loaded_params, params)
+        if _admits_lit_modules(self.missing_regex):
+            _refuse_goal_encoder_into_other_stage(loaded_params, params)
+        # Add all missing LoRA weights (and whatever else missing_regex names).
+        return _merge_params(loaded_params, params, missing_regex=self.missing_regex)
+
+
+# What a LIT stage-2 config may lack in its checkpoint: the LoRA weights, and every lit_* module (a stage-1 checkpoint
+# or pi05_base has none). Anchored on purpose: `.*lit_.*` would also match any other path that merely contains "lit_".
+LIT_MISSING_REGEX = ".*lora.*|lit_.*"
+
+
+def _restore(params_path: str) -> at.Params:
+    """The checkpoint's params, with a path that is one level off said plainly instead of orbax's `_METADATA` error."""
+    try:
+        return _model.restore_params(download.maybe_download(params_path), restore_type=np.ndarray)
+    except FileNotFoundError as error:
+        raise FileNotFoundError(
+            f"no checkpoint params at {params_path!r}: the path must end in <step>/params, e.g. "
+            f"<checkpoint_dir>/<exp_name>/<step>/params, not the step directory or the experiment directory. ({error})"
+        ) from error
+
+
+def _lit_roots(tree: at.Params) -> list[str]:
+    return sorted(key for key in tree if str(key).startswith("lit_"))
+
+
+def _admits_lit_modules(missing_regex: str) -> bool:
+    """Whether the regex lets a model's lit_* leaves be absent from the checkpoint (the opt-in of a stage-2 config)."""
+    return re.fullmatch(missing_regex, "lit_aggregator/probe") is not None
+
+
+def _refuse_goal_encoder_into_other_stage(loaded_params: at.Params, params: at.Params) -> None:
+    """A stage-1 checkpoint (it carries the goal encoder) taken through the generic loader into a model without a goal
+    encoder would lose it silently, and the fingerprint of `LitStage1WeightLoader` would not run: refuse."""
+    if "lit_goal_encoder" in loaded_params and "lit_goal_encoder" not in params:
+        raise ValueError(
+            "the checkpoint is a LIT stage-1 one (it carries lit_goal_encoder leaves) and the model is not stage 1: "
+            "its goal encoder would be dropped silently. Initialise a stage-2 model from it with LitStage1WeightLoader."
+        )
+
+
+def _refuse_unwanted_lit(loaded_params: at.Params, params: at.Params) -> None:
+    """A checkpoint with LIT modules loaded into a model that has none (lit="off") would have them dropped without a
+    word, and the stock model that is left would run or train on wrong weights: refuse."""
+    if (stray := _lit_roots(loaded_params)) and not _lit_roots(params):
+        raise ValueError(
+            f"the checkpoint carries LIT parameters {stray} but the model has none (lit='off'): loading it would "
+            "silently drop them and leave a stock model with weights trained to work with them. Use a lit config."
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LitStage1WeightLoader(WeightLoader):
+    """Initialises a LIT stage-2 model from a stage-1 checkpoint (`params_path`, given at launch).
+
+    The backbone and the action expert come from the checkpoint; the stage-1 goal encoder is dropped; the stage-2
+    lit_* modules (aggregator, pose decoder) keep the model's own initialisation. Fails closed: it raises unless the
+    checkpoint is a stage-1 one and the result is exactly that, with no checkpoint leaf dropped but the goal encoder
+    (see `_stage1_handoff`)."""
+
+    params_path: str = ""
+
+    def load(self, params: at.Params) -> at.Params:
+        if not self.params_path:
+            raise ValueError("pass the stage-1 checkpoint's params directory: --weight-loader.params-path=<dir>.")
+        return _stage1_handoff(_restore(self.params_path), params)
+
+
+def _stage1_handoff(loaded_params: at.Params, params: at.Params) -> at.Params:
+    flat_loaded = flax.traverse_util.flatten_dict(loaded_params, sep="/")
+    flat_ref = flax.traverse_util.flatten_dict(params, sep="/")
+    if not any(key.startswith("lit_goal_encoder/") for key in flat_loaded):
+        raise ValueError("not a LIT stage-1 checkpoint: it has no lit_goal_encoder leaves.")
+    if stage2 := [key for key in flat_loaded if key.startswith(("lit_aggregator/", "lit_pose_decoder/"))]:
+        raise ValueError(f"not a LIT stage-1 checkpoint: it carries stage-2 modules, e.g. {stage2[:2]}.")
+    if not any(key.startswith("lit_aggregator/") for key in flat_ref) or any(
+        key.startswith("lit_goal_encoder/") for key in flat_ref
+    ):
+        raise ValueError("a stage-1 checkpoint initialises a lit='stage2' model, and this one is not.")
+
+    merged = _merge_params(loaded_params, params, missing_regex=LIT_MISSING_REGEX)
+
+    # The fingerprint of the handoff, checked on the result and not assumed from the merge.
+    flat = flax.traverse_util.flatten_dict(merged, sep="/")
+    # The merge keeps only the model's own leaves, so a checkpoint leaf the model lacks would vanish without a word; the
+    # stage-1 goal encoder is the one thing that is meant to.
+    if unconsumed := [key for key in flat_loaded if key not in flat and not key.startswith("lit_goal_encoder/")]:
+        raise ValueError(
+            f"the stage-1 checkpoint has {len(unconsumed)} leaves the stage-2 model does not have, e.g. "
+            f"{unconsumed[:3]}: they would be dropped silently. Is it a LoRA checkpoint, or a tree with another "
+            "branch's modules?"
+        )
+    if survivors := [key for key in flat if key.startswith("lit_goal_encoder/")]:
+        raise ValueError(f"stage-1 goal encoder leaves survived into the stage-2 model: {survivors[:3]}.")
+    for key, reference in flat_ref.items():
+        if key.startswith("lit_"):
+            if flat.get(key) is not reference:
+                raise ValueError(f"{key} was loaded from the checkpoint: stage-2 lit_* modules must start fresh.")
+        elif key in flat_loaded:
+            kept = flat.get(key)
+            same = kept is flat_loaded[key] or (
+                kept is not None
+                and not isinstance(kept, jax.ShapeDtypeStruct)
+                and np.array_equal(kept, np.asarray(flat_loaded[key]).astype(reference.dtype))
+            )
+            if not same:
+                raise ValueError(f"{key} is not the stage-1 checkpoint's value after the merge.")
+        elif "lora" not in key:
+            raise ValueError(f"{key} is neither in the stage-1 checkpoint nor a LoRA leaf: the handoff is incomplete.")
+    return merged
 
 
 @dataclasses.dataclass(frozen=True)

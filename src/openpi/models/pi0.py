@@ -1,5 +1,6 @@
 import functools
 import logging
+from typing import NamedTuple
 
 import einops
 import flax.nnx as nnx
@@ -9,6 +10,7 @@ import jax
 import jax.numpy as jnp
 from typing_extensions import override
 
+from openpi.models import lit as _lit
 from openpi.models import model as _model
 from openpi.models import pi0_config
 import openpi.models.gemma as _gemma
@@ -65,6 +67,25 @@ def posemb_sincos(
     return jnp.concatenate([jnp.sin(sinusoid_input), jnp.cos(sinusoid_input)], axis=-1)
 
 
+class LitPrefix(NamedTuple):
+    """What the action rows read in a LIT step, from `Pi0._lit_prefix_pass`."""
+
+    # Stacked (k, v) of the prefix pass, each (layers, b, s, kv_heads, head_dim).
+    kv_cache: tuple
+    # bool (b, s): the prefix columns the action rows may attend (history drop and the LIT masks applied).
+    visible: jax.Array
+    # int (b,): valid prefix tokens, after the history drop.
+    count: jax.Array
+    # int (b,): the RoPE position the suffix starts from, `Pi0._lit_suffix_offset(count)`: `count`, or a constant 0
+    # when every prefix column is hidden from the action rows.
+    offset: jax.Array
+    # (k, v, visible) of the columns appended after the prefix, k and v (layers, b, e, kv_heads, head_dim): the latents
+    # (stage 2) or the goal tokens (stage 1).
+    extra: tuple
+    # Final latents (b, num_latents, lit_dim) for the pose decoder; None in stage 1.
+    latents: jax.Array | None
+
+
 class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
@@ -105,6 +126,42 @@ class Pi0(_model.BaseModel):
         self.deterministic = True
 
         self.hist_horizon = config.hist_horizon
+
+        # LIT modules come last so that lit="off" keeps the stock parameter tree and rng stream.
+        self.lit = config.lit
+        if config.lit != "off":
+            self.lit_goal_dims = tuple(config.lit_goal_dims)
+            self.lit_mask_image = config.lit_mask_image
+            self.lit_mask_language = config.lit_mask_language
+            self.lit_pose_weight = config.lit_pose_weight
+            self.lit_kv_heads = paligemma_config.num_kv_heads
+            self.lit_head_dim = paligemma_config.head_dim
+            if config.lit == "stage1":
+                self.lit_goal_encoder = _lit.LitGoalEncoder(
+                    pose_dim=len(config.lit_goal_dims),
+                    num_tokens=config.lit_goal_tokens,
+                    dim=config.lit_dim,
+                    kv_dim=config.lit_kv_dim,
+                    rngs=rngs,
+                )
+            else:
+                self.lit_aggregator = _lit.LitAggregator(
+                    num_latents=config.lit_num_latents,
+                    dim=config.lit_dim,
+                    context_dim=paligemma_config.width,
+                    kv_dim=config.lit_kv_dim,
+                    num_heads=config.lit_heads,
+                    num_groups=config.lit_groups,
+                    rngs=rngs,
+                    dtype=jnp.dtype(config.dtype),
+                    remat=True,
+                )
+                self.lit_pose_decoder = _lit.LitPoseDecoder(
+                    pose_dim=len(config.lit_goal_dims),
+                    num_tokens=config.lit_pose_tokens,
+                    dim=config.lit_dim,
+                    rngs=rngs,
+                )
 
     @at.typecheck
     def embed_prefix(
@@ -224,6 +281,8 @@ class Pi0(_model.BaseModel):
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
+        if self.lit != "off":
+            return self._compute_loss_lit(rng, observation, actions, train=train)[0]
         preprocess_rng, noise_rng, time_rng, mask_rng = jax.random.split(rng, 4)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
@@ -277,7 +336,218 @@ class Pi0(_model.BaseModel):
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
         return jnp.mean(jnp.square(v_t - u_t), axis=-1)
-    
+
+    def compute_loss_and_aux(
+        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+    ) -> tuple[at.Float[at.Array, "*b ah"], dict]:
+        """`compute_loss` plus scalar diagnostics: for lit != "off" {"pose_loss" (stage 2 only), "pose_copy_baseline"},
+        both unweighted means over the samples whose goal is real (weight: config.lit_pose_weight); {} for lit="off"."""
+        if self.lit == "off":
+            return self.compute_loss(rng, observation, actions, train=train), {}
+        return self._compute_loss_lit(rng, observation, actions, train=train, with_aux=True)
+
+    @at.typecheck
+    def embed_prefix_text(
+        self, obs: _model.Observation
+    ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"], int, int]:
+        """Stage 1 prefix: the language/state tokens as one block, no images. Same 5-tuple as `embed_prefix`."""
+        tokens = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
+        ar_mask = jnp.array([True] + [False] * (tokens.shape[1] - 1))
+        return tokens, obs.tokenized_prompt_mask, ar_mask, tokens.shape[1], 1
+
+    @at.typecheck
+    def prefix_roles(
+        self, obs: _model.Observation, num_block_tokens: int, num_blocks: int, *, ignore_validity: bool = False
+    ) -> at.Int[at.Array, "b s"]:
+        """Role of every prefix token (lit.ROLE_PAD / ROLE_IMAGE / ROLE_SEMANTIC) for `num_blocks` blocks of
+        [camera 0 | camera 1 | ... | language+state] of `num_block_tokens` tokens, in the order embed_prefix lays them
+        out. Image tokens are valid where their camera's mask is set, language/state tokens where the prompt mask is;
+        `ignore_validity` returns the layout's roles with every token counted valid (what a column is, whatever
+        its observation had masked)."""
+        if obs.tokenized_prompt_mask is None:
+            raise ValueError("LIT needs the tokenized prompt.")
+        b = obs.state.shape[0]
+        text_len = obs.tokenized_prompt_mask.shape[1]
+        per_camera, rest = divmod(num_block_tokens - text_len, len(obs.images))
+        if rest or per_camera < 0:
+            raise ValueError(
+                f"{num_block_tokens} tokens per block do not fit {len(obs.images)} cameras + {text_len} text."
+            )
+        block = []
+        if per_camera:
+            for name in obs.images:
+                valid = jnp.broadcast_to(obs.image_masks[name][..., None] | ignore_validity, (b, per_camera))
+                block.append(jnp.where(valid, _lit.ROLE_IMAGE, _lit.ROLE_PAD))
+        text_valid = jnp.broadcast_to(obs.tokenized_prompt_mask | ignore_validity, (b, text_len))
+        block.append(jnp.where(text_valid, _lit.ROLE_SEMANTIC, _lit.ROLE_PAD))
+        return jnp.tile(jnp.concatenate(block, axis=1), (1, num_blocks)).astype(jnp.int32)
+
+    def _lit_goal(self, obs: _model.Observation):
+        """(goal [b, len(lit_goal_dims)] float32 with padded rows zeroed, valid bool[b])."""
+        if obs.lit_goal is None:
+            raise ValueError("lit != 'off' needs observation.lit_goal.")
+        if obs.lit_goal.shape[-1] != self.action_dim:
+            raise ValueError(f"lit_goal must be {self.action_dim} wide like the state, got {obs.lit_goal.shape}.")
+        b = obs.state.shape[0]
+        if obs.lit_goal_mask is None:
+            raise ValueError(
+                "observation.lit_goal needs observation.lit_goal_mask (True where the goal is real): without it a "
+                "padded goal would be taken as a real target and train the pose loss and the goal K/V toward zero."
+            )
+        valid = jnp.broadcast_to(obs.lit_goal_mask, (b,))
+        goal = jnp.broadcast_to(obs.lit_goal, (b, self.action_dim))[:, jnp.asarray(self.lit_goal_dims)]
+        return jnp.where(valid[:, None], goal.astype(jnp.float32), 0.0), valid
+
+    def _lit_kv_columns(self, k, v):
+        """[layers, b, e, lit_kv_dim] -> the kv-cache layout [layers, b, e, kv_heads, head_dim]."""
+        shape = (*k.shape[:3], self.lit_kv_heads, self.lit_head_dim)
+        return k.reshape(shape), v.reshape(shape)
+
+    def _lit_prefix_pass(self, observation: _model.Observation, mask_rng=None, *, mask_num=None) -> LitPrefix:
+        """Prefix pass, then the aggregator (stage 2) or the goal encoder (stage 1).
+
+        The first `mask_num` history blocks are dropped from the prefix mask, as in the stock loss: mask_num is drawn
+        from `mask_rng` as there, or 0 when neither is given. Only the current (last) block feeds the aggregator."""
+        stage1 = self.lit == "stage1"
+        embed = self.embed_prefix_text if stage1 else self.embed_prefix
+        prefix_tokens, prefix_mask, prefix_ar_mask, block_len, blocks = embed(observation)
+        roles = self.prefix_roles(observation, block_len, blocks)
+        if mask_num is None:
+            mask_num = 0 if mask_rng is None else jax.random.randint(mask_rng, (), 0, blocks)
+        prefix_mask = prefix_mask & (jnp.arange(prefix_mask.shape[1]) >= mask_num * block_len)[None, :]
+        roles = jnp.where(prefix_mask, roles, _lit.ROLE_PAD)
+
+        attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        count = jnp.sum(prefix_mask, axis=1)
+        offset = self._lit_suffix_offset(count)
+        if stage1:
+            _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=attn_mask, positions=positions)
+            goal, valid = self._lit_goal(observation)
+            goal_k, goal_v = self.lit_goal_encoder.project_kv(self.lit_goal_encoder(goal))
+            layers = kv_cache[0].shape[0]
+            k, v = (jnp.broadcast_to(x[None], (layers, *x.shape)) for x in (goal_k, goal_v))
+            extra = (*self._lit_kv_columns(k, v), jnp.broadcast_to(valid[:, None], goal_k.shape[:2]))
+            return LitPrefix(kv_cache, prefix_mask, count, offset, extra, None)
+
+        start = (blocks - 1) * block_len
+        _, kv_cache, layer_inputs = self.PaliGemma.llm(
+            [prefix_tokens, None],
+            mask=attn_mask,
+            positions=positions,
+            return_layer_inputs=True,
+            layer_input_slice=(start, block_len),
+        )
+        semantic_mask, image_mask = _lit.role_masks(roles[:, start:])
+        latents, keys, values = self.lit_aggregator(layer_inputs, semantic_mask, image_mask)
+        extra = (*self._lit_kv_columns(keys, values), jnp.ones(keys.shape[1:3], bool))
+        return LitPrefix(kv_cache, self._lit_visible(prefix_mask, roles), count, offset, extra, latents)
+
+    def _lit_visible(self, prefix_mask, roles):
+        """The valid prefix columns the action rows may attend: the image and language/state ones are hidden per the
+        stage-2 switches. `roles` has the columns' roles (validity does not matter, `prefix_mask` carries it).
+        Only both switches on hide everything; one alone does not isolate its modality, since image and language
+        tokens attend to each other in the prefix pass and the visible columns carry the hidden modality."""
+        visible = prefix_mask
+        if self.lit_mask_image:
+            visible = visible & (roles != _lit.ROLE_IMAGE)
+        if self.lit_mask_language:
+            visible = visible & (roles != _lit.ROLE_SEMANTIC)
+        return visible
+
+    def _lit_suffix_offset(self, prefix_count):
+        """The RoPE position the action rows start from, given the valid prefix tokens `prefix_count` (b,): the one
+        place the training pass and the sampling pass (`lit_prefix`) both take it from.
+
+        Latent K/V carry no RoPE while the action rows' queries are rotated by absolute position, so a start that moves
+        with the valid-token count (prompt length, camera masks, history drop, memory length) moves the logits of the
+        action rows against the latents: the count reaches them though every column is hidden. When both stage-2
+        masks are on the start is therefore the constant 0. Whenever a prefix column is visible (stage 1, either
+        mask off) the rows continue from the count, as in the stock model."""
+        if self.lit == "stage2" and self.lit_mask_image and self.lit_mask_language:
+            return jnp.zeros_like(prefix_count)
+        return prefix_count
+
+    @staticmethod
+    def _lit_extend_cache(kv_cache, visible, extra):
+        """Append `extra` = (k, v, visible) after the cache columns, k and v cast to the cache dtype."""
+        extra_k, extra_v, extra_visible = extra
+        kv_cache = tuple(
+            jnp.concatenate([cache, e.astype(cache.dtype)], axis=2)
+            for cache, e in zip(kv_cache, (extra_k, extra_v), strict=True)
+        )
+        return kv_cache, jnp.concatenate([visible, extra_visible], axis=1)
+
+    def _suffix_velocity(self, observation, x_t, time, kv_cache, visible, offset, extra=None):
+        """The action expert's velocity for noisy actions `x_t` at `time` over a finished prefix pass: the one routine
+        shared by the training loss and sampling.
+
+        kv_cache: stacked prefix (k, v), (layers, b, s, kv_heads, head_dim). visible: bool (b, s), the prefix columns
+        every action row may attend. offset: int (b,), the RoPE position of the first action row, as `LitPrefix.offset`
+        or `lit_prefix` return it (never the raw valid-token count: see `_lit_suffix_offset`). extra: optional (k, v,
+        visible) to append after the prefix columns, k and v (layers, b, e, kv_heads, head_dim), visible bool (b, e);
+        they are cast to the cache dtype and carry no RoPE."""
+        if extra is not None:
+            kv_cache, visible = self._lit_extend_cache(kv_cache, visible, extra)
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
+        suffix_len = suffix_tokens.shape[1]
+        columns = jnp.broadcast_to(visible[:, None, :], (visible.shape[0], suffix_len, visible.shape[1]))
+        full_mask = jnp.concatenate([columns, make_attn_mask(suffix_mask, suffix_ar_mask)], axis=-1)
+        positions = offset[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+        (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+            [None, suffix_tokens],
+            mask=full_mask,
+            positions=positions,
+            kv_cache=kv_cache,
+            adarms_cond=[None, adarms_cond],
+        )
+        assert prefix_out is None
+        return self.action_out_proj(suffix_out[:, -self.action_horizon :])
+
+    def _lit_pose_losses(self, observation: _model.Observation, latents) -> dict:
+        goal, valid = self._lit_goal(observation)
+        weights = valid.astype(jnp.float32)
+        denominator = jnp.maximum(jnp.sum(weights), 1.0)
+
+        def masked_mean(squared):
+            return jnp.sum(jnp.where(valid, jnp.mean(squared, axis=-1), 0.0)) / denominator
+
+        state = observation.state[:, jnp.asarray(self.lit_goal_dims)].astype(jnp.float32)
+        aux = {"pose_copy_baseline": masked_mean(jnp.square(state - goal))}
+        if latents is not None:
+            aux["pose_loss"] = masked_mean(jnp.square(self.lit_pose_decoder(latents) - goal))
+        return aux
+
+    def _compute_loss_lit(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        *,
+        train: bool = False,
+        with_aux: bool = False,
+    ):
+        """The LIT training loss: (action loss (b, ah), aux). Two passes instead of the stock joint one: the prefix
+        pass (and the aggregator), then the action rows over [prefix cache; latent or goal K/V; own block]. The rng
+        stream is the stock 4-way split; nothing here consumes randomness of its own."""
+        preprocess_rng, noise_rng, time_rng, mask_rng = jax.random.split(rng, 4)
+        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+
+        b, ah, _ = actions.shape
+        noise = jax.random.normal(noise_rng, actions.shape)
+        time = jax.random.beta(time_rng, 1.5, 1, (b, 1)) * 0.999 + 0.001
+        time = jnp.broadcast_to(time, (b, ah))
+
+        x_t = time[..., None] * noise + (1 - time[..., None]) * actions
+        u_t = noise - actions
+
+        prefix = self._lit_prefix_pass(observation, mask_rng)
+        v_t = self._suffix_velocity(
+            observation, x_t, time, prefix.kv_cache, prefix.visible, prefix.offset, prefix.extra
+        )
+        action_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        return action_loss, (self._lit_pose_losses(observation, prefix.latents) if with_aux else {})
+
     @at.typecheck
     def embed_prefix_infer(
         self, obs: _model.Observation, memory_tokens
@@ -363,6 +633,90 @@ class Pi0(_model.BaseModel):
         memory_prefix_mask = memory["memory_prefix_mask"]
         return None, memory_kv_cache, memory_prefix_mask
 
+    def _prefix_attention(self, prefix_mask, prefix_ar_mask, memory_prefix_mask):
+        """(attention mask, prefix mask, positions) of the current prefix tokens over [memory; current] columns: the
+        mask and positions cover the current rows, the prefix mask the whole [memory; current] width."""
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+
+        if memory_prefix_mask is not None:
+            memory_prefix_attn_mask = einops.repeat(memory_prefix_mask, "b p -> b s p", s=prefix_mask.shape[1])
+            prefix_attn_mask = jnp.concatenate([memory_prefix_attn_mask, prefix_attn_mask], axis=-1)
+            prefix_mask = jnp.concatenate([memory_prefix_mask, prefix_mask], axis=-1)
+            positions = jnp.cumsum(prefix_mask, axis=1) - 1
+            positions = positions[..., memory_prefix_mask.shape[-1]:]
+        else:
+            positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        return prefix_attn_mask, prefix_mask, positions
+
+    def lit_prefix(self, observation: _model.Observation, memory: dict):
+        """The stage-2 prefix pass for sampling, with the memory carried across calls.
+
+        Takes the observation as `sample_actions` passes it on (preprocessed) and the memory dict. Returns
+        (visible, kv_cache, offset, new_memory):
+          visible   bool (b, s + e): the columns of kv_cache an action row may attend; the memory and current
+                    prefix columns (image and language/state ones hidden per the LIT switches, invalid ones
+                    hidden) followed by the e = lit_num_latents latent columns, which are always visible.
+          kv_cache  stacked (k, v), each (layers, b, s + e, kv_heads, head_dim): [memory; current prefix; latents],
+                    the latent K/V (no RoPE) in the cache dtype.
+          offset    int (b,): the RoPE position of the first action row, from `_lit_suffix_offset`. With both masks
+                    on (every prefix column hidden) it is a constant 0 and does NOT count the valid prefix tokens:
+                    the latent K/V carry no RoPE, so a count-dependent start would let the prompt length, the camera
+                    masks and the memory length reach the action rows through their logits against the latents. With
+                    either mask off it is the valid prefix tokens, memory included, as in the stock model. Use it as
+                    given: never replace it by a token count, and do not add anything to it that varies with the
+                    prefix (the training loss uses the same offset).
+          new_memory  a copy of `memory` holding this call's prefix, saved before the latents are appended: it
+                    has the stock keys only and never a latent, so the memory contract is unchanged.
+        The velocity for noisy actions x_t at time t is then
+        `_suffix_velocity(observation, x_t, t, kv_cache, visible, offset)`, with t of shape (b, action_horizon)
+        as in training, the same routine as the loss. Only lit="stage2" can sample."""
+        self._check_lit_sampling()
+        memory_tokens, memory_kv_cache, memory_prefix_mask = self.fetch_memory(memory)
+        prefix_tokens, prefix_mask, prefix_ar_mask, num_visual_tokens, num_text_tokens = self.embed_prefix_infer(
+            observation, memory_tokens
+        )
+        blocks = next(iter(observation.images.values())).shape[1]
+        block_len = prefix_tokens.shape[1] // blocks
+        # roles of the current tokens with validity (the aggregator's masks) and of every column without it (the
+        # visibility: memory columns carry their own validity in the memory prefix mask)
+        roles = jnp.where(prefix_mask, self.prefix_roles(observation, block_len, blocks), _lit.ROLE_PAD)
+        layout = self.prefix_roles(observation, block_len, blocks, ignore_validity=True)
+        if memory_prefix_mask is not None:
+            memory_len = memory_prefix_mask.shape[-1]
+            if memory_len % block_len:
+                raise ValueError(f"the memory holds {memory_len} columns, not whole {block_len}-token blocks.")
+            layout = jnp.concatenate([jnp.tile(layout[:, -block_len:], (1, memory_len // block_len)), layout], axis=1)
+
+        prefix_attn_mask, prefix_mask, positions = self._prefix_attention(
+            prefix_mask, prefix_ar_mask, memory_prefix_mask
+        )
+        start = (blocks - 1) * block_len
+        _, kv_cache, layer_inputs = self.PaliGemma.llm(
+            [prefix_tokens, None],
+            mask=prefix_attn_mask,
+            positions=positions,
+            kv_cache=memory_kv_cache,
+            return_layer_inputs=True,
+            layer_input_slice=(start, block_len),
+        )
+        new_memory = dict(memory)
+        self.save_memory(prefix_tokens, prefix_mask, num_visual_tokens, num_text_tokens, kv_cache, new_memory)
+
+        semantic_mask, image_mask = _lit.role_masks(roles[:, start:])
+        _, keys, values = self.lit_aggregator(layer_inputs, semantic_mask, image_mask)
+        extra = (*self._lit_kv_columns(keys, values), jnp.ones(keys.shape[1:3], bool))
+        kv_cache, visible = self._lit_extend_cache(kv_cache, self._lit_visible(prefix_mask, layout), extra)
+        return visible, kv_cache, self._lit_suffix_offset(jnp.sum(prefix_mask, axis=-1)), new_memory
+
+    def _check_lit_sampling(self):
+        if self.lit == "stage1":
+            raise ValueError(
+                "lit='stage1' is a training-only configuration (no images, goal K/V); it cannot sample. "
+                "Sample from a lit='stage2' model."
+            )
+        if self.lit == "off":
+            raise ValueError("lit_prefix is for lit='stage2'; lit='off' samples through the stock path.")
+
     @override
     def sample_actions(
         self,
@@ -374,6 +728,8 @@ class Pi0(_model.BaseModel):
         step: at.Int[at.Array, ""] = None,
         memory: dict = None
     ) -> _model.Actions:
+        if self.lit == "stage1":
+            self._check_lit_sampling()
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
@@ -381,6 +737,9 @@ class Pi0(_model.BaseModel):
         batch_size = observation.state.shape[0]
         if noise is None:
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+
+        if self.lit != "off":
+            return self._sample_actions_lit(observation, noise, dt, memory)
 
         # first fill KV cache with a forward pass of the prefix
  
@@ -393,18 +752,9 @@ class Pi0(_model.BaseModel):
 
         # prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
 
-        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
-
-        if memory_prefix_mask is not None:
-            memory_prefix_attn_mask = einops.repeat(memory_prefix_mask, "b p -> b s p", s=prefix_mask.shape[1])
-            prefix_attn_mask = jnp.concatenate([memory_prefix_attn_mask, prefix_attn_mask], axis=-1)
-            prefix_mask = jnp.concatenate([memory_prefix_mask, prefix_mask], axis=-1)
-        # memory_kv_cache = None
-            # import pdb;pdb.set_trace()
-            positions = jnp.cumsum(prefix_mask, axis=1) - 1
-            positions = positions[..., memory_prefix_mask.shape[-1]:] 
-        else:
-            positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        prefix_attn_mask, prefix_mask, positions = self._prefix_attention(
+            prefix_mask, prefix_ar_mask, memory_prefix_mask
+        )
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions, kv_cache=memory_kv_cache)
         self.save_memory(prefix_tokens, prefix_mask, num_visual_tokens, num_text_tokens, kv_cache, memory)
 
@@ -452,3 +802,27 @@ class Pi0(_model.BaseModel):
         with at.disable_typechecking():
             x_0, _ = jax.lax.while_loop(cond, step, (noise, jnp.float32(1.0)))
         return x_0, memory
+
+    def _sample_actions_lit(self, observation, noise, dt, memory):
+        visible, kv_cache, offset, new_memory = self.lit_prefix(observation, memory)
+        x_0 = self._denoise(observation, noise, dt, visible, kv_cache, offset)
+        memory.update(new_memory)
+        return x_0, memory
+
+    def _denoise(self, observation, noise, dt, visible, kv_cache, offset):
+        """Euler steps of `dt` (< 0) from `noise` at t=1 to 0 over a finished prefix (see `lit_prefix`)."""
+        batch_size = noise.shape[0]
+
+        def step(carry):
+            x_t, time = carry
+            time_ = jnp.broadcast_to(time, (batch_size, self.action_horizon))
+            v_t = self._suffix_velocity(observation, x_t, time_, kv_cache, visible, offset)
+            return x_t + dt * v_t, time + dt
+
+        def cond(carry):
+            _, time = carry
+            return time >= -dt / 2
+
+        with at.disable_typechecking():
+            x_0, _ = jax.lax.while_loop(cond, step, (noise, jnp.float32(1.0)))
+        return x_0
