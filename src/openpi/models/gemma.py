@@ -112,7 +112,7 @@ def get_config(variant: Variant) -> Config:
 @at.typecheck
 class RMSNorm(nn.Module):
     @nn.compact
-    def __call__(self, x, cond):
+    def __call__(self, x, cond, race_cond=None):
         dtype = x.dtype  # original dtype, could be half-precision
         var = jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)  # compute variance in float32
         normed_inputs = jnp.asarray(x * jnp.reciprocal(jnp.sqrt(var + 1e-06)))  # compute normalization in float32
@@ -126,6 +126,13 @@ class RMSNorm(nn.Module):
 
         # adaptive RMSNorm
         modulation = nn.Dense(x.shape[-1] * 3, kernel_init=nn.initializers.zeros, dtype=dtype)(cond)
+        if race_cond is not None:
+            # RACE (arXiv 2610.05719) eq. 6: token-wise offsets [dScale, dShift, dGate] = U W_l added to this
+            # layer's modulation. W_l is zero-initialised and has no bias (the paper's words), so a fresh W_l or
+            # a zero prior leaves the action expert exactly as it was.
+            modulation = modulation + nn.Dense(
+                x.shape[-1] * 3, use_bias=False, kernel_init=nn.initializers.zeros, dtype=dtype,
+                name="race_modulation")(race_cond)
         scale, shift, gate = jnp.split(modulation, 3, axis=-1)
         normed_inputs = normed_inputs * (1 + scale) + shift  # scale and shift in float32
         return normed_inputs.astype(dtype), gate
@@ -290,7 +297,8 @@ class Block(nn.Module):
     dropout_bdims: tuple[int, ...] = ()
 
     @nn.compact
-    def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True):  # noqa: FBT002
+    def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True,  # noqa: FBT002
+                 race_cond=None):
         xs = sharding.activation_sharding_constraint(xs)
         drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x
 
@@ -300,7 +308,8 @@ class Block(nn.Module):
         gates = []
         for i, x in enumerate(xs):
             if x is not None:
-                x, gate = RMSNorm(name=_name("pre_attention_norm", i))(x, adarms_cond[i])  # noqa: PLW2901
+                x, gate = RMSNorm(name=_name("pre_attention_norm", i))(  # noqa: PLW2901
+                    x, adarms_cond[i], _race_cond_for(adarms_cond[i], race_cond))
             pre_attn.append(x)
             gates.append(gate if x is not None else None)
 
@@ -315,7 +324,8 @@ class Block(nn.Module):
         gates = []
         for i, (x, config) in enumerate(zip(xs, self.configs, strict=True)):
             if x is not None:
-                x, gate = RMSNorm(name=_name("pre_ffw_norm", i))(x, adarms_cond[i])  # noqa: PLW2901
+                x, gate = RMSNorm(name=_name("pre_ffw_norm", i))(  # noqa: PLW2901
+                    x, adarms_cond[i], _race_cond_for(adarms_cond[i], race_cond))
                 x = lora.FeedForward(  # noqa: PLW2901
                     features=config.width,
                     hidden_dim=config.mlp_dim,
@@ -372,7 +382,8 @@ class Module(nn.Module):
                 nn.broadcast,
                 nn.broadcast,
                 nn.broadcast,
-            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=deterministic
+                nn.broadcast,
+            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=deterministic, 5=race_cond
             length=self.configs[0].depth,
         )(
             configs=self.configs,
@@ -396,28 +407,35 @@ class Module(nn.Module):
         *,
         kv_cache: KVCache | None = None,
         deterministic: bool = True,
+        race_cond: at.Float[at.Array, "b _s _d"] | None = None,
     ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]:
+        """`race_cond` is RACE's token-wise transition feature U (b, suffix tokens, width), added through every
+        adaptive RMSNorm of the expert that has adarms_cond; None runs the expert unmodulated."""
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
         mask = jnp.asarray(mask)[:, None, :, :]
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
 
-        embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic)
+        embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic, race_cond)
 
         assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
 
         return [
-            f(e, a)[0] if e is not None else e for f, e, a in zip(self.final_norms, embedded, adarms_cond, strict=True)
+            f(e, a, _race_cond_for(a, race_cond))[0] if e is not None else e
+            for f, e, a in zip(self.final_norms, embedded, adarms_cond, strict=True)
         ], kv_cache
 
-    def init(self, use_adarms: Sequence[bool]):
-        """Convenience method for initializing all parameters, necessary due to the quirks of linen."""
+    def init(self, use_adarms: Sequence[bool], race: bool = False):  # noqa: FBT001, FBT002
+        """Convenience method for initializing all parameters, necessary due to the quirks of linen. `race`
+        also creates RACE's per-layer modulation weights in every adaptive RMSNorm."""
         self.embed(jnp.zeros((1, 1), dtype=jnp.int32))
+        adarms_width = next((c.width for u, c in zip(use_adarms, self.configs, strict=True) if u), None)
         self(
             [jnp.zeros((1, 1, c.width)) for c in self.configs],
             jnp.zeros((1, len(self.configs)), dtype=jnp.int32),
             jnp.zeros((1, len(self.configs), len(self.configs)), dtype=bool),
             adarms_cond=[jnp.zeros((1, 1, c.width)) if u else None for u, c in zip(use_adarms, self.configs, strict=True)],
+            race_cond=jnp.zeros((1, 1, adarms_width)) if race else None,
         )
 
 
@@ -448,6 +466,11 @@ def _name(name, i):
     if i == 0:
         return name
     return f"{name}_{i}"
+
+
+def _race_cond_for(adarms_cond, race_cond):
+    """RACE modulates only the expert carrying adaptive RMSNorm (pi0.5's action expert)."""
+    return None if adarms_cond is None else race_cond
 
 
 def _gated_residual(x, y, gate):

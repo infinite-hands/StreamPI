@@ -51,10 +51,18 @@ VLASH_REFERENCE_MAX_OFFSET = 8
 VLASH_LONG_MAX_OFFSET = 12
 # The YAM LeRobot layout: three cameras, 14-dim state/action [L j0..5, L grip, R j0..5, R grip].
 YAM_CAMERAS = ("cam_high", "cam_left_wrist", "cam_right_wrist")
+# RACE twins (arXiv 2610.05719) read their transition targets from <this>/<dataset repo id> on the misc Volume,
+# which training containers mount at /misc.
+RACE_TARGETS_ROOT = "/misc/race-targets"
+# The recipes that get a `_race` twin (race_twin).
+RACE_TWIN_BASES: tuple[str, ...] = ("pi05_yam_stream5_i20_bagging_right_real",
+                                   "pi05_yam_stream5_i20_bagging_left_real")
 
 
-def yam_repack(cameras: tuple[str, ...] = YAM_CAMERAS, *, vlash_cond_now: bool = False) -> _transforms.Group:
+def yam_repack(cameras: tuple[str, ...] = YAM_CAMERAS, *, vlash_cond_now: bool = False,
+               race: bool = False) -> _transforms.Group:
     extras = {key: key for key in (_transforms.NOW_STATE_KEY, _transforms.DELTA_KEY)} if vlash_cond_now else {}
+    race_targets = {key: key for key in _transforms.RACE_TARGET_KEYS} if race else {}
     return _transforms.Group(
         inputs=[
             _transforms.RepackTransform(
@@ -63,6 +71,7 @@ def yam_repack(cameras: tuple[str, ...] = YAM_CAMERAS, *, vlash_cond_now: bool =
                     "state": "observation.state",
                     "actions": "action",
                     **extras,
+                    **race_targets,
                 }
             )
         ]
@@ -89,10 +98,20 @@ def get_ih_yam_configs():
         fills it at train and serve time exactly as the openpi fork's YAM configs do."""
 
         repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(default=YAM_REPACK)
+        # Load the norm stats of this config instead of this recipe's own (a twin that must normalize exactly as
+        # the recipe its checkpoint was trained under). An explicit --data.assets.assets-dir still wins.
+        norm_stats_config: str | None = None
+        # RACE: the dataset's sidecar is <race_targets_root>/<repo_id> (DataConfig.race_targets_dir), so a
+        # --data.repo-id override follows to that dataset's own targets. None: no RACE targets.
+        race_targets_root: str | None = None
 
         @override
         def create(self, assets_dirs, model_config):
+            if self.norm_stats_config is not None:
+                assets_dirs = assets_dirs.parent / self.norm_stats_config
             created = super().create(assets_dirs, model_config)
+            if self.race_targets_root is not None:
+                created = dataclasses.replace(created, race_targets_dir=f"{self.race_targets_root}/{created.repo_id}")
             if created.vlash_cond_now:
                 # The state at the image's frame is a state: normalized with the state's own statistics.
                 # Saved with the checkpoint's norm stats, so the server normalizes it the same way.
@@ -119,7 +138,8 @@ def get_ih_yam_configs():
                       vlash_max_offset: int = 0, vlash_branches: int = 0, state_cond: bool = False,
                       vlash_state_source: str = "action", vlash_cond_now: bool = False,
                       num_train_steps: int = 20_000,
-                      encode_only_active_cameras: bool = False):
+                      encode_only_active_cameras: bool = False,
+                      race: bool = False, norm_stats_config: str | None = None):
         # A masked camera's tokens are padding, so a recipe may skip decoding and encoding them: the same
         # model, one SigLIP pass per frame instead of three and a third of the prefix. Opt-in per config
         # because it changes the model's input layout (not its weights).
@@ -140,6 +160,7 @@ def get_ih_yam_configs():
                              vlash_cond_dims(active_state_dims) if vlash_cond_now else active_state_dims),
             vlash_branches=vlash_branches,
             image_keys=image_keys,
+            race=race,
         )
         return TrainConfig(
             name=name,
@@ -150,7 +171,9 @@ def get_ih_yam_configs():
                 active_image_keys=active_image_keys,
                 active_state_dims=active_state_dims,
                 held_action_dims=held_action_dims,
-                repack_transforms=yam_repack(kept_cameras, vlash_cond_now=vlash_cond_now),
+                repack_transforms=yam_repack(kept_cameras, vlash_cond_now=vlash_cond_now, race=race),
+                norm_stats_config=norm_stats_config,
+                race_targets_root=RACE_TARGETS_ROOT if race else None,
                 hist_sequence_keys=tuple(f"observation.images.{camera}" for camera in kept_cameras),
                 base_config=DataConfig(
                     prompt_from_task=False,
@@ -263,8 +286,16 @@ def get_ih_yam_configs():
         return {**vlash_twin(recipe), "name": recipe["name"] + "_vlashp",
                 "vlash_branches": recipe.get("hist_interval", HIST_INTERVAL), "state_cond": True}
 
+    def race_twin(recipe: dict) -> dict:
+        # RACE (arXiv 2610.05719) on the recipe a checkpoint was trained under, warm-started from that checkpoint
+        # (--weight-loader.params-path; the new weights start at zero, so step 0 is the checkpoint). It keeps the
+        # recipe's norm stats, and a single-camera recipe skips the cameras it masks (the same model).
+        return {**recipe, "name": recipe["name"] + "_race", "race": True, "norm_stats_config": recipe["name"],
+                "encode_only_active_cameras": recipe.get("active_image_keys") is not None}
+
+    race_twins = [race_twin(recipe) for recipe in recipes if recipe["name"] in RACE_TWIN_BASES]
     return [stream_config(**recipe) for recipe in
             recipes + [vlash_twin(recipe) for recipe in recipes] + [vlash_reference_twin(recipe) for recipe in recipes]
             + [vlash_measured_twin(recipe) for recipe in recipes] + [vlash_packed_measured_twin(recipe) for recipe in recipes]
             + [vlash_conditioned_twin(recipe) for recipe in recipes] + [vlash_long_conditioned_twin(recipe) for recipe in recipes]
-            + [vlash_packed_twin(recipe) for recipe in recipes]]
+            + [vlash_packed_twin(recipe) for recipe in recipes] + race_twins]

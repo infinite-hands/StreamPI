@@ -1,7 +1,9 @@
 from collections.abc import Iterator, Sequence
+import json
 import logging
 import multiprocessing
 import os
+import pathlib
 import typing
 import random
 from functools import partial
@@ -22,6 +24,8 @@ T_co = TypeVar("T_co", covariant=True)
 
 # The LeRobot state column every config's repack reads; TemporalOffset shifts it in place.
 VLASH_STATE_KEY = "observation.state"
+# The RACE sidecar format this loader reads (meta.json's "version").
+RACE_TARGETS_VERSION = 1
 
 
 class Dataset(Protocol[T_co]):
@@ -56,15 +60,25 @@ class DataLoader(Protocol[T_co]):
 
 
 class TransformedDataset(Dataset[T_co]):
-    def __init__(self, dataset: Dataset, transforms: Sequence[_transforms.DataTransformFn]):
+    def __init__(self, dataset: Dataset, transforms: Sequence[_transforms.DataTransformFn], *,
+                 sample_weights: np.ndarray | None = None):
+        """`sample_weights`, one per item, asks the loader to draw items with probability proportional to them;
+        a wrapped dataset's are kept when this one sets none."""
         self._dataset = dataset
         self._transform = _transforms.compose(transforms)
+        self._sample_weights = sample_weights
 
     def __getitem__(self, index: SupportsIndex) -> T_co:
         return self._transform(self._dataset[index])
 
     def __len__(self) -> int:
         return len(self._dataset)
+
+    @property
+    def sample_weights(self) -> np.ndarray | None:
+        if self._sample_weights is not None:
+            return self._sample_weights
+        return getattr(self._dataset, "sample_weights", None)
 
 
 class IterableTransformedDataset(IterableDataset[T_co]):
@@ -190,6 +204,7 @@ def create_torch_dataset(
                                             delta_timestamps=delta_timestamps)
     else:
         dataset = lerobot_dataset.LeRobotDataset(data_config.repo_id, delta_timestamps=delta_timestamps)
+    lerobot = dataset
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
@@ -205,7 +220,85 @@ def create_torch_dataset(
             state_key=VLASH_STATE_KEY, state_source=data_config.vlash_state_source,
             branches=data_config.vlash_branches, cond_now=data_config.vlash_cond_now)])
 
+    race_model = getattr(model_config, "race", False)
+    if data_config.race_targets_dir is not None:
+        if not race_model:
+            raise ValueError("race_targets_dir is set but the model is not a RACE model (Pi0Config.race)")
+        if data_config.vlash_max_offset > 0 or data_config.vlash_branches:
+            raise ValueError("RACE targets follow the unshifted action window; they are not wired for VLASH offsets")
+        store = check_race_targets(data_config.race_targets_dir, repo_id, dataset_meta.total_frames)
+        weights = race_sample_weights(store, *_lerobot_frame_columns(lerobot), data_config.race_targets_dir)
+        dataset = TransformedDataset(dataset, [_transforms.RaceTargets(data_config.race_targets_dir, action_horizon)],
+                                     sample_weights=weights)
+    elif race_model:
+        raise ValueError("a RACE model trains on transition targets: set the data config's race_targets_dir")
+
     return dataset
+
+
+def check_race_targets(directory: str, repo_id: str, total_frames: int) -> dict[str, np.ndarray]:
+    """A RACE sidecar's arrays (transforms.race_store), after refusing one that does not fit this dataset or
+    holds a value the loss or the sampler cannot use."""
+    meta_path = pathlib.Path(directory, "meta.json")
+    if not meta_path.is_file():
+        raise FileNotFoundError(f"RACE targets {directory} have no meta.json")
+    meta = json.loads(meta_path.read_text())
+    problems = []
+    if meta.get("version") != RACE_TARGETS_VERSION:
+        problems.append(f"its version is {meta.get('version')!r}, this loader reads {RACE_TARGETS_VERSION}")
+    if meta.get("repo_id") != repo_id:
+        problems.append(f"it was written for {meta.get('repo_id')!r}, the dataset is {repo_id!r}")
+    if meta.get("n_frames") != total_frames:
+        problems.append(f"it holds {meta.get('n_frames')} frames, the dataset {total_frames}")
+    store = {}
+    for name, dtype in _transforms.RACE_STORE_ARRAYS.items():
+        path = pathlib.Path(directory, f"{name}.npy")
+        if not path.is_file():
+            problems.append(f"{name}.npy is missing")
+            continue
+        array = np.load(path, mmap_mode="r")
+        if array.dtype != dtype or array.shape != (total_frames,):
+            problems.append(f"{name}.npy is {array.dtype}{list(array.shape)}, expected {np.dtype(dtype)}[{total_frames}]")
+            continue
+        store[name] = array
+    if "transition" in store:
+        transition = np.asarray(store["transition"])
+        if not (np.isfinite(transition).all() and (transition >= 0).all() and (transition <= 1).all()):
+            problems.append("transition.npy has values outside [0, 1]")
+    if "weight" in store:
+        weight = np.asarray(store["weight"])
+        if not (np.isfinite(weight).all() and (weight > 0).all()):
+            problems.append("weight.npy has a weight that is not finite and > 0")
+    if problems:
+        raise ValueError(f"RACE targets {directory} do not fit: " + "; ".join(problems))
+    return store
+
+
+def race_sample_weights(store: dict[str, np.ndarray], frame_index_column: np.ndarray,
+                        episode_index_column: np.ndarray, directory: str) -> np.ndarray:
+    """Each dataset item's sampling weight: its frame's (`frame_index_column` holds every item's global frame
+    index, `episode_index_column` its episode), after refusing a sidecar whose episodes disagree."""
+    frames = np.asarray(frame_index_column, dtype=np.int64)
+    if frames.min(initial=0) < 0 or frames.max(initial=0) >= store["weight"].shape[0]:
+        raise ValueError(f"RACE targets {directory} do not cover every frame of the dataset")
+    if not np.array_equal(np.asarray(store["episode_index"])[frames], np.asarray(episode_index_column)):
+        raise ValueError(f"RACE targets {directory} place frames in other episodes than the dataset does")
+    return np.asarray(store["weight"], dtype=np.float64)[frames]
+
+
+def _lerobot_frame_columns(dataset: lerobot_dataset.LeRobotDataset) -> tuple[np.ndarray, np.ndarray]:
+    """(global frame index, episode index) of each item, in item order."""
+    columns = dataset.hf_dataset.select_columns(["index", "episode_index"]).with_format("numpy")
+    return np.asarray(columns["index"]), np.asarray(columns["episode_index"])
+
+
+def race_weighted_sampler(weights: np.ndarray, seed: int) -> torch.utils.data.Sampler:
+    """Draws items with replacement, with probability proportional to `weights`, one epoch = len(weights) draws."""
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return torch.utils.data.WeightedRandomSampler(
+        torch.as_tensor(weights, dtype=torch.double), num_samples=len(weights), replacement=True,
+        generator=generator)
 
 
 def create_rlds_dataset(
@@ -288,6 +381,8 @@ def create_distributed_torch_data_loader(
 
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+    if dataset.sample_weights is not None:
+        raise NotImplementedError("weighted sampling (RACE targets) is not wired for the distributed loader")
 
     sampler = torch.utils.data.DistributedSampler(dataset, num_replicas=world_size, rank=rank)
     generator = torch.Generator()
@@ -510,6 +605,11 @@ def create_torch_data_loader(
             local_batch_size = batch_size
     else:
         local_batch_size = batch_size // jax.process_count()
+
+    if dataset.sample_weights is not None:
+        if sampler is not None:
+            raise NotImplementedError("weighted sampling (RACE targets) is not wired for distributed PyTorch")
+        sampler = race_weighted_sampler(dataset.sample_weights, seed)
 
     logging.info(f"local_batch_size: {local_batch_size}")
     data_loader = TorchDataLoader(
