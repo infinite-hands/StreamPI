@@ -233,13 +233,14 @@ def test_vlash_branches_are_refused():
 
 @dataclasses.dataclass(frozen=True)
 class _MergedConfig(pi0_config.Pi0Config):
-    """A Pi0Config with the fields other branches add, declared as those branches declare them: ih/spatial-forcing
-    (spatial_layer), ih/vlash (state_cond, image_keys), ih/race (race). None of them exists at this pin."""
+    """A Pi0Config with the fields other branches add, named and defaulted as those branches' pi0_config.py declare
+    them (checked with `git show origin/<branch>:src/openpi/models/pi0_config.py`): ih/spatial-forcing (spatial_layer),
+    ih/vlash and its descendants (state_cond, image_keys), ih/race (race). None of them exists at this pin.
+    encode_only_active_cameras is not among them: it is a stream_config keyword that builds image_keys."""
 
     spatial_layer: int | None = None
     state_cond: bool = False
     image_keys: tuple[str, ...] = _model.IMAGE_KEYS
-    encode_only_active_cameras: bool = False
     race: bool = False
 
 
@@ -250,13 +251,12 @@ class _MergedConfig(pi0_config.Pi0Config):
         ("state_cond", True, "state_cond.*adaRMS"),
         ("image_keys", ("left_wrist_0_rgb",), "every camera embedded"),
         ("image_keys", ("left_wrist_0_rgb", "base_0_rgb", "right_wrist_0_rgb"), "every camera embedded"),
-        ("encode_only_active_cameras", True, "every camera embedded"),
         ("race", True, "race.*adaRMS"),
     ],
 )
 def test_merge_hazards_of_other_branches_are_refused(field, value, match):
     """Fields that would silently change what a LIT run trains or what its action rows see are rejected through
-    getattr, the way vlash_branches is: git gives no signal for them (spatial forcing's train.py merges cleanly)."""
+    getattr, the way vlash_branches is: git gives no reliable signal for them."""
     kwargs = {"lit": "stage2", "pi05": True, "lit_goal_dims": GOAL_DIMS, "action_dim": 14}
     _MergedConfig(**kwargs)  # the defaults are the stock model
     _MergedConfig(**kwargs, image_keys=list(_model.IMAGE_KEYS))  # the default layout, spelled as a list

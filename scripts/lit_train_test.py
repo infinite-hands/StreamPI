@@ -244,6 +244,18 @@ def test_the_two_scripts_share_one_train_step_and_emit_the_step_line_once_as_the
         )
 
 
+def test_both_scripts_take_their_loss_from_lit_train_loss_with_parts():
+    """A source-text guard for a merge: ih/spatial-forcing rewrites the same loss_fn of scripts/train.py (a conflict),
+    and resolving it to that side calls model.compute_loss(es) directly, which drops the LIT loss and the stage-2
+    guard without any test of the numbers failing for a lit=off config."""
+    for script in SCRIPTS:
+        source = pathlib.Path(script.__file__).read_text()
+        assert "import openpi.training.lit_train as _lit_train" in source, script.__name__
+        step = inspect.getsource(script.train_step)
+        assert re.search(r"return _lit_train\.loss_with_parts\(model, rng, observation, actions\)", step), script.__name__
+        assert "compute_loss" not in step, f"{script.__name__}: the train step must not call the model's loss directly"
+
+
 # ---- the LIT loss: the pose term once, the parts that are logged ----
 
 
