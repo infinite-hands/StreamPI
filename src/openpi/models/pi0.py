@@ -18,8 +18,6 @@ from openpi.shared import array_typing as at
 
 logger = logging.getLogger("openpi")
 
-_SIGLIP_VARIANT = "So400m/14"
-
 
 def make_attn_mask(input_mask, mask_ar):
     """Adapted from big_vision.
@@ -86,7 +84,7 @@ class Pi0(_model.BaseModel):
         img = nnx_bridge.ToNNX(
             _siglip.Module(
                 num_classes=paligemma_config.width,
-                variant=_SIGLIP_VARIANT,
+                variant="So400m/14",
                 pool_type="none",
                 scan=True,
                 dtype_mm=config.dtype,
@@ -112,13 +110,16 @@ class Pi0(_model.BaseModel):
         # TEMPO channels (openpi.models.tempo); absent unless the config turns them on.
         self.tempo_sam2_image_key = config.tempo_sam2_image_key
         self.sam2_fusion = (
-            _tempo.Sam2CrossAttnFusion(paligemma_config.width, config.tempo_sam2_token_dim,
+            _tempo.GatedCrossAttn(paligemma_config.width, config.tempo_sam2_token_dim,
                                        config.tempo_sam2_num_tokens, config.tempo_sam2_heads, rngs=rngs)
             if config.tempo_sam2 else None
         )
-        self.action_history_tokens = (
-            _tempo.ActionHistoryTokens(config.tempo_action_history_dim, config.tempo_action_history_steps,
-                                       paligemma_config.width, rngs=rngs)
+        # TEMPO-ACT, read by the action expert alone: its input tokens attend to the current unit's
+        # history buckets through a zero-gated cross-attention (exact no-op at init), so the prefix and
+        # every warm-started weight see exactly what the control does (openpi.models.tempo).
+        self.action_history_xattn = (
+            _tempo.GatedCrossAttn(action_expert_config.width, config.tempo_action_history_dim,
+                                  config.tempo_action_history_steps, config.tempo_sam2_heads, rngs=rngs)
             if config.tempo_action_history else None
         )
         self.action_history_cond = (
@@ -126,17 +127,10 @@ class Pi0(_model.BaseModel):
                                         action_expert_config.width, rngs=rngs)
             if config.tempo_action_history and config.pi05 else None
         )
-        # A history unit's length (every camera's patches, the padded prompt, the history tokens): the
-        # history tokens are its last `tempo_action_history_steps` slots, hidden from the image and prompt
-        # tokens and left out of the positions, so those tokens see exactly what the control's do.
-        patch = int(_SIGLIP_VARIANT.split("/")[1])
-        image_tokens = (_model.IMAGE_RESOLUTION[0] // patch) * (_model.IMAGE_RESOLUTION[1] // patch)
-        self.history_steps = config.tempo_action_history_steps if config.tempo_action_history else 0
-        self.unit_len = len(config.fake_obs().images) * image_tokens + config.max_token_len + self.history_steps
 
     def _history_unit(self, obs: _model.Observation, all_image_tokens: dict, t: int, tokenized_inputs):
         """History unit t: every camera's visual tokens (the SAM2 camera's fused with frame t's cue),
-        the prompt, then frame t's action-history tokens. (tokens, input mask, ar mask)."""
+        then the prompt. (tokens, input mask, ar mask)."""
         visual_tokens = []
         visual_input_mask = []
         for name in obs.images:
@@ -152,42 +146,7 @@ class Pi0(_model.BaseModel):
         input_mask = [jnp.concatenate(visual_input_mask, axis=1), obs.tokenized_prompt_mask]
         # image tokens attend to each other; full attention between image and language inputs
         ar_mask = [True] + [False] * (visual_tokens.shape[1] - 1) + [False] * tokenized_inputs.shape[1]
-        if self.action_history_tokens is not None:
-            if obs.action_history is None or obs.action_history_is_pad is None:
-                raise ValueError("this config reads the action history, but the observation carries none")
-            history = self.action_history_tokens(obs.action_history[:, t]).astype(visual_tokens.dtype)
-            tokens.append(history)
-            input_mask.append(~obs.action_history_is_pad[:, t])  # buckets entirely before the episode
-            ar_mask += [False] * history.shape[1]
-        tokens = jnp.concatenate(tokens, axis=1)
-        if self.history_steps and tokens.shape[1] != self.unit_len:
-            raise ValueError(f"a history unit is {tokens.shape[1]} tokens, but the model hides history slots "
-                             f"by a unit length of {self.unit_len}")
-        return tokens, jnp.concatenate(input_mask, axis=1), ar_mask
-
-    def history_slots(self, length: int) -> jax.Array:
-        """(length,) True on the action-history tokens of a prefix made of whole history units."""
-        if not self.history_steps:
-            return jnp.zeros((length,), jnp.bool_)
-        if length % self.unit_len:
-            raise ValueError(f"a prefix of {length} tokens is not whole history units of {self.unit_len}")
-        return jnp.arange(length) % self.unit_len >= self.unit_len - self.history_steps
-
-    def position_mask(self, prefix_mask: jax.Array) -> jax.Array:
-        """The prefix tokens that count toward positions: every valid token except the history tokens."""
-        return prefix_mask & ~self.history_slots(prefix_mask.shape[-1])
-
-    def hide_history(self, prefix_attn_mask: jax.Array) -> jax.Array:
-        """Restrict a (b, q, k) prefix attention mask, whose queries are the last q of its k prefix keys:
-        image and prompt tokens never see history tokens; history tokens see only their own unit's."""
-        if not self.history_steps:
-            return prefix_attn_mask
-        q, k = prefix_attn_mask.shape[-2:]
-        slots = self.history_slots(k)
-        unit = jnp.arange(k) // self.unit_len
-        q_slots, q_unit = slots[k - q:], unit[k - q:]
-        allowed = jnp.where(q_slots[:, None], slots[None, :] & (q_unit[:, None] == unit[None, :]), ~slots[None, :])
-        return prefix_attn_mask & allowed[None]
+        return jnp.concatenate(tokens, axis=1), jnp.concatenate(input_mask, axis=1), ar_mask
 
     @at.typecheck
     def embed_prefix(
@@ -250,6 +209,12 @@ class Pi0(_model.BaseModel):
             ar_mask += [True]
 
         action_tokens = self.action_in_proj(noisy_actions)
+        if self.action_history_xattn is not None:
+            if obs.action_history is None or obs.action_history_is_pad is None:
+                raise ValueError("this config reads the action history, but the observation carries none")
+            # the CURRENT unit's buckets; a bucket wholly before the episode is masked out
+            action_tokens = self.action_history_xattn(action_tokens, obs.action_history[:, -1],
+                                                      kv_mask=~obs.action_history_is_pad[:, -1])
         # embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
         time_emb = jax.vmap(
             functools.partial(
@@ -318,11 +283,7 @@ class Pi0(_model.BaseModel):
         input_mask = input_mask & to_mask[None, :]
 
         attn_mask = make_attn_mask(input_mask, ar_mask)
-        prefix_len = prefix_mask.shape[1]
-        attn_mask = attn_mask.at[:, :prefix_len, :prefix_len].set(
-            self.hide_history(attn_mask[:, :prefix_len, :prefix_len]))
-        position_mask = input_mask.at[:, :prefix_len].set(self.position_mask(input_mask[:, :prefix_len]))
-        positions = jnp.cumsum(position_mask, axis=1) - 1
+        positions = jnp.cumsum(input_mask, axis=1) - 1
 
         def safe_print(fmt, *args):
             if jax.process_index() == 0:
@@ -449,11 +410,12 @@ class Pi0(_model.BaseModel):
             memory_prefix_attn_mask = einops.repeat(memory_prefix_mask, "b p -> b s p", s=prefix_mask.shape[1])
             prefix_attn_mask = jnp.concatenate([memory_prefix_attn_mask, prefix_attn_mask], axis=-1)
             prefix_mask = jnp.concatenate([memory_prefix_mask, prefix_mask], axis=-1)
-            positions = jnp.cumsum(self.position_mask(prefix_mask), axis=1) - 1
-            positions = positions[..., memory_prefix_mask.shape[-1]:]
+        # memory_kv_cache = None
+            # import pdb;pdb.set_trace()
+            positions = jnp.cumsum(prefix_mask, axis=1) - 1
+            positions = positions[..., memory_prefix_mask.shape[-1]:] 
         else:
-            positions = jnp.cumsum(self.position_mask(prefix_mask), axis=1) - 1
-        prefix_attn_mask = self.hide_history(prefix_attn_mask)
+            positions = jnp.cumsum(prefix_mask, axis=1) - 1
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions, kv_cache=memory_kv_cache)
         self.save_memory(prefix_tokens, prefix_mask, num_visual_tokens, num_text_tokens, kv_cache, memory)
 
@@ -479,7 +441,7 @@ class Pi0(_model.BaseModel):
             # )
             # print(full_attn_mask.shape)
             # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens
-            positions = jnp.sum(self.position_mask(prefix_mask), axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
 
             (prefix_out, suffix_out), _ = self.PaliGemma.llm(
                 [None, suffix_tokens],

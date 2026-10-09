@@ -67,7 +67,7 @@ def _with_open_gates(model):
         names = tuple(map(str, key))
         if "llm" in names and np.ndim(value) >= 2 and not np.any(value):
             flat[key] = jnp.asarray(rng.normal(0, 0.02, np.shape(value)), np.asarray(value).dtype)
-        elif names[-1] == "gate" or "pos_emb" in names or "mlp_out" in names:  # TEMPO's zero-init gates, opened
+        elif names[-1] == "gate" or "mlp_out" in names:  # TEMPO's zero-init gates, opened
             flat[key] = jnp.asarray(rng.normal(0.5, 0.1, np.shape(value)), np.asarray(value).dtype)
     state.replace_by_pure_dict(flax.traverse_util.unflatten_dict(flat))
     return nnx.merge(graph, state)
@@ -76,8 +76,8 @@ def _with_open_gates(model):
 def _prefix_pass(model, obs):
     """The prefix forward pass compute_loss makes (without its random unit masking): (out, kv_cache)."""
     tokens, mask, ar_mask, *_ = model.embed_prefix(obs)
-    attn_mask = model.hide_history(pi0.make_attn_mask(mask, ar_mask))
-    positions = jnp.cumsum(model.position_mask(mask), axis=1) - 1
+    attn_mask = pi0.make_attn_mask(mask, ar_mask)
+    positions = jnp.cumsum(mask, axis=1) - 1
     (out, _), kv_cache = model.PaliGemma.llm([tokens, None], mask=attn_mask, positions=positions, adarms_cond=[None, None])
     return out, kv_cache
 
@@ -93,7 +93,7 @@ def test_sam2_fusion_is_a_no_op_at_init_and_can_learn():
 
     block = fused.sam2_fusion
     vis, sam2 = jnp.ones((1, 5, 64)), jnp.ones((1, 7, 256))
-    small = tempo.Sam2CrossAttnFusion(64, 256, 7, 8, rngs=nnx.Rngs(0))
+    small = tempo.GatedCrossAttn(64, 256, 7, 8, rngs=nnx.Rngs(0))
     grads = nnx.grad(lambda module: jnp.sum(module(vis, sam2) * 1.0))(small)
     assert float(jnp.abs(grads.gate.value).max()) > 0, "the gate must receive a gradient at init (upstream's does not)"
     assert block.gate.value.shape == (1,)
@@ -110,19 +110,15 @@ def test_action_history_residual_is_zero_at_init():
     assert jnp.array_equal(with_history, without_history), "the adaRMS residual starts at exactly zero"
 
 
-def test_history_units_carry_their_own_action_tokens():
-    config = _config_for(tempo_sam2=True, tempo_sam2_image_key="left_wrist_0_rgb", tempo_action_history=True)
-    model = config.create(jax.random.key(0))
+def test_action_history_leaves_the_prefix_as_the_controls():
     plain = _config_for().create(jax.random.key(0))
+    config = _config_for(tempo_action_history=True)
+    act = _shared_base(config.create(jax.random.key(1)), plain)
     obs = _observation(config)
-    tokens, mask, ar_mask, unit_size, units = model.embed_prefix(obs)
-    plain_tokens, _, _, plain_unit, _ = plain.embed_prefix(obs)
-    steps = config.tempo_action_history_steps
-    assert units == UNITS and unit_size == plain_unit + steps
-    assert tokens.shape[1] == plain_tokens.shape[1] + UNITS * steps
-    oldest_history = mask[:, unit_size - steps:unit_size]
-    assert not bool(oldest_history[:, :4].any()) and bool(oldest_history[:, 4:].all()), "pad buckets are masked out"
-    assert not bool(ar_mask[unit_size - steps:unit_size].any()), "history attends bidirectionally within its unit"
+    with_history = act.embed_prefix(obs)
+    without_history = plain.embed_prefix(obs)
+    assert all(jnp.array_equal(a, b) for a, b in zip(with_history[:3], without_history[:3], strict=True))
+    assert with_history[3:] == without_history[3:]
 
 
 def test_loss_and_streaming_sample_run_with_both_channels():
@@ -136,7 +132,7 @@ def test_loss_and_streaming_sample_run_with_both_channels():
         "with trained-like gates the loss must depend on the TEMPO inputs"
     grads = nnx.grad(lambda m: jnp.mean(m.compute_loss(jax.random.key(1), obs, jnp.ones((BATCH, HORIZON, config.action_dim)))))(model)
     assert float(jnp.abs(grads.sam2_fusion.gate.value).max()) > 0
-    assert float(jnp.abs(grads.action_history_tokens.proj.kernel.value).max()) > 0
+    assert float(jnp.abs(grads.action_history_xattn.kv_in.kernel.value).max()) > 0
 
 
     memory = {"memory_tokens": None, "memory_kv_cache": None, "memory_prefix_mask": None}
@@ -146,25 +142,26 @@ def test_loss_and_streaming_sample_run_with_both_channels():
         assert actions.shape == (BATCH, HORIZON, config.action_dim) and bool(jnp.isfinite(actions).all())
 
 
-def test_history_tokens_are_live_at_init():
+def test_action_history_read_is_a_no_op_at_init_and_learns():
+    plain = _with_open_gates(_config_for().create(jax.random.key(0)))
     config = _config_for(tempo_action_history=True)
-    model = config.create(jax.random.key(0))
+    shut = _shared_base(config.create(jax.random.key(1)), plain)  # a warm start: base open, TEMPO shut
+    shut.action_history_cond = None  # isolate the cross-attention from the (also zero) adaRMS residual
     obs = _observation(config)
-    assert bool(jnp.any(model.action_history_tokens(obs.action_history[:, -1]))), \
-        "an all-zero history stream makes RMSNorm's backward 1/sqrt(eps) per layer: NaN on Gemma 2B"
+    noisy, time = jnp.ones((BATCH, HORIZON, config.action_dim)), jnp.full((BATCH, HORIZON), 0.5)
+    with_read, *_ = shut.embed_suffix(obs, noisy, time)
+    plain_obs = dataclasses.replace(obs, action_history=None, action_history_is_pad=None)
+    without_read, *_ = plain.embed_suffix(plain_obs, noisy, time)
+    assert jnp.array_equal(with_read, without_read), "a zero gate leaves the action expert's input unchanged"
+    actions = jnp.ones((BATCH, HORIZON, config.action_dim))
+    grads = nnx.grad(lambda m: jnp.mean(m.compute_loss(jax.random.key(1), obs, actions)))(shut)
+    gate_grad = float(jnp.abs(grads.action_history_xattn.gate.value).max())
+    assert 0 < gate_grad < float("inf"), "a shut gate gets a finite, non-zero gradient"
 
-
-def test_history_is_invisible_to_image_and_prompt_tokens():
-    plain = _with_open_gates(_config_for("float32").create(jax.random.key(0)))
-    config = _config_for("float32", tempo_action_history=True)
-    act = _with_open_gates(_shared_base(config.create(jax.random.key(1)), plain))
-    obs = _observation(config)
-    with_history, _ = _prefix_pass(act, obs)
-    without_history, _ = _prefix_pass(plain, obs)
-    slots = act.history_slots(with_history.shape[1])
-    assert bool(jnp.any(with_history[:, slots])), "the history tokens themselves are live once the gate opens"
-    # float32 throughout; the two sequences differ in length, so reductions may differ in the last bits
-    np.testing.assert_allclose(np.asarray(with_history[:, ~slots]), np.asarray(without_history), rtol=1e-5, atol=1e-5)
+    opened = _with_open_gates(shut)
+    all_pad = dataclasses.replace(obs, action_history_is_pad=jnp.ones_like(obs.action_history_is_pad))
+    padded, *_ = opened.embed_suffix(all_pad, noisy, time)
+    assert jnp.array_equal(padded, opened.action_in_proj(noisy)), "a history wholly before the episode adds nothing"
 
 
 def test_streaming_memory_matches_the_training_pass():
@@ -176,8 +173,6 @@ def test_streaming_memory_matches_the_training_pass():
     for t in range(UNITS):
         unit = jax.tree.map(lambda x, t=t: x[:, t:t + 1] if x.ndim >= 3 and x.shape[1] == UNITS else x, obs)
         _, memory = model.sample_actions(jax.random.key(2), unit, num_steps=1, memory=memory)
-    # A padded bucket's row is fully masked, so its output averages whatever keys are present: it
-    # differs between the two passes and nothing reads it. Every valid token must match.
     valid = np.asarray(memory["memory_prefix_mask"][0])
     for streamed, full in zip(jax.tree.leaves(memory["memory_kv_cache"]), jax.tree.leaves(full_kv), strict=True):
         assert streamed.shape == full.shape  # (layers, b, tokens, heads, head_dim)
@@ -216,7 +211,7 @@ def test_warm_start_from_a_checkpoint_without_tempo_modules():
     assert set(flax.traverse_util.flatten_dict(lora_only, sep="/")) != expected, \
         "without the TEMPO regex the new modules are absent, which the trainer's tree check refuses"
     merged = weight_loaders._merge_params(
-        plain, reference, missing_regex=r".*lora.*|.*(sam2_fusion|action_history_tokens|action_history_cond).*")
+        plain, reference, missing_regex=r".*lora.*|.*(sam2_fusion|action_history_xattn|action_history_cond).*")
     flat_merged = flax.traverse_util.flatten_dict(merged, sep="/")
     assert set(flat_merged) == expected
     flat_plain = flax.traverse_util.flatten_dict(plain, sep="/")

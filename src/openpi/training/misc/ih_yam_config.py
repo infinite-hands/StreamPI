@@ -51,7 +51,7 @@ TEMPO_WARM_STEPS = 5_000  # upstream TEMPO's warm-started rung length; the contr
 TEMPO_WARMUP_STEPS = 500  # upstream TEMPO's warmup for that rung; peak and floor stay this recipe's own
 # A warm start must normalise exactly as the checkpoint it continues: the pair reads the base recipe's stats.
 NORM_STATS_ROOT = "/checkpoints/assets"
-TEMPO_NEW_MODULES = ".*lora.*|.*(sam2_fusion|action_history_tokens|action_history_cond).*"
+TEMPO_NEW_MODULES = ".*lora.*|.*(sam2_fusion|action_history_xattn|action_history_cond).*"
 # The YAM LeRobot layout: three cameras, 14-dim state/action [L j0..5, L grip, R j0..5, R grip].
 YAM_REPACK = _transforms.Group(
     inputs=[
