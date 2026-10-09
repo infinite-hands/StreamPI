@@ -62,8 +62,8 @@ class Pi0Config(_model.BaseModelConfig):
     lit_mask_language: bool = True
     # Indices into the (state-width) goal vector that the pose loss and goal encoder use: the driven arm's dims.
     lit_goal_dims: tuple[int, ...] = ()
-    # Merge hazards, rejected by _validate_lit through getattr because these Pi0Config fields exist on other branches and
-    # not at this pin (names as those branches declare them). Git gives no reliable signal for them:
+    # Merge hazards, rejected by _validate_lit through getattr because these Pi0Config fields exist on other branches
+    # and not at this pin (names as those branches declare them). Git gives no reliable signal for them:
     # - spatial_layer (ih/spatial-forcing): moves the loss body into compute_losses, which its scripts/train.py calls
     #   when the field is set, so a LIT + spatial-forcing config would train the stock joint loss and never the LIT one.
     #   That train.py conflicts with this branch in 3 hunks (both sides rewrite loss_fn to has_aux); the silent risk is
@@ -71,10 +71,10 @@ class Pi0Config(_model.BaseModelConfig):
     #   with it the pose loss and the stage-2 guard. scripts/lit_train_test.py asserts both train scripts call it.
     # - state_cond (ih/vlash): feeds the state to the action expert through the adaRMS conditioning in embed_suffix, a
     #   direct state path around the latents that breaks the premise of the stage-2 hard mask.
-    # - image_keys other than all cameras in the default order (ih/vlash, ih/race, ih/race-yam, ih/vlash-right-real): the
-    #   model then embeds only those cameras while prefix_roles lays the prefix out from obs.images. The stream_config
-    #   keyword encode_only_active_cameras on those branches is not a Pi0Config field: it builds the narrowed image_keys
-    #   (and DataConfig.decode_only_hist_cameras), so the image_keys check is the one that sees it.
+    # - image_keys other than all cameras in the default order (ih/vlash, ih/race, ih/race-yam, ih/vlash-right-real):
+    #   the model then embeds only those cameras while prefix_roles lays the prefix out from obs.images. The
+    #   stream_config keyword encode_only_active_cameras on those branches is not a Pi0Config field: it builds the
+    #   narrowed image_keys (and DataConfig.decode_only_hist_cameras), so the image_keys check is the one that sees it.
     # - race (ih/race, ih/race-yam): a prior computed from the prefix's features modulates every adaRMS norm of the
     #   action expert, another direct path around the latents, and its training loss is a different compute
     #   (training_loss).

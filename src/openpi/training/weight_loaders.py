@@ -92,8 +92,8 @@ def _refuse_goal_encoder_into_other_stage(loaded_params: at.Params, params: at.P
     encoder would lose it silently, and the fingerprint of `LitStage1WeightLoader` would not run: refuse."""
     if "lit_goal_encoder" in loaded_params and "lit_goal_encoder" not in params:
         raise ValueError(
-            "the checkpoint is a LIT stage-1 one (it carries lit_goal_encoder leaves) and the model is not stage 1: its "
-            "goal encoder would be dropped silently. Initialise a stage-2 model from it with LitStage1WeightLoader."
+            "the checkpoint is a LIT stage-1 one (it carries lit_goal_encoder leaves) and the model is not stage 1: "
+            "its goal encoder would be dropped silently. Initialise a stage-2 model from it with LitStage1WeightLoader."
         )
 
 

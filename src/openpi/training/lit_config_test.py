@@ -153,7 +153,7 @@ def test_the_four_rows_read_one_set_of_norm_statistics(tmp_path):
     for suffix in SUFFIXES:
         assert _row(suffix).data.assets == pinned, suffix
     assert _yam.LIT_NORM_ASSETS_DIR == production
-    # the pinned file is the one the base recipe itself reads on the volume: assets_dirs (keyed by config name) / repo id
+    # the pinned file is the one the base recipe itself reads on the volume: assets_dirs (keyed by config name) / repo
     base = _config.get_config(BASE)
     on_volume = dataclasses.replace(base, assets_base_dir="/checkpoints/assets")
     base_data = on_volume.data.create(on_volume.assets_dirs, on_volume.model)
