@@ -51,10 +51,10 @@ def _stub_image_encoder():
 
 @pytest.fixture(autouse=True)
 def no_shared_compile_cache(monkeypatch):
-    """train.main points JAX's persistent compilation cache at ~/.cache/jax. On the Mac these tests were written on,
-    that directory (shared with other JAX processes) handed back executables that computed something else for the same
-    program (a different step-0 loss on each run, then a segfault) until it was bypassed, so the tests keep the cache
-    off: main's update of that one option is ignored."""
+    """train.main points JAX's persistent compilation cache at ~/.cache/jax. These tests ignore that one update: a
+    local-CPU observation on the Mac they were written on, where a cache hit gave different numerics for the identical
+    program (a different step-0 loss per run, then a segfault). It says nothing about the production runs, which keep
+    the cache, and main itself is unchanged."""
     real_update = jax.config.update
 
     def update(name, value):
@@ -234,12 +234,14 @@ def test_the_stock_lora_step_is_bit_identical_to_the_pins_without_ema():
     assert new_state.ema_params is None
 
 
-def test_the_two_scripts_share_one_train_step_and_both_write_the_step_line_to_the_log():
+def test_the_two_scripts_share_one_train_step_and_emit_the_step_line_once_as_the_pin_does():
     assert inspect.getsource(train.train_step) == inspect.getsource(train_multi_node.train_step)
     for script in SCRIPTS:
         source = inspect.getsource(script.main)
-        assert 'pbar.write(f"Step {step}: {info_str}")' in source
-        assert 'logging.info(f"Step {step}: {info_str}")' in source
+        assert source.count('pbar.write(f"Step {step}: {info_str}")') == 1
+        assert "Step {step}" not in source.replace('pbar.write(f"Step {step}: {info_str}")', ""), (
+            "a second emitter of the Step line records every point twice in the repo's metrics tap"
+        )
 
 
 # ---- the LIT loss: the pose term once, the parts that are logged ----
@@ -291,6 +293,7 @@ def _lit_step(stage, script="train"):
 
 
 _EXPECTED_KEYS = {
+    "off": {"loss", "grad_norm", "param_norm"},
     "stage2": {
         "loss", "grad_norm", "param_norm", "action_loss", "pose_loss", "pose_copy_baseline",
         "grad_norm_backbone", "grad_norm_expert", "grad_norm_lit_aggregator", "grad_norm_lit_pose_decoder",
@@ -546,20 +549,21 @@ def _main_config(tmp_path, stage, **overrides):
 
 
 @pytest.mark.parametrize("script", SCRIPTS)
-@pytest.mark.parametrize("stage", ["stage1", "stage2"])
-def test_main_writes_numeric_step_lines_to_the_log(tmp_path, monkeypatch, caplog, script, stage):
+@pytest.mark.parametrize("stage", ["off", "stage1", "stage2"])
+def test_main_writes_each_numeric_step_line_once_to_stdout(tmp_path, monkeypatch, capsys, caplog, script, stage):
+    """pbar.write reaches a non-terminal stdout (what the repo's metrics tap reads), and the pin's logging is otherwise
+    unchanged: a Step line in the logging records as well would record every point twice."""
     config = _main_config(tmp_path, stage)
     monkeypatch.setattr(_data_loader, "create_data_loader", lambda *a, **k: _Loader(_batch(config.model)))
     monkeypatch.setattr(script, "init_logging", lambda: None)
     with caplog.at_level(logging.INFO):
         script.main(config)
-    lines = [_parse(r.getMessage()) for r in caplog.records]
-    parsed = {step: pairs for step, pairs in (line for line in lines if line is not None)}
-    assert sorted(parsed) == [0, 1], "one Step line per log_interval, both captured by the logging system"
-    for pairs in parsed.values():
+    parsed = [line for line in map(_parse, capsys.readouterr().out.splitlines()) if line is not None]
+    assert [step for step, _ in parsed] == [0, 1], "one Step line per log_interval, each emitted once"
+    for _, pairs in parsed:
         assert set(pairs) == _EXPECTED_KEYS[stage]
         assert all(np.isfinite(float(v)) for v in pairs.values())
-    assert any(line is not None for line in lines)
+    assert [r.getMessage() for r in caplog.records if _parse(r.getMessage()) is not None] == []
 
 
 def _manager(root: pathlib.Path):

@@ -311,9 +311,6 @@ def main(config: _config.TrainConfig):
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
             pbar.write(f"Step {step}: {info_str}")
-            # pbar.write does not reach a log file when stdout is not a terminal: the training curves are parsed
-            # from this line.
-            logging.info(f"Step {step}: {info_str}")
             if jax.process_index() == 0:
                 wandb.log(reduced_info, step=step)
             infos = []
