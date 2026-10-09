@@ -59,7 +59,7 @@ LEFT_REAL_WARM_START = "/checkpoints/fine-tuned/pi05_yam_stream5_i20_bagging_lef
 RIGHT_REAL_WARM_START = "/checkpoints/fine-tuned/pi05_yam_stream5_i20_bagging_right_real/right-real-i20-run1/19999/params"
 TEMPO_WARM_STEPS = 5_000  # upstream TEMPO's warm-started rung length; the control trains exactly as long
 TEMPO_WARMUP_STEPS = 500  # upstream TEMPO's warmup for that rung; peak and floor stay this recipe's own
-TEMPO_NEW_MODULES = ".*lora.*|.*(sam2_fusion|action_history_tokens|action_history_cond).*"
+TEMPO_NEW_MODULES = ".*lora.*|.*(sam2_fusion|action_history_tokens|action_history_xattn|action_history_cond).*"
 # The inputs LoadTempoHistory attaches before repacking.
 TEMPO_INPUT_KEYS = ("sam2_tokens", "action_history", "action_history_is_pad")
 # The YAM LeRobot layout: three cameras, 14-dim state/action [L j0..5, L grip, R j0..5, R grip].
