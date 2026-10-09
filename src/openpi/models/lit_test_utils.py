@@ -12,18 +12,29 @@ The public API below is stable; later LIT tests import it unchanged.
     empty_memory() / memory_summary(memory)                        the policy's memory dict, and a checksum view
     jit_loss(model) / jit_sample(model)                            module_jit wrappers, as Policy uses them
     param_manifest(model) / array_digest(x)                        path -> shape, dtype, sha256 of the values
+    stub_image_encoder()                                           opt-in one-Dense stand-in for SigLIP (see below)
+    fixture_exact_skip_reason(recorded_toolchain, current_toolchain)   why an exact-equality fixture test cannot run
 
 What the tiny model is. Both Gemma experts use the "dummy" variant (width 64, depth 4, 1 kv head of head_dim 16),
 pi05=True, float32, action_dim 14, action_horizon 4, hist_horizon 3, max_token_len 8. The image tower is the REAL
 SigLIP So400m/14: Pi0.__init__ hard-codes it and the config offers no smaller variant, and it is cheap enough
-(measured on this CPU: model creation ~4 s, one compute_loss or sample_actions call at batch 2 ~5-10 s eager), so no
-stub encoder is used. Images must be 224x224 (other sizes are resized inside preprocess_observation), giving 256 image
+(measured on this CPU: model creation ~4 s, one compute_loss or sample_actions call at batch 2 ~5-10 s eager), so the
+default is the real encoder. Images must be 224x224 (other sizes are resized inside preprocess_observation), giving
+256 image
 tokens per camera. With 3 cameras and max_token_len 8 one history block is 3*256 + 8 = 776 tokens, 3 blocks = 2328.
 
 Two init facts the tests depend on. A freshly created pi0.5 is prefix-blind: every adaRMS modulation kernel is
 zero-initialised, so the action expert's attention contributes nothing. And the SigLIP head (head_zeroinit) is
 zero-initialised, so every image token is exactly zero. Call randomize_zero_init(model, seed) to get a model that
 actually reads the prefix and the images; tests of masking, gradients or image/language dependence need it.
+
+Stub image encoder, OFF by default. `stub_image_encoder()` swaps SigLIP for one Dense layer over 14x14 patch means for
+the duration of the `with` block (the Pi0 constructor reads `siglip.Module` when a model is created), and setting
+LIT_TEST_STUB_SIGLIP=1 in the environment applies it to the whole process. It exists for the trainer, loader and data
+tests, which check the optimizer, the checkpoint tree and the batch plumbing and not the image tower: a train step with
+gradients through the real So400m does not fit this CPU next to another JAX process. It changes every numerics that
+involves an image token, so nothing that compares against the lit=off fixture may run under it
+(fixture_exact_skip_reason says so) and the model tests of lit_pi0_test / lit_test keep the real encoder.
 
 LIT fields. `lit` and `lit_*` overrides are forwarded to Pi0Config only when the field exists, so this file works
 before and after the LIT fields land. On a Pi0Config without them, `lit="off"` (or no lit override) is accepted and
@@ -34,10 +45,13 @@ make_observation passes extra Observation fields (for example the LIT goal) thro
 dataclass does not have.
 """
 
+import contextlib
 import dataclasses
 import hashlib
+import os
 import zlib
 
+from flax import linen as nn
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
@@ -45,6 +59,7 @@ import numpy as np
 
 from openpi.models import model as _model
 from openpi.models import pi0_config as _pi0_config
+from openpi.models import siglip as _siglip
 from openpi.shared import nnx_utils
 
 ACTION_DIM = 14
@@ -78,6 +93,70 @@ _CONFIG_DEFAULTS = {
     "hist_horizon": HIST_HORIZON,
     "max_token_len": MAX_TOKEN_LEN,
 }
+
+
+STUB_ENV = "LIT_TEST_STUB_SIGLIP"
+_REAL_SIGLIP_MODULE = _siglip.Module
+
+
+class _StubSiglip(nn.Module):
+    """The real tower's interface (image (n, 224, 224, 3) -> ((n, 256, num_classes) tokens, aux)) with one Dense layer
+    over the 16x16 grid of 14x14 patch means. Unlike the real head it is not zero-initialised: image tokens carry the
+    image from the start."""
+
+    num_classes: int
+    dtype_mm: str = "float32"
+
+    @nn.compact
+    def __call__(self, image, *, train=False):
+        n, h, w, c = image.shape
+        patches = jnp.asarray(image, jnp.float32).reshape(n, 16, h // 16, 16, w // 16, c).mean(axis=(2, 4))
+        tokens = nn.Dense(self.num_classes, name="head")(patches.reshape(n, 256, c))
+        return tokens.astype(self.dtype_mm), {}
+
+
+def _stub_module(num_classes=None, *, variant=None, **kw):
+    return _StubSiglip(num_classes, dtype_mm=kw.get("dtype_mm", "float32"))
+
+
+def stub_active() -> bool:
+    return _siglip.Module is not _REAL_SIGLIP_MODULE
+
+
+@contextlib.contextmanager
+def stub_image_encoder():
+    """Models created inside the block use the one-Dense stub instead of SigLIP (see the module docstring)."""
+    previous = _siglip.Module
+    _siglip.Module = _stub_module
+    try:
+        yield
+    finally:
+        _siglip.Module = previous
+
+
+if os.environ.get(STUB_ENV) == "1":
+    _siglip.Module = _stub_module
+
+
+def fixture_exact_skip_reason(recorded_toolchain: dict, current_toolchain: dict) -> str | None:
+    """Why a test that compares exactly against a stored fixture (a bit-for-bit lit=off golden) cannot run here, or
+    None when it can. Such a fixture is a function of the toolchain it was generated on (the compiler's reductions
+    and the CPU kernels) and of the real image tower: on another machine, jax or numpy, or under the stub encoder,
+    "equal" and "different" say nothing, so the test must report not run, never passed. The tolerance-based LIT tests
+    do not use this."""
+    if stub_active():
+        return f"not run: the stub image encoder ({STUB_ENV}) changes the numerics the fixture was generated with"
+    keys = ("jax", "flax", "numpy", "machine", "jax_platform")
+    differing = {k: (recorded_toolchain.get(k), current_toolchain.get(k)) for k in keys}
+    differing = {k: v for k, v in differing.items() if v[0] != v[1]}
+    if differing:
+        return (
+            "not run: toolchain. The exact-equality fixture was generated on "
+            + ", ".join(f"{k} {a}" for k, (a, _) in differing.items())
+            + "; this run has "
+            + ", ".join(f"{k} {b}" for k, (_, b) in differing.items())
+        )
+    return None
 
 
 def _is_lit(name: str) -> bool:
