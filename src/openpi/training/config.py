@@ -96,6 +96,15 @@ class DataConfig:
     jitter_range: tuple = (-2, -1, 0, 1, 2)
     enable_jitter: bool = False
 
+    # TEMPO (openpi.policies.tempo_history). None = off. The cache holds tokens/episode_N.npy, one
+    # camera's SAM2 tokens (T, 64, 256), and actions/episode_N.npy, the raw action column (T, A); each
+    # history unit reads them at the frame TemporalJitter chose for `tempo_hist_key`, the same camera.
+    tempo_cache_dir: str | None = None
+    tempo_hist_key: str | None = None
+    tempo_action_dims: tuple[int, ...] | None = None
+    tempo_action_history_steps: int = 10
+    tempo_frames_per_bucket: int = 30
+
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 

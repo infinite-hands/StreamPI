@@ -10,6 +10,9 @@ from typing_extensions import Literal
 from openpi import transforms
 
 
+TEMPO_KEYS = ("sam2_tokens", "action_history", "action_history_is_pad")  # openpi.policies.tempo_history's outputs
+
+
 def make_agilex_example() -> dict:
     """Creates a random input example for the Agilex policy."""
     return {
@@ -311,6 +314,10 @@ class AgilexInputs(transforms.DataTransformFn):
 
         if "action_prefix" in data:
             inputs["action_prefix"] = data["action_prefix"]
+
+        for key in TEMPO_KEYS:
+            if key in data:
+                inputs[key] = np.asarray(data[key])
 
         return inputs
 

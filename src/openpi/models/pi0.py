@@ -13,6 +13,7 @@ from openpi.models import model as _model
 from openpi.models import pi0_config
 import openpi.models.gemma as _gemma
 import openpi.models.siglip as _siglip
+import openpi.models.tempo as _tempo
 from openpi.shared import array_typing as at
 
 logger = logging.getLogger("openpi")
@@ -106,6 +107,47 @@ class Pi0(_model.BaseModel):
 
         self.hist_horizon = config.hist_horizon
 
+        # TEMPO channels (openpi.models.tempo); absent unless the config turns them on.
+        self.tempo_sam2_image_key = config.tempo_sam2_image_key
+        self.sam2_fusion = (
+            _tempo.GatedCrossAttn(paligemma_config.width, config.tempo_sam2_token_dim,
+                                       config.tempo_sam2_num_tokens, config.tempo_sam2_heads, rngs=rngs)
+            if config.tempo_sam2 else None
+        )
+        # TEMPO-ACT, read by the action expert alone: its input tokens attend to the current unit's
+        # history buckets through a zero-gated cross-attention (exact no-op at init), so the prefix and
+        # every warm-started weight see exactly what the control does (openpi.models.tempo).
+        self.action_history_xattn = (
+            _tempo.GatedCrossAttn(action_expert_config.width, config.tempo_action_history_dim,
+                                  config.tempo_action_history_steps, config.tempo_sam2_heads, rngs=rngs)
+            if config.tempo_action_history else None
+        )
+        self.action_history_cond = (
+            _tempo.ActionHistoryCondMLP(config.tempo_action_history_steps * config.tempo_action_history_dim,
+                                        action_expert_config.width, rngs=rngs)
+            if config.tempo_action_history and config.pi05 else None
+        )
+
+    def _history_unit(self, obs: _model.Observation, all_image_tokens: dict, t: int, tokenized_inputs):
+        """History unit t: every camera's visual tokens (the SAM2 camera's fused with frame t's cue),
+        then the prompt. (tokens, input mask, ar mask)."""
+        visual_tokens = []
+        visual_input_mask = []
+        for name in obs.images:
+            frame_tokens = all_image_tokens[name][:, t]
+            if self.sam2_fusion is not None and name == self.tempo_sam2_image_key:
+                if obs.sam2_tokens is None:
+                    raise ValueError("this config fuses SAM2 tokens, but the observation carries none")
+                frame_tokens = self.sam2_fusion(frame_tokens, obs.sam2_tokens[:, t])
+            visual_tokens.append(frame_tokens)
+            visual_input_mask.append(einops.repeat(obs.image_masks[name], "b -> b s", s=frame_tokens.shape[1]))
+        visual_tokens = jnp.concatenate(visual_tokens, axis=1)
+        tokens = [visual_tokens, tokenized_inputs]
+        input_mask = [jnp.concatenate(visual_input_mask, axis=1), obs.tokenized_prompt_mask]
+        # image tokens attend to each other; full attention between image and language inputs
+        ar_mask = [True] + [False] * (visual_tokens.shape[1] - 1) + [False] * tokenized_inputs.shape[1]
+        return jnp.concatenate(tokens, axis=1), jnp.concatenate(input_mask, axis=1), ar_mask
+
     @at.typecheck
     def embed_prefix(
         self, obs: _model.Observation,
@@ -133,31 +175,10 @@ class Pi0(_model.BaseModel):
             num_text_tokens = 0
 
         for t in range(T):
-            visual_tokens = list()
-            visual_input_mask = list()
-            for name in obs.images:
-                visual_tokens.append(all_image_tokens[name][:, t])
-
-                visual_input_mask.append(einops.repeat(
-                    obs.image_masks[name],
-                    "b -> b s",
-                    s=visual_tokens[0].shape[1],
-                ))
-
-            visual_tokens = jnp.concatenate(visual_tokens, axis=1)
-            visual_input_mask = jnp.concatenate(visual_input_mask, axis=1)
-
-            multimodal_tokens = jnp.concatenate([visual_tokens, tokenized_inputs], axis=1)
-            multimodal_input_mask = jnp.concatenate([visual_input_mask, obs.tokenized_prompt_mask], axis=1)
-
-            # image tokens attend to each other
-            ar_mask += [True] + [False] * (visual_tokens.shape[1] - 1)
-
-            # full attention between image and language inputs
-            ar_mask += [False] * (tokenized_inputs.shape[1])
-
-            tokens.append(multimodal_tokens)
-            input_mask.append(multimodal_input_mask)
+            unit_tokens, unit_mask, unit_ar_mask = self._history_unit(obs, all_image_tokens, t, tokenized_inputs)
+            tokens.append(unit_tokens)
+            input_mask.append(unit_mask)
+            ar_mask += unit_ar_mask
 
         num_visual_tokens = tokens[0].shape[1]
 
@@ -188,6 +209,12 @@ class Pi0(_model.BaseModel):
             ar_mask += [True]
 
         action_tokens = self.action_in_proj(noisy_actions)
+        if self.action_history_xattn is not None:
+            if obs.action_history is None or obs.action_history_is_pad is None:
+                raise ValueError("this config reads the action history, but the observation carries none")
+            # the CURRENT unit's buckets; a bucket wholly before the episode is masked out
+            action_tokens = self.action_history_xattn(action_tokens, obs.action_history[:, -1],
+                                                      kv_mask=~obs.action_history_is_pad[:, -1])
         # embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
         time_emb = jax.vmap(
             functools.partial(
@@ -202,6 +229,11 @@ class Pi0(_model.BaseModel):
             time_emb = nnx.swish(time_emb)
             action_expert_tokens = action_tokens
             adarms_cond = time_emb
+            if self.action_history_cond is not None:
+                # TEMPO-ACT's second route: the CURRENT unit's history, a zero residual at init.
+                current = obs.action_history[:, -1]
+                residual = self.action_history_cond(current.reshape(current.shape[0], -1))
+                adarms_cond = adarms_cond + residual[:, None, :].astype(adarms_cond.dtype)  # every action row's cond
         else:
             # mix timestep + action information using an MLP (no adaRMS)
             time_tokens = einops.repeat(time_emb, "b emb -> b s emb", s=self.action_horizon)
@@ -305,31 +337,10 @@ class Pi0(_model.BaseModel):
             num_text_tokens = 0
 
         for t in range(T):
-            visual_tokens = list()
-            visual_input_mask = list()
-            for name in obs.images:
-                visual_tokens.append(all_image_tokens[name][:, t])
-
-                visual_input_mask.append(einops.repeat(
-                    obs.image_masks[name],
-                    "b -> b s",
-                    s=visual_tokens[0].shape[1],
-                ))
-
-            visual_tokens = jnp.concatenate(visual_tokens, axis=1)
-            visual_input_mask = jnp.concatenate(visual_input_mask, axis=1)
-
-            multimodal_tokens = jnp.concatenate([visual_tokens, tokenized_inputs], axis=1)
-            multimodal_input_mask = jnp.concatenate([visual_input_mask, obs.tokenized_prompt_mask], axis=1)
-
-            # image tokens attend to each other
-            ar_mask += [True] + [False] * (visual_tokens.shape[1] - 1)
-
-            # full attention between image and language inputs
-            ar_mask += [False] * (tokenized_inputs.shape[1])
-
-            tokens.append(multimodal_tokens)
-            input_mask.append(multimodal_input_mask)
+            unit_tokens, unit_mask, unit_ar_mask = self._history_unit(obs, all_image_tokens, t, tokenized_inputs)
+            tokens.append(unit_tokens)
+            input_mask.append(unit_mask)
+            ar_mask += unit_ar_mask
 
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1).reshape(bs, -1)
