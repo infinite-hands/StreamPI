@@ -92,8 +92,9 @@ class Observation(Generic[ArrayT]):
     images: dict[str, at.Float[ArrayT, "#b t h w c"]]
     # Image masks, with same keys as images.
     image_masks: dict[str, at.Bool[ArrayT, "#b"]]
-    # Low-dimensional robot state.
-    state: at.Float[ArrayT, "#b s"]
+    # Low-dimensional robot state. The optional middle axis is VLASH's shared-observation training: one
+    # state per branch behind the same images and prompt (Pi0Config.vlash_branches).
+    state: at.Float[ArrayT, "#b *n s"]
 
     # Tokenized prompt.
     tokenized_prompt: at.Int[ArrayT, "#b l"] | None = None
