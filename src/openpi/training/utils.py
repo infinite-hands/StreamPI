@@ -4,6 +4,7 @@ from typing import Any
 from flax import nnx
 from flax import struct
 import jax
+import jax.numpy as jnp
 import optax
 
 from openpi.models import model as _model
@@ -36,3 +37,16 @@ def tree_to_info(tree: at.PyTree, interp_func: Callable[[Any], str] = str) -> st
 def array_tree_to_info(tree: at.PyTree) -> str:
     """Converts a PyTree of arrays into a human-readable string for logging."""
     return tree_to_info(tree, lambda x: f"{x.shape}@{x.dtype}")
+
+
+def ema_update(decay: float, ema_params: at.PyTree, new_params: at.PyTree) -> at.PyTree:
+    """One EMA step, computed in float32 and stored in each leaf's own dtype.
+
+    A frozen bfloat16 weight (old == new) therefore stays bit-identical; doing the arithmetic in bfloat16 adds rounding
+    noise to it every step, which a 0.99 decay lets accumulate.
+    """
+
+    def step(old, new):
+        return (decay * old.astype(jnp.float32) + (1 - decay) * new.astype(jnp.float32)).astype(old.dtype)
+
+    return jax.tree.map(step, ema_params, new_params)
