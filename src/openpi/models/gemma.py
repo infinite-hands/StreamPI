@@ -179,7 +179,7 @@ class Attention(nn.Module):
     configs: Sequence[Config]
 
     @nn.compact
-    def __call__(self, xs, positions, attn_mask, kv_cache):
+    def __call__(self, xs, positions, attn_mask, kv_cache, memory_bank=None):
         # all experts must share the same head dim, num heads, and num kv heads for self-attention to work
         assert all(config.head_dim == self.configs[0].head_dim for config in self.configs)
         assert all(config.num_heads == self.configs[0].num_heads for config in self.configs)
@@ -217,6 +217,8 @@ class Attention(nn.Module):
                 qkvs.append((q, k, v))
 
         q, k, v = (jnp.concatenate(y, axis=1) for y in zip(*qkvs, strict=True))
+        # The memory read below is content-based: it uses the queries before RoPE, and its keys carry no position.
+        q_unrotated = q * self.configs[0].head_dim**-0.5
 
         q = _apply_rope(q, positions=positions)
         q *= self.configs[0].head_dim ** -0.5
@@ -259,7 +261,26 @@ class Attention(nn.Module):
                     init_fn=nn.initializers.lecun_normal(in_axis=(-3, -2), out_axis=-1),
                     lora_config=config.lora_configs.get("attn"),
                 )
-                out.append(out_einsum("BTNH,NHD->BTD", encoded[:, start:end]))
+                attended = encoded[:, start:end]
+                if memory_bank is not None and i == len(self.configs) - 1:
+                    # The last expert (the action expert) also reads a bank of memory tokens through its own branch,
+                    # scaled by tanh of a gate that starts at zero: with the gate closed the layer is exactly what it
+                    # was, and a bank with no valid token adds nothing whatever the gate.
+                    bank, bank_mask = memory_bank
+                    kv_width = config.num_kv_heads * config.head_dim
+                    k_memory = nn.Dense(kv_width, use_bias=False, name="memory_k")(bank).reshape(
+                        *bank.shape[:2], config.num_kv_heads, config.head_dim)
+                    v_memory = nn.Dense(kv_width, use_bias=False, name="memory_v")(bank).reshape(
+                        *bank.shape[:2], config.num_kv_heads, config.head_dim)
+                    q_memory = einops.rearrange(q_unrotated[:, start:end], "B T (K G) H -> B T K G H", K=config.num_kv_heads)
+                    memory_logits = jnp.einsum("BTKGH,BLKH->BKGTL", q_memory, k_memory, preferred_element_type=jnp.float32)
+                    memory_logits = jnp.where(bank_mask[:, None, None, None, :], memory_logits, big_neg)
+                    memory_probs = jax.nn.softmax(memory_logits, axis=-1) * bank_mask.any(axis=-1)[:, None, None, None, None]
+                    read = jnp.einsum("BKGTL,BLKH->BTKGH", memory_probs.astype(dtype), v_memory)
+                    read = einops.rearrange(read, "B T K G H -> B T (K G) H")
+                    gate = jnp.tanh(self.param("memory_gate", nn.initializers.zeros, ())).astype(dtype)
+                    attended = attended + gate * read
+                out.append(out_einsum("BTNH,NHD->BTD", attended))
                 start = end
             else:
                 out.append(None)
@@ -309,7 +330,7 @@ class Block(nn.Module):
 
     @nn.compact
     def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True,  # noqa: FBT002
-                 race_cond=None):
+                 race_cond=None, memory_bank=None):
         xs = sharding.activation_sharding_constraint(xs)
         drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x
 
@@ -325,7 +346,7 @@ class Block(nn.Module):
             gates.append(gate if x is not None else None)
 
         pre_attn = sharding.activation_sharding_constraint(pre_attn)
-        post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache)
+        post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache, memory_bank)
         post_attn = jax.tree.map(lambda x: drop(x, deterministic), post_attn)
         post_attn = sharding.activation_sharding_constraint(post_attn)
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, post_attn, gates, strict=True)]
@@ -394,7 +415,8 @@ class Module(nn.Module):
                 nn.broadcast,
                 nn.broadcast,
                 nn.broadcast,
-            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=deterministic, 5=race_cond
+                nn.broadcast,
+            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=deterministic, 5=race_cond, 6=memory_bank
             length=self.configs[0].depth,
         )(
             configs=self.configs,
@@ -419,15 +441,18 @@ class Module(nn.Module):
         kv_cache: KVCache | None = None,
         deterministic: bool = True,
         race_cond: at.Float[at.Array, "b _s _d"] | None = None,
+        memory_bank: tuple[at.Float[at.Array, "b bank _d"], at.Bool[at.Array, "b bank"]] | None = None,
     ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]:
         """`race_cond` is RACE's token-wise transition feature U (b, suffix tokens, width), added through every
-        adaptive RMSNorm of the expert that has adarms_cond; None runs the expert unmodulated."""
+        adaptive RMSNorm of the expert that has adarms_cond; None runs the expert unmodulated. `memory_bank` is (tokens,
+        valid mask): memory tokens the last expert reads through a zero-gated branch in every layer; None adds nothing."""
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
         mask = jnp.asarray(mask)[:, None, :, :]
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
 
-        embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic, race_cond)
+        embedded, kv_cache = self.layers(
+            embedded, kv_cache, positions, mask, adarms_cond, deterministic, race_cond, memory_bank)
 
         assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
 
@@ -436,9 +461,10 @@ class Module(nn.Module):
             for f, e, a in zip(self.final_norms, embedded, adarms_cond, strict=True)
         ], kv_cache
 
-    def init(self, use_adarms: Sequence[bool], race: bool = False):  # noqa: FBT001, FBT002
+    def init(self, use_adarms: Sequence[bool], race: bool = False, memory_width: int | None = None):  # noqa: FBT001, FBT002
         """Convenience method for initializing all parameters, necessary due to the quirks of linen. `race`
-        also creates RACE's per-layer modulation weights in every adaptive RMSNorm."""
+        also creates RACE's per-layer modulation weights in every adaptive RMSNorm; `memory_width` creates the
+        action expert's memory-read branch for a bank of tokens that wide."""
         self.embed(jnp.zeros((1, 1), dtype=jnp.int32))
         adarms_width = next((c.width for u, c in zip(use_adarms, self.configs, strict=True) if u), None)
         self(
@@ -447,6 +473,7 @@ class Module(nn.Module):
             jnp.zeros((1, len(self.configs), len(self.configs)), dtype=bool),
             adarms_cond=[jnp.zeros((1, 1, c.width)) if u else None for u, c in zip(use_adarms, self.configs, strict=True)],
             race_cond=jnp.zeros((1, 1, adarms_width)) if race else None,
+            memory_bank=None if memory_width is None else (jnp.zeros((1, 1, memory_width)), jnp.ones((1, 1), dtype=bool)),
         )
 
 
