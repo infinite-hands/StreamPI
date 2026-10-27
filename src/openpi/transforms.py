@@ -192,6 +192,16 @@ class Unnormalize(DataTransformFn):
         return (x + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01
 
 
+def history_frame_offsets(
+    hist_horizon: int, hist_interval: int, jitter_range: Sequence[int], *, enable_jitter: bool
+) -> tuple[int, ...]:
+    """The frame offsets from the current frame (oldest first, all <= 0) that TemporalJitter can pick, so a loader can
+    decode only those instead of the whole (hist_horizon - 1) * hist_interval + 1 frame window."""
+    oldest = -(hist_horizon - 1) * hist_interval
+    jitters = tuple(jitter_range) if enable_jitter else (0,)
+    return tuple(sorted({min(0, max(oldest, -slot * hist_interval + jitter)) for slot in range(hist_horizon) for jitter in jitters}))
+
+
 @dataclasses.dataclass(frozen=True)
 class TemporalJitter(DataTransformFn):
     jitter_range: None
@@ -199,8 +209,12 @@ class TemporalJitter(DataTransformFn):
     hist_horizon: int
     hist_sequence_keys: list
     enable_jitter: bool
+    # None: the sequences are the dense window. Else they hold only these frame offsets, in order (history_frame_offsets).
+    window_offsets: tuple[int, ...] | None = None
 
     def __call__(self, data: DataDict) -> DataDict:
+        slots = None if self.window_offsets is None else {offset: slot for slot, offset in enumerate(self.window_offsets)}
+        oldest = -(self.hist_horizon - 1) * self.hist_interval
         for key in self.hist_sequence_keys:
             full_seq = data[key]
             T = full_seq.shape[0]
@@ -212,6 +226,10 @@ class TemporalJitter(DataTransformFn):
                 base_offset = 0
 
             for i in range(self.hist_horizon):
+                if slots is not None:
+                    offset = min(0, max(oldest, -i * self.hist_interval + base_offset))
+                    sampled_frames.append(full_seq[slots[offset]])
+                    continue
                 frame_idx = (T - 1) - (i * self.hist_interval) + base_offset
 
                 frame_idx = np.clip(frame_idx, 0, T - 1)

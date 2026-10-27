@@ -190,12 +190,16 @@ def create_torch_dataset(
     step_time = 1.0 / dataset_meta.fps
 
     hist_delta_timestamps = {}
+    window_offsets = None
+    if data_config.sparse_hist_decode:
+        window_offsets = _transforms.history_frame_offsets(
+            hist_horizon, hist_interval, jitter_range, enable_jitter=enable_jitter)
 
     for key in data_config.hist_sequence_keys:
-        base_steps = [
-            -1 * t
-            for t in range((hist_horizon - 1) * hist_interval, -1, -1)
-        ]
+        base_steps = (
+            list(window_offsets) if window_offsets is not None
+            else [-1 * t for t in range((hist_horizon - 1) * hist_interval, -1, -1)]
+        )
         hist_delta_timestamps[key] = [s * step_time for s in base_steps]
 
     delta_timestamps.update(hist_delta_timestamps)
@@ -210,7 +214,8 @@ def create_torch_dataset(
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 
-    dataset = TransformedDataset(dataset, [_transforms.TemporalJitter(jitter_range, hist_interval, hist_horizon, data_config.hist_sequence_keys, enable_jitter)])
+    dataset = TransformedDataset(dataset, [_transforms.TemporalJitter(
+        jitter_range, hist_interval, hist_horizon, data_config.hist_sequence_keys, enable_jitter, window_offsets)])
 
     if data_config.vlash_max_offset > 0 or data_config.vlash_branches:
         if data_config.vlash_branches != getattr(model_config, "vlash_branches", 0):

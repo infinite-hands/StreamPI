@@ -112,6 +112,9 @@ class DataConfig:
     # Decode only the video columns in hist_sequence_keys. A recipe that masks a camera still pays
     # its decode otherwise: LeRobot decodes every video column for every sample.
     decode_only_hist_cameras: bool = False
+    # Decode only the history frames TemporalJitter can pick (transforms.history_frame_offsets), not the whole window:
+    # 21 instead of 81 per camera at 5 frames 20 apart with the default jitter, 5 without it. Same samples.
+    sparse_hist_decode: bool = False
     # Training-time state augmentation on the text state (transforms.TokenizePrompt); the trainer sets these from
     # TrainConfig, so serving never sees them.
     state_dropout: float = 0.0

@@ -205,6 +205,7 @@ def get_ih_yam_configs():
                     vlash_state_source=vlash_state_source,
                     vlash_cond_now=vlash_cond_now,
                     decode_only_hist_cameras=encode_only_active_cameras,
+                    sparse_hist_decode=True,
                 ),
             ),
             weight_loader=weight_loaders.CheckpointWeightLoader(
