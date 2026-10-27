@@ -30,3 +30,12 @@ def test_one_arm_recipes_carry_their_gripper_dim_at_weight_one():
     for name, dim in ((BASE, 13), ("pi05_yam_stream5_i20_bagging_left_real", 6)):
         model = config.get_config(name).model
         assert (model.gripper_loss_dim, model.gripper_loss_weight) == (dim, 1.0)
+
+
+def test_cam2_twin_reads_the_overhead_camera_as_well():
+    base, twin = config.get_config(BASE), config.get_config(BASE + "_cam2")
+    assert base.model.image_keys == ("right_wrist_0_rgb",)
+    assert twin.model.image_keys == ("base_0_rgb", "right_wrist_0_rgb")
+    assert twin.data.active_image_keys == frozenset({"base_0_rgb", "right_wrist_0_rgb"})
+    assert set(twin.data.hist_sequence_keys) == {"observation.images.cam_high", "observation.images.cam_right_wrist"}
+    assert twin.data.active_state_dims == base.data.active_state_dims

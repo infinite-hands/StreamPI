@@ -66,6 +66,9 @@ XR128_TWIN_BASES: tuple[str, ...] = ("pi05_yam_stream5_i20_bagging_right_real",)
 # The recipes that get a `_px336` twin: the cameras read at 336 px (576 tokens per image, a 24 x 24 patch grid).
 PX336_TWIN_BASES: tuple[str, ...] = ("pi05_yam_stream5_i20_bagging_right_real",)
 PX336_RESOLUTION = (336, 336)
+# The recipes that get a `_cam2` twin: the driven wrist camera plus the overhead camera (cam_high), for global bag context.
+CAM2_TWIN_BASES: tuple[str, ...] = ("pi05_yam_stream5_i20_bagging_right_real",)
+CAM2_EXTRA_IMAGE_KEY = "base_0_rgb"
 
 
 def yam_repack(cameras: tuple[str, ...] = YAM_CAMERAS, *, vlash_cond_now: bool = False,
@@ -324,13 +327,20 @@ def get_ih_yam_configs():
         return {**recipe, "name": recipe["name"] + "_px336", "image_resolution": PX336_RESOLUTION,
                 "norm_stats_config": recipe["name"]}
 
+    def two_camera_twin(recipe: dict) -> dict:
+        # The recipe with the overhead camera read as well, warm-started from a wrist-only checkpoint of the same recipe:
+        # the cameras share SigLIP, so no weight changes, but each frame block carries 256 more tokens.
+        return {**recipe, "name": recipe["name"] + "_cam2", "norm_stats_config": recipe["name"],
+                "active_image_keys": recipe["active_image_keys"] | {CAM2_EXTRA_IMAGE_KEY}}
+
     race_twins = [race_twin(recipe) for recipe in recipes if recipe["name"] in RACE_TWIN_BASES]
     xr128_twins = [expert_rank_twin(recipe) for recipe in recipes if recipe["name"] in XR128_TWIN_BASES]
     px336_twins = [px336_twin(recipe) for recipe in recipes if recipe["name"] in PX336_TWIN_BASES]
+    cam2_twins = [two_camera_twin(recipe) for recipe in recipes if recipe["name"] in CAM2_TWIN_BASES]
     cadence_recipes = [{**recipe, "name": recipe["name"].replace("_i20_", "_i15_"), "hist_interval": HIST_INTERVAL_MID}
                        for recipe in recipes if recipe["name"] == "pi05_yam_stream5_i20_bagging_right_real"]
     return [stream_config(**recipe) for recipe in
             recipes + [vlash_twin(recipe) for recipe in recipes] + [vlash_reference_twin(recipe) for recipe in recipes]
             + [vlash_measured_twin(recipe) for recipe in recipes] + [vlash_packed_measured_twin(recipe) for recipe in recipes]
             + [vlash_conditioned_twin(recipe) for recipe in recipes] + [vlash_long_conditioned_twin(recipe) for recipe in recipes]
-            + [vlash_packed_twin(recipe) for recipe in recipes] + race_twins + xr128_twins + px336_twins + cadence_recipes]
+            + [vlash_packed_twin(recipe) for recipe in recipes] + race_twins + xr128_twins + px336_twins + cam2_twins + cadence_recipes]
