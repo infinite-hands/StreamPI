@@ -164,6 +164,9 @@ class Pi0(_model.BaseModel):
 
         self.hist_horizon = config.hist_horizon
         self.image_keys = tuple(config.image_keys)
+        self.image_resolution = tuple(config.image_resolution)
+        self.loss_weights = None if config.gripper_loss_weight == 1.0 else tuple(
+            config.gripper_loss_weight if dim == config.gripper_loss_dim else 1.0 for dim in range(config.action_dim))
 
     @at.typecheck
     def embed_prefix(
@@ -284,6 +287,12 @@ class Pi0(_model.BaseModel):
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask, adarms_cond
 
+    def _loss_rows(self, v_t, u_t):
+        squared = jnp.square(v_t - u_t)
+        if self.loss_weights is not None:
+            squared = squared * jnp.asarray(self.loss_weights, dtype=squared.dtype)
+        return jnp.mean(squared, axis=-1)
+
     def _state_cond_emb(self, state: at.Float[at.Array, "b s"]) -> at.Float[at.Array, "b emb"]:
         if self.state_cond_dims is not None:
             keep = jnp.zeros((state.shape[-1],), dtype=bool).at[jnp.array(self.state_cond_dims)].set(True)
@@ -319,7 +328,8 @@ class Pi0(_model.BaseModel):
     ):
         """(L_full per row, L_aux per row, L_timing); the last two are None for a model without RACE."""
         preprocess_rng, noise_rng, time_rng, mask_rng = jax.random.split(rng, 4)
-        observation = _model.preprocess_observation(preprocess_rng, observation, train=train, image_keys=self.image_keys)
+        observation = _model.preprocess_observation(
+            preprocess_rng, observation, train=train, image_keys=self.image_keys, image_resolution=self.image_resolution)
 
         b, ah, ad = actions.shape
         batch_shape = actions.shape[:-2]
@@ -378,7 +388,7 @@ class Pi0(_model.BaseModel):
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        full = jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        full = self._loss_rows(v_t, u_t)
         if not self.race:
             return full, None, None
 
@@ -407,7 +417,8 @@ class Pi0(_model.BaseModel):
         if not self.state_cond:
             raise ValueError("branched samples need state_cond: the prompt carries no per-branch state")
         preprocess_rng, noise_rng, time_rng, mask_rng = jax.random.split(rng, 4)
-        observation = _model.preprocess_observation(preprocess_rng, observation, train=train, image_keys=self.image_keys)
+        observation = _model.preprocess_observation(
+            preprocess_rng, observation, train=train, image_keys=self.image_keys, image_resolution=self.image_resolution)
 
         b, n, ah, ad = actions.shape
         noise = jax.random.normal(noise_rng, actions.shape)
@@ -445,7 +456,7 @@ class Pi0(_model.BaseModel):
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
         )
         v_t = self.action_out_proj(suffix_out).reshape(b, n, suffix_len, ad)[:, :, -ah:]
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        return self._loss_rows(v_t, u_t)
 
     @at.typecheck
     def embed_prefix_infer(
@@ -543,7 +554,8 @@ class Pi0(_model.BaseModel):
         step: at.Int[at.Array, ""] = None,
         memory: dict = None
     ) -> _model.Actions:
-        observation = _model.preprocess_observation(None, observation, train=False, image_keys=self.image_keys)
+        observation = _model.preprocess_observation(
+            None, observation, train=False, image_keys=self.image_keys, image_resolution=self.image_resolution)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
         dt = -1.0 / num_steps

@@ -58,6 +58,13 @@ class Pi0Config(_model.BaseModelConfig):
     # Sec. 4.1: "we set lambda_aux = 0.1 and lambda_timing = 0.05".
     race_aux_weight: float = 0.1
     race_timing_weight: float = 0.05
+    # The flow-matching loss's weight on one action dimension (the driven arm's gripper), so a grasp counts for
+    # more than a joint; 1.0 is the plain mean over dimensions.
+    gripper_loss_weight: float = 1.0
+    gripper_loss_dim: int | None = None
+    # The square size the cameras are resized to, a multiple of SigLIP's 14-pixel patch. Above 224 the learned
+    # position embedding is resampled at load (CheckpointWeightLoader.resize_posemb).
+    image_resolution: tuple[int, int] = _model.IMAGE_RESOLUTION
 
     def __post_init__(self):
         if self.max_token_len is None:
@@ -80,6 +87,13 @@ class Pi0Config(_model.BaseModelConfig):
             raise ValueError("race modulates pi0.5's adaptive RMSNorm; pi0 has none")
         if self.race and self.vlash_branches:
             raise ValueError("race is wired for one action chunk per sample, not vlash_branches")
+        if self.gripper_loss_weight <= 0 or (self.gripper_loss_weight != 1.0 and self.gripper_loss_dim is None):
+            raise ValueError("gripper_loss_weight must be positive, and needs gripper_loss_dim when it is not 1.0")
+        if self.gripper_loss_dim is not None and not 0 <= self.gripper_loss_dim < self.action_dim:
+            raise ValueError(f"gripper_loss_dim {self.gripper_loss_dim} is outside the {self.action_dim} action dims")
+        height, width = self.image_resolution
+        if height != width or height % 14:
+            raise ValueError(f"image_resolution must be square and a multiple of 14, got {self.image_resolution}")
 
     @property
     @override
@@ -96,7 +110,7 @@ class Pi0Config(_model.BaseModelConfig):
 
     @override
     def inputs_spec(self, *, batch_size: int = 1) -> tuple[_model.Observation, _model.Actions]:
-        image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
+        image_spec = jax.ShapeDtypeStruct([batch_size, *self.image_resolution, 3], jnp.float32)
         image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
         # With branches, the state and the action chunk carry a branch axis behind the one observation.
         branch_shape = [self.vlash_branches] if self.vlash_branches else []

@@ -6,6 +6,7 @@ import pytest
 
 import openpi.models.lora as lora
 import openpi.models.model as _model
+import openpi.models.siglip as siglip
 import openpi.shared.download as download
 import openpi.training.config as config
 import openpi.training.weight_loaders as weight_loaders
@@ -67,3 +68,20 @@ def test_rank_32_checkpoint_grows_into_the_real_rank_128_expert():
     assert _lora_size(small, expert=True) == 22_118_400
     assert _lora_size(large, expert=True) == 88_473_600
     assert _lora_size(small, expert=False) == _lora_size(large, expert=False) == 27_869_184
+
+
+def test_224_px_checkpoint_resamples_into_the_real_336_px_model():
+    small = _flat(_real_param_shapes("pi05_yam_stream5_i20_bagging_right_real"))
+    large = _flat(_real_param_shapes("pi05_yam_stream5_i20_bagging_right_real_px336"))
+    saved = {key: np.broadcast_to(np.zeros((), np.float32), leaf.shape) for key, leaf in small.items()}
+
+    changed = {key for key in large if small[key].shape != large[key].shape}
+    assert [key.rsplit("/", 1)[-1] for key in changed] == ["pos_embedding"]
+    (key,) = changed
+    assert small[key].shape == (1, 256, 1152)
+    assert large[key].shape == (1, 576, 1152)
+
+    grown = siglip.resize_posemb(saved, large)
+
+    assert grown.keys() == large.keys()
+    assert all(grown[name].shape == large[name].shape for name in large)

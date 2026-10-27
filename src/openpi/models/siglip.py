@@ -15,6 +15,7 @@
 """A refactored and simplified ViT adoptation for Pi, taken from big_vision."""
 
 from collections.abc import Sequence
+from typing import Any
 
 import flax.linen as nn
 import jax
@@ -371,3 +372,24 @@ def decode_variant(variant):
         # pylint:enable=line-too-long
         **patch,
     }
+
+
+def resize_posemb(loaded: dict[str, Any], reference: dict[str, Any]) -> dict[str, Any]:
+    """Resamples the learned position embedding to the square patch grid `reference` asks for (bicubic over the grid).
+
+    `loaded` and `reference` are flat "a/b/pos_embedding" maps of (1, side * side, width) arrays and shapes.
+    """
+    grown = dict(loaded)
+    for key, value in loaded.items():
+        if key.rsplit("/", 1)[-1] != "pos_embedding" or key not in reference:
+            continue
+        old, new = tuple(np.shape(value)), tuple(reference[key].shape)
+        if old == new:
+            continue
+        old_side, new_side = round(old[1] ** 0.5), round(new[1] ** 0.5)
+        if len(old) != 3 or len(new) != 3 or old[0] != 1 or new[0] != 1 or old[2] != new[2] or old_side**2 != old[1] or new_side**2 != new[1]:
+            raise ValueError(f"{key}: cannot resample a position embedding of shape {old} to {new}")
+        grid = jnp.asarray(value, jnp.float32).reshape(1, old_side, old_side, old[2])
+        resized = jax.image.resize(grid, (1, new_side, new_side, old[2]), method="bicubic")
+        grown[key] = np.asarray(resized, dtype=np.asarray(value).dtype).reshape(new)
+    return grown

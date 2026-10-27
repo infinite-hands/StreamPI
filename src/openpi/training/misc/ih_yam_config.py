@@ -3,6 +3,7 @@
 import dataclasses
 
 from openpi.models.model import IMAGE_KEYS
+from openpi.models.model import IMAGE_RESOLUTION
 import openpi.models.pi0_config as pi0_config
 from openpi.policies.agilex_policy import AgilexInputs
 import openpi.training.optimizer as _optimizer
@@ -41,6 +42,8 @@ HIST_INTERVAL = 10
 # observation half as often. Model shape is untouched -- HIST_HORIZON and ACTION_HORIZON set the
 # token count and KV-cache size -- so fsdp_devices and batch_size below are unchanged.
 HIST_INTERVAL_WIDE = 20
+# A 15-frame cadence (0.5 s) for a serve whose round trip fits it: the right-real recipe only, see cadence_recipes.
+HIST_INTERVAL_MID = 15
 ACTION_HORIZON = 30
 # The reference implementation's offset range (mit-han-lab/vlash, examples/train/*/async*.yaml:
 # max_delay_steps: 8), for a deployment that fixes its lead at this many rows or fewer. The full-window
@@ -60,6 +63,9 @@ RACE_TWIN_BASES: tuple[str, ...] = ("pi05_yam_stream5_i20_bagging_right_real",
 # The action-expert LoRA ranks a recipe can ask for (gemma.get_config), and the recipes that get an `_xr128` twin.
 EXPERT_LORA_VARIANTS = {None: "gemma_300m_lora", 128: "gemma_300m_lora_r128"}
 XR128_TWIN_BASES: tuple[str, ...] = ("pi05_yam_stream5_i20_bagging_right_real",)
+# The recipes that get a `_px336` twin: the cameras read at 336 px (576 tokens per image, a 24 x 24 patch grid).
+PX336_TWIN_BASES: tuple[str, ...] = ("pi05_yam_stream5_i20_bagging_right_real",)
+PX336_RESOLUTION = (336, 336)
 
 
 def yam_repack(cameras: tuple[str, ...] = YAM_CAMERAS, *, vlash_cond_now: bool = False,
@@ -143,7 +149,8 @@ def get_ih_yam_configs():
                       num_train_steps: int = 20_000,
                       encode_only_active_cameras: bool = False,
                       race: bool = False, norm_stats_config: str | None = None,
-                      expert_lora_rank: int | None = None):
+                      expert_lora_rank: int | None = None,
+                      image_resolution: tuple[int, int] | None = None):
         # A masked camera's tokens are padding, so a recipe may skip decoding and encoding them: the same
         # model, one SigLIP pass per frame instead of three and a third of the prefix. Opt-in per config
         # because it changes the model's input layout (not its weights).
@@ -168,6 +175,9 @@ def get_ih_yam_configs():
             vlash_branches=vlash_branches,
             image_keys=image_keys,
             race=race,
+            image_resolution=image_resolution or IMAGE_RESOLUTION,
+            # The driven arm's gripper; its loss weight stays 1.0 until a run raises it (--model.gripper-loss-weight).
+            gripper_loss_dim=max(active_state_dims) if active_state_dims else None,
         )
         return TrainConfig(
             name=name,
@@ -195,7 +205,8 @@ def get_ih_yam_configs():
                 ),
             ),
             weight_loader=weight_loaders.CheckpointWeightLoader(
-                PI05_BASE_PARAMS, expand_lora_rank=expert_lora_rank is not None),
+                PI05_BASE_PARAMS, expand_lora_rank=expert_lora_rank is not None,
+                resize_posemb=image_resolution is not None),
             # LoRA fits one H100 (make_mesh refuses a device count the FSDP count does not divide).
             # The FULL fine-tune does not: at batch 32 with T=5 it ran out of memory on one 80 GB
             # H100 (a 24 GB allocation on top of ~53 GB of fp32 params + grads + Adam state), so it
@@ -307,10 +318,19 @@ def get_ih_yam_configs():
         # norm stats, like the race twin.
         return {**recipe, "name": recipe["name"] + "_xr128", "expert_lora_rank": 128, "norm_stats_config": recipe["name"]}
 
+    def px336_twin(recipe: dict) -> dict:
+        # The recipe with its cameras read at 336 px, warm-started from a 224 px checkpoint of the same recipe: the
+        # loader resamples the position embedding. Unlike the other twins, step 0 is near the checkpoint, not equal.
+        return {**recipe, "name": recipe["name"] + "_px336", "image_resolution": PX336_RESOLUTION,
+                "norm_stats_config": recipe["name"]}
+
     race_twins = [race_twin(recipe) for recipe in recipes if recipe["name"] in RACE_TWIN_BASES]
     xr128_twins = [expert_rank_twin(recipe) for recipe in recipes if recipe["name"] in XR128_TWIN_BASES]
+    px336_twins = [px336_twin(recipe) for recipe in recipes if recipe["name"] in PX336_TWIN_BASES]
+    cadence_recipes = [{**recipe, "name": recipe["name"].replace("_i20_", "_i15_"), "hist_interval": HIST_INTERVAL_MID}
+                       for recipe in recipes if recipe["name"] == "pi05_yam_stream5_i20_bagging_right_real"]
     return [stream_config(**recipe) for recipe in
             recipes + [vlash_twin(recipe) for recipe in recipes] + [vlash_reference_twin(recipe) for recipe in recipes]
             + [vlash_measured_twin(recipe) for recipe in recipes] + [vlash_packed_measured_twin(recipe) for recipe in recipes]
             + [vlash_conditioned_twin(recipe) for recipe in recipes] + [vlash_long_conditioned_twin(recipe) for recipe in recipes]
-            + [vlash_packed_twin(recipe) for recipe in recipes] + race_twins + xr128_twins]
+            + [vlash_packed_twin(recipe) for recipe in recipes] + race_twins + xr128_twins + px336_twins + cadence_recipes]
