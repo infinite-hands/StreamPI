@@ -65,6 +65,9 @@ class Pi0Config(_model.BaseModelConfig):
     # The square size the cameras are resized to, a multiple of SigLIP's 14-pixel patch. Above 224 the learned
     # position embedding is resampled at load (CheckpointWeightLoader.resize_posemb).
     image_resolution: tuple[int, int] = _model.IMAGE_RESOLUTION
+    # Training only: a small crop-and-resize, a light blur and sensor noise on the wrist cameras (model.wrist_degradation),
+    # which otherwise get colour jitter only.
+    wrist_augmentation: bool = False
 
     def __post_init__(self):
         if self.max_token_len is None:

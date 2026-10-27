@@ -8,6 +8,7 @@ import pytest
 
 from openpi.models import model as _model
 from openpi.models import pi0_config as _pi0_config
+from openpi.models import pi0_testing
 
 ACTION_DIM, HORIZON, TOKENS = 14, 4, 16
 CAMERA = "right_wrist_0_rgb"
@@ -74,3 +75,20 @@ def test_a_336_px_model_reads_576_image_tokens_and_resizes_a_224_px_camera():
 
     actions = jnp.zeros((1, HORIZON, ACTION_DIM), dtype=jnp.float32)
     assert np.isfinite(np.asarray(model.compute_loss(jax.random.key(0), _observation(224, frames=2), actions))).all()
+
+
+def test_wrist_augmentation_runs_inside_the_training_loss():
+    key = jax.random.key(0)
+    actions = jnp.zeros((1, HORIZON, ACTION_DIM), dtype=jnp.float32)
+    # Awakened models, so the loss depends on the image at all.
+    augmented = pi0_testing.awaken(_config(wrist_augmentation=True).create(key), jax.random.key(7))
+    plain = pi0_testing.awaken(_config().create(key), jax.random.key(7))
+
+    loss = augmented.compute_loss(key, _observation(224), actions, train=True)
+    reference = plain.compute_loss(key, _observation(224), actions, train=True)
+    evaluation = augmented.compute_loss(key, _observation(224), actions, train=False)
+    evaluation_reference = plain.compute_loss(key, _observation(224), actions, train=False)
+
+    assert np.isfinite(np.asarray(loss)).all()
+    assert not np.allclose(np.asarray(loss), np.asarray(reference), atol=1e-6)
+    assert np.array_equal(np.asarray(evaluation), np.asarray(evaluation_reference))

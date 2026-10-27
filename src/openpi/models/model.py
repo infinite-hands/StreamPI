@@ -160,6 +160,30 @@ class Observation(Generic[ArrayT]):
 Actions = at.Float[ArrayT, "*b ah ad"]
 
 
+def wrist_degradation(
+    rng: at.KeyArrayLike,
+    image: at.Float[ArrayT, "h w c"],
+    *,
+    blur_prob: float = 0.5,
+    sigma_range: tuple[float, float] = (0.3, 1.2),
+    noise_max: float = 0.02,
+) -> at.Float[ArrayT, "h w c"]:
+    """A light blur (with probability `blur_prob`, sigma drawn from `sigma_range` in pixels) and Gaussian sensor noise
+    (std up to `noise_max`) on one [0, 1] image."""
+    blur_rng, sigma_rng, noise_rng, std_rng = jax.random.split(rng, 4)
+    sigma = jnp.where(jax.random.uniform(blur_rng) < blur_prob, jax.random.uniform(sigma_rng, minval=sigma_range[0], maxval=sigma_range[1]), 0.05)
+    taps = jnp.arange(-2, 3, dtype=jnp.float32)
+    kernel = jnp.exp(-(taps**2) / (2 * sigma**2))
+    kernel = kernel / kernel.sum()
+    height, width = image.shape[:2]
+    padded = jnp.pad(image, ((0, 0), (2, 2), (0, 0)), mode="edge")
+    image = sum(kernel[i] * padded[:, i : i + width] for i in range(5))
+    padded = jnp.pad(image, ((2, 2), (0, 0), (0, 0)), mode="edge")
+    image = sum(kernel[i] * padded[i : i + height] for i in range(5))
+    noise = jax.random.uniform(std_rng, maxval=noise_max) * jax.random.normal(noise_rng, image.shape)
+    return jnp.clip(image + noise, 0.0, 1.0)
+
+
 def preprocess_observation(
     rng: at.KeyArrayLike | None,
     observation: Observation,
@@ -167,9 +191,11 @@ def preprocess_observation(
     train: bool = False,
     image_keys: Sequence[str] = IMAGE_KEYS,
     image_resolution: tuple[int, int] = IMAGE_RESOLUTION,
+    wrist_augmentation: bool = False,
 ) -> Observation:
     """Preprocess the observations by performing image augmentations (if train=True), resizing (if necessary), and
-    filling in a default image mask (if necessary).
+    filling in a default image mask (if necessary). `wrist_augmentation` adds a small crop-and-resize, a light random
+    blur and sensor noise to the wrist cameras, which otherwise get colour jitter only.
     """
 
     if not set(image_keys).issubset(observation.images):
@@ -199,11 +225,18 @@ def preprocess_observation(
                     augmax.Rotate((-5, 5)),
                 ]
 
+            if "wrist" in key and wrist_augmentation:
+                height, width = image.shape[1:3]
+                transforms += [augmax.RandomCrop(int(width * 0.97), int(height * 0.97)), augmax.Resize(width, height)]
+
             transforms += [
                 augmax.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5),
             ]
             sub_rngs = jax.random.split(rng, image.shape[0])
             image = jax.vmap(augmax.Chain(*transforms))(sub_rngs, image)
+            if "wrist" in key and wrist_augmentation:
+                degrade_rngs = jax.random.split(jax.random.fold_in(rng, 1), image.shape[0])
+                image = jax.vmap(wrist_degradation)(degrade_rngs, image)
 
             # Back to [-1, 1].
             image = image * 2.0 - 1.0

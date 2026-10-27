@@ -165,6 +165,7 @@ class Pi0(_model.BaseModel):
         self.hist_horizon = config.hist_horizon
         self.image_keys = tuple(config.image_keys)
         self.image_resolution = tuple(config.image_resolution)
+        self.wrist_augmentation = config.wrist_augmentation
         self.loss_weights = None if config.gripper_loss_weight == 1.0 else tuple(
             config.gripper_loss_weight if dim == config.gripper_loss_dim else 1.0 for dim in range(config.action_dim))
 
@@ -329,7 +330,8 @@ class Pi0(_model.BaseModel):
         """(L_full per row, L_aux per row, L_timing); the last two are None for a model without RACE."""
         preprocess_rng, noise_rng, time_rng, mask_rng = jax.random.split(rng, 4)
         observation = _model.preprocess_observation(
-            preprocess_rng, observation, train=train, image_keys=self.image_keys, image_resolution=self.image_resolution)
+            preprocess_rng, observation, train=train, image_keys=self.image_keys, image_resolution=self.image_resolution,
+            wrist_augmentation=self.wrist_augmentation)
 
         b, ah, ad = actions.shape
         batch_shape = actions.shape[:-2]
@@ -418,7 +420,8 @@ class Pi0(_model.BaseModel):
             raise ValueError("branched samples need state_cond: the prompt carries no per-branch state")
         preprocess_rng, noise_rng, time_rng, mask_rng = jax.random.split(rng, 4)
         observation = _model.preprocess_observation(
-            preprocess_rng, observation, train=train, image_keys=self.image_keys, image_resolution=self.image_resolution)
+            preprocess_rng, observation, train=train, image_keys=self.image_keys, image_resolution=self.image_resolution,
+            wrist_augmentation=self.wrist_augmentation)
 
         b, n, ah, ad = actions.shape
         noise = jax.random.normal(noise_rng, actions.shape)
