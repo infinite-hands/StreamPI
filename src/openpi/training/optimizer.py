@@ -1,6 +1,8 @@
 import dataclasses
+import re
 from typing import Protocol, runtime_checkable
 
+import jax
 import jax.numpy as jnp
 import optax
 
@@ -107,3 +109,25 @@ def create_optimizer(
 ) -> optax.GradientTransformation:
     lr = lr_schedule.create()
     return optimizer.create(lr, weight_decay_mask=weight_decay_mask)
+
+
+# SigLIP sits under PaliGemma/img (pi0.py), outside the llm subtree the freeze filter matches.
+VISION_PARAMS_REGEX = ".*PaliGemma/img/.*"
+
+
+def _path_labels(path_regex: str):
+    pattern = re.compile(path_regex)
+
+    def label(path: tuple, _leaf: object) -> str:
+        parts = [str(getattr(key, "key", getattr(key, "name", getattr(key, "idx", key)))) for key in path]
+        return "scaled" if pattern.fullmatch("/".join(parts)) else "same"
+
+    return lambda params: jax.tree_util.tree_map_with_path(label, params)
+
+
+def scale_updates(tx: optax.GradientTransformation, scale: float, path_regex: str) -> optax.GradientTransformation:
+    """`tx` with its updates multiplied by `scale` for the parameters whose "/"-joined path fully matches `path_regex`.
+
+    Adam's step does not shrink with the gradient, so scaling the update is what scales a block's learning rate.
+    """
+    return optax.chain(tx, optax.multi_transform({"scaled": optax.scale(scale), "same": optax.identity()}, _path_labels(path_regex)))

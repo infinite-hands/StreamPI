@@ -57,6 +57,9 @@ RACE_TARGETS_ROOT = "/misc/race-targets"
 # The recipes that get a `_race` twin (race_twin).
 RACE_TWIN_BASES: tuple[str, ...] = ("pi05_yam_stream5_i20_bagging_right_real",
                                    "pi05_yam_stream5_i20_bagging_left_real")
+# The action-expert LoRA ranks a recipe can ask for (gemma.get_config), and the recipes that get an `_xr128` twin.
+EXPERT_LORA_VARIANTS = {None: "gemma_300m_lora", 128: "gemma_300m_lora_r128"}
+XR128_TWIN_BASES: tuple[str, ...] = ("pi05_yam_stream5_i20_bagging_right_real",)
 
 
 def yam_repack(cameras: tuple[str, ...] = YAM_CAMERAS, *, vlash_cond_now: bool = False,
@@ -139,12 +142,16 @@ def get_ih_yam_configs():
                       vlash_state_source: str = "action", vlash_cond_now: bool = False,
                       num_train_steps: int = 20_000,
                       encode_only_active_cameras: bool = False,
-                      race: bool = False, norm_stats_config: str | None = None):
+                      race: bool = False, norm_stats_config: str | None = None,
+                      expert_lora_rank: int | None = None):
         # A masked camera's tokens are padding, so a recipe may skip decoding and encoding them: the same
         # model, one SigLIP pass per frame instead of three and a third of the prefix. Opt-in per config
         # because it changes the model's input layout (not its weights).
         if encode_only_active_cameras and active_image_keys is None:
             raise ValueError(f"{name}: encode_only_active_cameras needs active_image_keys")
+        if expert_lora_rank not in EXPERT_LORA_VARIANTS or (expert_lora_rank is not None and not lora):
+            raise ValueError(f"{name}: expert_lora_rank must be None or one of "
+                             f"{sorted(rank for rank in EXPERT_LORA_VARIANTS if rank)}, and needs lora")
         cameras = {image_key: camera for camera, image_key in AgilexInputs.IMAGE_KEY_BY_CAMERA.items()}
         image_keys = tuple(key for key in IMAGE_KEYS if not encode_only_active_cameras or key in active_image_keys)
         kept_cameras = tuple(cameras[key] for key in image_keys)
@@ -153,7 +160,7 @@ def get_ih_yam_configs():
             action_horizon=ACTION_HORIZON,
             hist_horizon=HIST_HORIZON,
             paligemma_variant="gemma_2b_lora" if lora else "gemma_2b",
-            action_expert_variant="gemma_300m_lora" if lora else "gemma_300m",
+            action_expert_variant=EXPERT_LORA_VARIANTS[expert_lora_rank] if lora else "gemma_300m",
             # With the state out of the prompt, the single-arm recipe's state mask moves to the conditioning.
             state_cond=state_cond,
             state_cond_dims=(None if not state_cond or active_state_dims is None else
@@ -187,7 +194,8 @@ def get_ih_yam_configs():
                     decode_only_hist_cameras=encode_only_active_cameras,
                 ),
             ),
-            weight_loader=weight_loaders.CheckpointWeightLoader(PI05_BASE_PARAMS),
+            weight_loader=weight_loaders.CheckpointWeightLoader(
+                PI05_BASE_PARAMS, expand_lora_rank=expert_lora_rank is not None),
             # LoRA fits one H100 (make_mesh refuses a device count the FSDP count does not divide).
             # The FULL fine-tune does not: at batch 32 with T=5 it ran out of memory on one 80 GB
             # H100 (a 24 GB allocation on top of ~53 GB of fp32 params + grads + Adam state), so it
@@ -293,9 +301,16 @@ def get_ih_yam_configs():
         return {**recipe, "name": recipe["name"] + "_race", "race": True, "norm_stats_config": recipe["name"],
                 "encode_only_active_cameras": recipe.get("active_image_keys") is not None}
 
+    def expert_rank_twin(recipe: dict) -> dict:
+        # The recipe with a rank-128 expert LoRA, warm-started from a rank-32 checkpoint of the same recipe: the loader
+        # grows the trained adapters and the new ranks add nothing, so step 0 is the checkpoint. It keeps the recipe's
+        # norm stats, like the race twin.
+        return {**recipe, "name": recipe["name"] + "_xr128", "expert_lora_rank": 128, "norm_stats_config": recipe["name"]}
+
     race_twins = [race_twin(recipe) for recipe in recipes if recipe["name"] in RACE_TWIN_BASES]
+    xr128_twins = [expert_rank_twin(recipe) for recipe in recipes if recipe["name"] in XR128_TWIN_BASES]
     return [stream_config(**recipe) for recipe in
             recipes + [vlash_twin(recipe) for recipe in recipes] + [vlash_reference_twin(recipe) for recipe in recipes]
             + [vlash_measured_twin(recipe) for recipe in recipes] + [vlash_packed_measured_twin(recipe) for recipe in recipes]
             + [vlash_conditioned_twin(recipe) for recipe in recipes] + [vlash_long_conditioned_twin(recipe) for recipe in recipes]
-            + [vlash_packed_twin(recipe) for recipe in recipes] + race_twins]
+            + [vlash_packed_twin(recipe) for recipe in recipes] + race_twins + xr128_twins]

@@ -52,7 +52,7 @@ class Config:
     lora_configs: dict[str, lora.LoRAConfig] = dataclasses.field(default_factory=dict)
 
 
-Variant = Literal["dummy", "gemma_300m", "gemma_300m_lora", "gemma_2b", "gemma_2b_lora"]
+Variant = Literal["dummy", "gemma_300m", "gemma_300m_lora", "gemma_300m_lora_r128", "gemma_2b", "gemma_2b_lora"]
 
 
 def get_config(variant: Variant) -> Config:
@@ -105,6 +105,17 @@ def get_config(variant: Variant) -> Config:
             num_kv_heads=1,
             head_dim=256,
             lora_configs={"attn": lora.LoRAConfig(rank=32, alpha=32.0), "ffn": lora.LoRAConfig(rank=32, alpha=32.0)},
+        )
+    if variant == "gemma_300m_lora_r128":
+        # alpha equals rank, so the scale stays 1.0 and a rank-32 checkpoint grows into it unchanged (lora.expand_rank).
+        return Config(
+            width=1024,
+            depth=18,
+            mlp_dim=4096,
+            num_heads=8,
+            num_kv_heads=1,
+            head_dim=256,
+            lora_configs={"attn": lora.LoRAConfig(rank=128, alpha=128.0), "ffn": lora.LoRAConfig(rank=128, alpha=128.0)},
         )
     raise ValueError(f"Unknown variant: {variant}")
 

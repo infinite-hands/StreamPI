@@ -6,6 +6,7 @@ from typing import Protocol, runtime_checkable
 import flax.traverse_util
 import numpy as np
 
+import openpi.models.lora as _lora
 import openpi.models.model as _model
 from openpi.models.pi0_config import RACE_PARAMS_REGEX
 import openpi.shared.array_typing as at
@@ -47,10 +48,15 @@ class CheckpointWeightLoader(WeightLoader):
     """
 
     params_path: str
+    # Grow the checkpoint's LoRA weights to this model's larger rank (lora.expand_rank) instead of failing the
+    # shape check, for a config whose LoRA is bigger than the run the checkpoint came from.
+    expand_lora_rank: bool = False
 
     def load(self, params: at.Params) -> at.Params:
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
         loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
+        if self.expand_lora_rank:
+            loaded_params = _expand_lora_rank(loaded_params, params)
         # Add all missing LoRA weights, pi0.5's optional state-conditioning MLP (Pi0Config.state_cond) and RACE's
         # weights (Pi0Config.race), which a base checkpoint does not carry; the latter two start the model as the
         # checkpoint was (zero-initialised outputs).
@@ -75,6 +81,13 @@ class PaliGemmaWeightLoader(WeightLoader):
         loaded_params = {"PaliGemma": flax.traverse_util.unflatten_dict(flat_params, sep="/")["params"]}
         # Add all missing weights.
         return _merge_params(loaded_params, params, missing_regex=".*")
+
+
+def _expand_lora_rank(loaded_params: at.Params, params: at.Params) -> at.Params:
+    grown = _lora.expand_rank(
+        flax.traverse_util.flatten_dict(loaded_params, sep="/"), flax.traverse_util.flatten_dict(params, sep="/")
+    )
+    return flax.traverse_util.unflatten_dict(grown, sep="/")
 
 
 def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex: str) -> at.Params:

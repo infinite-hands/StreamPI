@@ -1,9 +1,11 @@
 import math
 import re
+from typing import Any
 
 import flax.linen as nn
 import flax.struct as struct
 import jax.numpy as jnp
+import numpy as np
 
 import openpi.shared.array_typing as at
 
@@ -146,3 +148,35 @@ class FeedForward(nn.Module):
         if lora_weights is None:
             return base
         return base + jnp.dot(jnp.dot(x, lora_weights[0].astype(x.dtype)), lora_weights[1].astype(x.dtype))
+
+
+def expand_rank(
+    loaded: dict[str, Any], reference: dict[str, Any], *, init_std: float = 0.01, seed: int = 0
+) -> dict[str, Any]:
+    """Grows trained LoRA weights to the larger rank `reference` asks for, leaving the model's output unchanged.
+
+    `loaded` maps "a/b/lora_a" paths to arrays and `reference` maps the same paths to anything with a `.shape`.
+    On the default `LoRAConfig.axes`, `lora_a` gains random columns and `lora_b` gains zero rows, so the new ranks
+    add nothing until they train. The output is unchanged only while alpha / rank is equal in both configs.
+    """
+    rng = np.random.default_rng(seed)
+    grown = dict(loaded)
+    for key in sorted(loaded):
+        name = key.rsplit("/", 1)[-1]
+        if key not in reference or not name.endswith(("lora_a", "lora_b")):
+            continue
+        old, new = tuple(np.shape(loaded[key])), tuple(reference[key].shape)
+        if old == new:
+            continue
+        is_a = name.endswith("lora_a")
+        if len(old) != len(new):
+            raise ValueError(f"{key}: cannot grow LoRA weights of shape {old} to {new}")
+        axis = len(old) - 1 if is_a else len(old) - 2
+        if old[:axis] + old[axis + 1 :] != new[:axis] + new[axis + 1 :] or new[axis] < old[axis]:
+            raise ValueError(f"{key}: cannot grow LoRA weights of shape {old} to {new}")
+        value = np.asarray(loaded[key])
+        extra_shape = list(new)
+        extra_shape[axis] = new[axis] - old[axis]
+        extra = rng.normal(0.0, init_std, extra_shape) if is_a else np.zeros(extra_shape)
+        grown[key] = np.concatenate([value, extra.astype(value.dtype)], axis=axis)
+    return grown
