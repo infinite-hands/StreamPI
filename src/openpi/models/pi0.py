@@ -559,15 +559,50 @@ class Pi0(_model.BaseModel):
     ) -> _model.Actions:
         observation = _model.preprocess_observation(
             None, observation, train=False, image_keys=self.image_keys, image_resolution=self.image_resolution)
-        # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
-        # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
-        dt = -1.0 / num_steps
         batch_size = observation.state.shape[0]
         if noise is None:
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
+        prefix_mask, kv_cache, prior = self._encode_prefix(observation, noise, memory)
+        x_0 = self._denoise(observation, prefix_mask, kv_cache, noise, num_steps, prior)
+        if prior is None:
+            return x_0, memory
+        # A RACE model also returns the head's scores for the rows of x_0 (Policy.infer: "transition_scores").
+        return x_0, memory, prior
+
+    def sample_action_candidates(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        num_candidates: int,
+        num_steps: int | at.Int[at.Array, ""] = 10,
+        noise: at.Float[at.Array, "b n ah ad"] | None = None,
+        memory: dict = None,
+    ) -> tuple[at.Float[at.Array, "b n ah ad"], dict]:
+        """`num_candidates` action chunks per observation from ONE prefix pass (the memory is saved once, as in
+        sample_actions), so a caller can pick among them (chunk_selection). Candidate i of row b is what
+        sample_actions returns for noise[b, i]."""
+        if self.race:
+            raise NotImplementedError("candidates are not wired for RACE models")
+        observation = _model.preprocess_observation(
+            None, observation, train=False, image_keys=self.image_keys, image_resolution=self.image_resolution)
+        batch_size = observation.state.shape[0]
+        if noise is None:
+            noise = jax.random.normal(rng, (batch_size, num_candidates, self.action_horizon, self.action_dim))
+        if noise.shape[:2] != (batch_size, num_candidates):
+            raise ValueError(f"noise must be (batch, num_candidates, ...) = ({batch_size}, {num_candidates}, ...), got {noise.shape}")
+        prefix_mask, kv_cache, _ = self._encode_prefix(observation, noise[:, 0], memory)
+        tiled = jax.tree.map(lambda leaf: jnp.repeat(leaf, num_candidates, axis=0), observation)
+        tiled_cache = jax.tree.map(lambda leaf: jnp.repeat(leaf, num_candidates, axis=1), kv_cache)
+        flat_noise = noise.reshape(batch_size * num_candidates, self.action_horizon, self.action_dim)
+        x_0 = self._denoise(tiled, jnp.repeat(prefix_mask, num_candidates, axis=0), tiled_cache, flat_noise, num_steps, None)
+        return x_0.reshape(batch_size, num_candidates, self.action_horizon, self.action_dim), memory
+
+    def _encode_prefix(self, observation, noise, memory):
+        """The prefix pass of a serving call: fills the KV cache, saves it as the client's memory, and (RACE) computes
+        the prior from the noise the denoising loop starts from. Returns (prefix_mask, kv_cache, prior)."""
         # first fill KV cache with a forward pass of the prefix
- 
         memory_tokens, memory_kv_cache, memory_prefix_mask = self.fetch_memory(memory)
 
         # if jax.process_index() == 0:
@@ -596,6 +631,11 @@ class Pi0(_model.BaseModel):
         prior = None
         if self.race:
             prior = self.race_prior(observation, prefix_mask, kv_cache, noise, current_prefix_len=prefix_tokens.shape[1])
+        return prefix_mask, kv_cache, prior
+
+    def _denoise(self, observation, prefix_mask, kv_cache, noise, num_steps, prior):
+        dt = -1.0 / num_steps
+        batch_size = noise.shape[0]
 
         def step(carry):
             x_t, time = carry
@@ -611,10 +651,7 @@ class Pi0(_model.BaseModel):
 
         with at.disable_typechecking():
             x_0, _ = jax.lax.while_loop(cond, step, (noise, jnp.float32(1.0)))
-        if prior is None:
-            return x_0, memory
-        # A RACE model also returns the head's scores for the rows of x_0 (Policy.infer: "transition_scores").
-        return x_0, memory, prior
+        return x_0
 
     def _suffix_pass(self, observation, prefix_mask, kv_cache, x_t, timestep, race_cond=None):
         """One action-expert pass over a cached prefix: (velocity, the final-layer hidden states of the action
