@@ -1,4 +1,5 @@
 from collections.abc import Iterator, Sequence
+import dataclasses
 import json
 import logging
 import multiprocessing
@@ -471,7 +472,8 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
             *data_config.repack_transforms.inputs,
             *data_config.data_transforms.inputs,
             _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
-            *data_config.model_transforms.inputs,
+            *_transforms.with_state_augmentation(
+                data_config.model_transforms.inputs, data_config.state_dropout, data_config.state_noise_std),
         ],
     )
 
@@ -525,6 +527,8 @@ def create_data_loader(
         framework: The framework to use ("jax" or "pytorch").
     """
     data_config = config.data.create(config.assets_dirs, config.model)
+    data_config = dataclasses.replace(
+        data_config, state_dropout=config.state_dropout, state_noise_std=config.state_noise_std)
     logging.info(f"data_config: {data_config}")
 
     if data_config.rlds_data_dir is not None:

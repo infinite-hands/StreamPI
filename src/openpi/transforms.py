@@ -485,6 +485,11 @@ class TokenizePrompt(DataTransformFn):
     active_state_dims: tuple[int, ...] | None = None
     # pi0.5 with the state out of the prompt (Pi0Config.state_cond): "Task: ...;\nAction: ".
     task_only: bool = False
+    # Training only (the loader sets them): with probability state_dropout the tokenized state is the normalized
+    # midpoint, as if unknown, so the policy cannot lean on it alone; state_noise_std adds Gaussian noise (in
+    # normalized units) to the dims the model may see. data["state"] itself is left real.
+    state_dropout: float = 0.0
+    state_noise_std: float = 0.0
 
     def __post_init__(self):
         if self.active_state_dims is not None and not self.discrete_state_input:
@@ -504,6 +509,13 @@ class TokenizePrompt(DataTransformFn):
                 keep = np.zeros(state.shape[-1], dtype=bool)
                 keep[list(self.active_state_dims)] = True
                 state = np.where(keep, state, 0.0)
+            else:
+                keep = np.ones(np.shape(state)[-1], dtype=bool)
+            if self.state_noise_std > 0:
+                noise = np.asarray([random.gauss(0.0, self.state_noise_std) for _ in keep])
+                state = np.where(keep, np.clip(np.asarray(state) + noise, -1.0, 1.0), 0.0)
+            if self.state_dropout > 0 and random.random() < self.state_dropout:
+                state = np.zeros_like(state)
         else:
             state = None
 
@@ -512,6 +524,26 @@ class TokenizePrompt(DataTransformFn):
 
         tokens, token_masks = self.tokenizer.tokenize(prompt, state, task_only=self.task_only)
         return {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
+
+
+def with_state_augmentation(
+    transforms: Sequence[DataTransformFn], state_dropout: float, state_noise_std: float
+) -> list[DataTransformFn]:
+    """`transforms` with the text-state augmentation switched on in its TokenizePrompt (a no-op when both are 0)."""
+    if not (state_dropout or state_noise_std):
+        return list(transforms)
+    out, found = [], False
+    for transform in transforms:
+        if isinstance(transform, TokenizePrompt):
+            if not transform.discrete_state_input:
+                raise ValueError("state_dropout and state_noise_std need a config that carries the state as text, not state_cond")
+            out.append(dataclasses.replace(transform, state_dropout=state_dropout, state_noise_std=state_noise_std))
+            found = True
+        else:
+            out.append(transform)
+    if not found:
+        raise ValueError("state_dropout and state_noise_std need a TokenizePrompt to act on")
+    return out
 
 
 @dataclasses.dataclass(frozen=True)

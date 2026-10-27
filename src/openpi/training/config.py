@@ -112,6 +112,10 @@ class DataConfig:
     # Decode only the video columns in hist_sequence_keys. A recipe that masks a camera still pays
     # its decode otherwise: LeRobot decodes every video column for every sample.
     decode_only_hist_cameras: bool = False
+    # Training-time state augmentation on the text state (transforms.TokenizePrompt); the trainer sets these from
+    # TrainConfig, so serving never sees them.
+    state_dropout: float = 0.0
+    state_noise_std: float = 0.0
     # RACE (Pi0Config.race): the directory of this dataset's transition-target sidecar (transforms.RaceTargets;
     # meta.json + episode_index/frame_index/transition/weight .npy by global frame index). Frames are then drawn
     # with probability proportional to its weight. None: no RACE targets, uniform sampling.
@@ -671,6 +675,11 @@ class TrainConfig:
     ema_decay: float | None = 0.99
     # Multiplies the vision tower's (SigLIP's) learning rate; 1.0 leaves the optimizer exactly as it was.
     vision_lr_scale: float = 1.0
+    # Hide the robot state from the model (set it to the normalized midpoint) on this fraction of training samples,
+    # and add noise of this std to it on the rest, so the policy has to look at the cameras. Needs a config that
+    # carries the state as text.
+    state_dropout: float = 0.0
+    state_noise_std: float = 0.0
 
     # Specifies which weights should be frozen.
     freeze_filter: tyro.conf.Suppress[Filter] = dataclasses.field(default_factory=nnx.Nothing)
