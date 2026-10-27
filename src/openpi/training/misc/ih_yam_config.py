@@ -69,6 +69,9 @@ PX336_RESOLUTION = (336, 336)
 # The recipes that get a `_cam2` twin: the driven wrist camera plus the overhead camera (cam_high), for global bag context.
 CAM2_TWIN_BASES: tuple[str, ...] = ("pi05_yam_stream5_i20_bagging_right_real",)
 CAM2_EXTRA_IMAGE_KEY = "base_0_rgb"
+# The recipes that get a `_dino` twin: a frozen DINOv2-base branch added to SigLIP through a zero-initialised projection.
+DINO_TWIN_BASES: tuple[str, ...] = ("pi05_yam_stream5_i20_bagging_right_real",)
+DINO_VARIANT = "base"
 
 
 def yam_repack(cameras: tuple[str, ...] = YAM_CAMERAS, *, vlash_cond_now: bool = False,
@@ -153,7 +156,8 @@ def get_ih_yam_configs():
                       encode_only_active_cameras: bool = False,
                       race: bool = False, norm_stats_config: str | None = None,
                       expert_lora_rank: int | None = None,
-                      image_resolution: tuple[int, int] | None = None):
+                      image_resolution: tuple[int, int] | None = None,
+                      dino_variant: str | None = None):
         # A masked camera's tokens are padding, so a recipe may skip decoding and encoding them: the same
         # model, one SigLIP pass per frame instead of three and a third of the prefix. Opt-in per config
         # because it changes the model's input layout (not its weights).
@@ -179,6 +183,7 @@ def get_ih_yam_configs():
             image_keys=image_keys,
             race=race,
             image_resolution=image_resolution or IMAGE_RESOLUTION,
+            dino_variant=dino_variant,
             # The driven arm's gripper; its loss weight stays 1.0 until a run raises it (--model.gripper-loss-weight).
             gripper_loss_dim=max(active_state_dims) if active_state_dims else None,
         )
@@ -210,7 +215,7 @@ def get_ih_yam_configs():
             ),
             weight_loader=weight_loaders.CheckpointWeightLoader(
                 PI05_BASE_PARAMS, expand_lora_rank=expert_lora_rank is not None,
-                resize_posemb=image_resolution is not None),
+                resize_posemb=image_resolution is not None, dino_variant=dino_variant),
             # LoRA fits one H100 (make_mesh refuses a device count the FSDP count does not divide).
             # The FULL fine-tune does not: at batch 32 with T=5 it ran out of memory on one 80 GB
             # H100 (a 24 GB allocation on top of ~53 GB of fp32 params + grads + Adam state), so it
@@ -334,14 +339,20 @@ def get_ih_yam_configs():
         return {**recipe, "name": recipe["name"] + "_cam2", "norm_stats_config": recipe["name"],
                 "active_image_keys": recipe["active_image_keys"] | {CAM2_EXTRA_IMAGE_KEY}}
 
+    def dino_twin(recipe: dict) -> dict:
+        # The recipe with a DINOv2 branch, warm-started from a checkpoint of the same recipe: the projection starts at zero, so
+        # step 0 is the checkpoint. The DINOv2 weights come from Hugging Face on a first run, from the checkpoint after.
+        return {**recipe, "name": recipe["name"] + "_dino", "dino_variant": DINO_VARIANT, "norm_stats_config": recipe["name"]}
+
     race_twins = [race_twin(recipe) for recipe in recipes if recipe["name"] in RACE_TWIN_BASES]
     xr128_twins = [expert_rank_twin(recipe) for recipe in recipes if recipe["name"] in XR128_TWIN_BASES]
     px336_twins = [px336_twin(recipe) for recipe in recipes if recipe["name"] in PX336_TWIN_BASES]
     cam2_twins = [two_camera_twin(recipe) for recipe in recipes if recipe["name"] in CAM2_TWIN_BASES]
+    dino_twins = [dino_twin(recipe) for recipe in recipes if recipe["name"] in DINO_TWIN_BASES]
     cadence_recipes = [{**recipe, "name": recipe["name"].replace("_i20_", "_i15_"), "hist_interval": HIST_INTERVAL_MID}
                        for recipe in recipes if recipe["name"] == "pi05_yam_stream5_i20_bagging_right_real"]
     return [stream_config(**recipe) for recipe in
             recipes + [vlash_twin(recipe) for recipe in recipes] + [vlash_reference_twin(recipe) for recipe in recipes]
             + [vlash_measured_twin(recipe) for recipe in recipes] + [vlash_packed_measured_twin(recipe) for recipe in recipes]
             + [vlash_conditioned_twin(recipe) for recipe in recipes] + [vlash_long_conditioned_twin(recipe) for recipe in recipes]
-            + [vlash_packed_twin(recipe) for recipe in recipes] + race_twins + xr128_twins + px336_twins + cam2_twins + cadence_recipes]
+            + [vlash_packed_twin(recipe) for recipe in recipes] + race_twins + xr128_twins + px336_twins + cam2_twins + dino_twins + cadence_recipes]

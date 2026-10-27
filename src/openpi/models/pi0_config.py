@@ -7,6 +7,7 @@ import jax.numpy as jnp
 from typing_extensions import override
 
 from openpi.models import model as _model
+import openpi.models.dinov2 as _dinov2
 import openpi.models.gemma as _gemma
 from openpi.shared import array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
@@ -68,6 +69,10 @@ class Pi0Config(_model.BaseModelConfig):
     # Training only: a small crop-and-resize, a light blur and sensor noise on the wrist cameras (model.wrist_degradation),
     # which otherwise get colour jitter only.
     wrist_augmentation: bool = False
+    # A DINOv2 branch ("small", "base" or "large"): its patch tokens, through a zero-initialised projection, are added to
+    # SigLIP's, so a model with it starts as the model without it. The backbone is frozen unless dino_trainable.
+    dino_variant: str | None = None
+    dino_trainable: bool = False
 
     def __post_init__(self):
         if self.max_token_len is None:
@@ -94,6 +99,8 @@ class Pi0Config(_model.BaseModelConfig):
             raise ValueError("gripper_loss_weight must be positive, and needs gripper_loss_dim when it is not 1.0")
         if self.gripper_loss_dim is not None and not 0 <= self.gripper_loss_dim < self.action_dim:
             raise ValueError(f"gripper_loss_dim {self.gripper_loss_dim} is outside the {self.action_dim} action dims")
+        if self.dino_variant is not None:
+            _dinov2.get_config(self.dino_variant)
         height, width = self.image_resolution
         if height != width or height % 14:
             raise ValueError(f"image_resolution must be square and a multiple of 14, got {self.image_resolution}")
@@ -133,6 +140,16 @@ class Pi0Config(_model.BaseModelConfig):
 
     def get_freeze_filter(self) -> nnx.filterlib.Filter:
         """Returns the freeze filter based on the model config."""
+        frozen = []
+        if (llm := self._llm_freeze_filter()) is not nnx.Nothing:
+            frozen.append(llm)
+        if self.dino_variant is not None and not self.dino_trainable:
+            frozen.append(nnx_utils.PathRegex(DINO_BACKBONE_REGEX))
+        if not frozen:
+            return nnx.Nothing
+        return frozen[0] if len(frozen) == 1 else nnx.Any(*frozen)
+
+    def _llm_freeze_filter(self) -> nnx.filterlib.Filter:
         filters = []
         has_lora = False
         gemma_params_filter = nnx_utils.PathRegex(".*llm.*")
@@ -168,6 +185,8 @@ class Pi0Config(_model.BaseModelConfig):
 
 # Every RACE parameter's path contains this (Pi0's race_* attributes, gemma's race_modulation).
 RACE_PARAMS_REGEX = ".*race_.*"
+# The DINOv2 backbone's parameters sit under dino/; its projection into SigLIP's tokens, dino_proj/, always trains.
+DINO_BACKBONE_REGEX = ".*dino/.*"
 
 
 @dataclasses.dataclass(frozen=True)

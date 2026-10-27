@@ -11,6 +11,7 @@ from typing_extensions import override
 
 from openpi.models import model as _model
 from openpi.models import pi0_config
+import openpi.models.dinov2 as _dinov2
 import openpi.models.gemma as _gemma
 import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
@@ -169,6 +170,16 @@ class Pi0(_model.BaseModel):
         self.loss_weights = None if config.gripper_loss_weight == 1.0 else tuple(
             config.gripper_loss_weight if dim == config.gripper_loss_dim else 1.0 for dim in range(config.action_dim))
 
+        # Created last, so every parameter above initialises exactly as it does without the branch. dino_proj starts at
+        # zero: a model with a DINOv2 branch is the model without it until the projection trains.
+        self.dino = None
+        if config.dino_variant is not None:
+            dino_config = _dinov2.get_config(config.dino_variant)
+            self.dino = nnx_bridge.ToNNX(_dinov2.Dinov2(dino_config, dtype_mm=config.dtype))
+            self.dino.lazy_init(next(iter(config.fake_obs().images.values())), rngs=rngs)
+            self.dino_proj = nnx.Linear(
+                dino_config.width, paligemma_config.width, use_bias=False, kernel_init=nnx.initializers.zeros_init(), rngs=rngs)
+
     @at.typecheck
     def embed_prefix(
         self, obs: _model.Observation,
@@ -184,6 +195,8 @@ class Pi0(_model.BaseModel):
             bs, T = image.shape[0], image.shape[1]
             image = image.reshape(bs*T, image.shape[2], image.shape[3], image.shape[4])
             image_tokens, _ = self.PaliGemma.img(image, train=False)
+            if self.dino is not None:
+                image_tokens = image_tokens + self.dino_proj(self.dino(image)[:, 1:]).astype(image_tokens.dtype)
             image_tokens = image_tokens.reshape(bs, T, image_tokens.shape[1], image_tokens.shape[2])
     
             all_image_tokens[name] = image_tokens
@@ -476,6 +489,8 @@ class Pi0(_model.BaseModel):
             bs, T = image.shape[0], image.shape[1]
             image = image.reshape(bs*T, image.shape[2], image.shape[3], image.shape[4])
             image_tokens, _ = self.PaliGemma.img(image, train=False)
+            if self.dino is not None:
+                image_tokens = image_tokens + self.dino_proj(self.dino(image)[:, 1:]).astype(image_tokens.dtype)
             image_tokens = image_tokens.reshape(bs, T, image_tokens.shape[1], image_tokens.shape[2])
     
             all_image_tokens[name] = image_tokens

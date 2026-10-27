@@ -6,6 +6,7 @@ from typing import Protocol, runtime_checkable
 import flax.traverse_util
 import numpy as np
 
+import openpi.models.dinov2 as _dinov2
 import openpi.models.lora as _lora
 import openpi.models.model as _model
 from openpi.models.pi0_config import RACE_PARAMS_REGEX
@@ -55,10 +56,17 @@ class CheckpointWeightLoader(WeightLoader):
     # Resample SigLIP's learned position embedding to this model's image size (siglip.resize_posemb), for a config
     # that reads larger images than the run the checkpoint came from.
     resize_posemb: bool = False
+    # Add DINOv2 weights (a Hugging Face repo id, or a local directory with model.safetensors) for a config with a
+    # DINOv2 branch, unless the checkpoint already carries a trained branch: a warm start keeps its own.
+    dino_variant: str | None = None
+    dino_weights: str | None = None
 
     def load(self, params: at.Params) -> at.Params:
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
         loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
+        if self.dino_variant is not None and "dino" not in loaded_params:
+            source = self.dino_weights or _dinov2.HF_REPOS[self.dino_variant]
+            loaded_params = {**loaded_params, "dino": _dinov2.load_hf_params(source, _dinov2.get_config(self.dino_variant))}
         grows = [grow for grow, wanted in ((_lora.expand_rank, self.expand_lora_rank),
                                            (_siglip.resize_posemb, self.resize_posemb)) if wanted]
         if grows:
@@ -67,7 +75,7 @@ class CheckpointWeightLoader(WeightLoader):
         # weights (Pi0Config.race), which a base checkpoint does not carry; the latter two start the model as the
         # checkpoint was (zero-initialised outputs).
         return _merge_params(loaded_params, params,
-                             missing_regex=f".*lora.*|.*state_(proj|mlp_in|mlp_out).*|{RACE_PARAMS_REGEX}")
+                             missing_regex=f".*lora.*|.*state_(proj|mlp_in|mlp_out).*|.*dino_proj.*|{RACE_PARAMS_REGEX}")
 
 
 @dataclasses.dataclass(frozen=True)
