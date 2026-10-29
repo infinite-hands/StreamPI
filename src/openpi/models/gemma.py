@@ -268,9 +268,9 @@ class Attention(nn.Module):
                     # was, and a bank with no valid token adds nothing whatever the gate.
                     bank, bank_mask = memory_bank
                     kv_width = config.num_kv_heads * config.head_dim
-                    k_memory = nn.Dense(kv_width, use_bias=False, name="memory_k")(bank).reshape(
+                    k_memory = nn.Dense(kv_width, use_bias=False, dtype=dtype, name="memory_k")(bank).reshape(
                         *bank.shape[:2], config.num_kv_heads, config.head_dim)
-                    v_memory = nn.Dense(kv_width, use_bias=False, name="memory_v")(bank).reshape(
+                    v_memory = nn.Dense(kv_width, use_bias=False, dtype=dtype, name="memory_v")(bank).reshape(
                         *bank.shape[:2], config.num_kv_heads, config.head_dim)
                     q_memory = einops.rearrange(q_unrotated[:, start:end], "B T (K G) H -> B T K G H", K=config.num_kv_heads)
                     memory_logits = jnp.einsum("BTKGH,BLKH->BKGTL", q_memory, k_memory, preferred_element_type=jnp.float32)
@@ -279,7 +279,7 @@ class Attention(nn.Module):
                     read = jnp.einsum("BKGTL,BLKH->BTKGH", memory_probs.astype(dtype), v_memory)
                     read = einops.rearrange(read, "B T K G H -> B T (K G) H")
                     gate = jnp.tanh(self.param("memory_gate", nn.initializers.zeros, ())).astype(dtype)
-                    attended = attended + gate * read
+                    attended = attended + gate * read.astype(dtype)
                 out.append(out_einsum("BTNH,NHD->BTD", attended))
                 start = end
             else:

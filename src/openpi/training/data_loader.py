@@ -189,6 +189,23 @@ def create_torch_dataset(
     enable_jitter = data_config.enable_jitter
     step_time = 1.0 / dataset_meta.fps
 
+    memory_frames = getattr(model_config, "memory_frames", 0)
+    memory_offsets: tuple[int, ...] = ()
+    if memory_frames:
+        if len(data_config.hist_sequence_keys) != 1:
+            raise ValueError("memory_frames is wired for one camera: hist_sequence_keys must name exactly one")
+        if hist_horizon != model_config.hist_horizon:
+            raise ValueError(f"DataConfig.hist_horizon ({hist_horizon}) must match the model's ({model_config.hist_horizon}): "
+                             "the memory slots are placed beyond the history window")
+        memory_offsets = _transforms.memory_frame_offsets(hist_horizon, hist_interval, memory_frames, model_config.memory_stride)
+
+    state_rows = getattr(model_config, "state_history", 0)
+    if state_rows:
+        if data_config.vlash_max_offset > 0 or data_config.vlash_branches:
+            raise ValueError("state_history reads the state column at its own offsets; it is not wired for VLASH offsets")
+        state_offsets = _transforms.state_history_offsets(hist_interval, model_config.state_history_first_age, state_rows)
+        delta_timestamps[VLASH_STATE_KEY] = [s * step_time for s in (*state_offsets, 0)]
+
     hist_delta_timestamps = {}
     window_offsets = None
     if data_config.sparse_hist_decode:
@@ -200,7 +217,7 @@ def create_torch_dataset(
             list(window_offsets) if window_offsets is not None
             else [-1 * t for t in range((hist_horizon - 1) * hist_interval, -1, -1)]
         )
-        hist_delta_timestamps[key] = [s * step_time for s in base_steps]
+        hist_delta_timestamps[key] = [s * step_time for s in (*memory_offsets, *base_steps)]
 
     delta_timestamps.update(hist_delta_timestamps)
 
@@ -213,6 +230,11 @@ def create_torch_dataset(
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+
+    if memory_frames:
+        dataset = TransformedDataset(dataset, [_transforms.SplitMemoryFrames(data_config.hist_sequence_keys[0], memory_frames)])
+    if state_rows:
+        dataset = TransformedDataset(dataset, [_transforms.SplitStateHistory(VLASH_STATE_KEY, state_rows)])
 
     dataset = TransformedDataset(dataset, [_transforms.TemporalJitter(
         jitter_range, hist_interval, hist_horizon, data_config.hist_sequence_keys, enable_jitter, window_offsets)])

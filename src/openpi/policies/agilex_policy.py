@@ -306,6 +306,16 @@ class AgilexInputs(transforms.DataTransformFn):
         if "delay" in data:
             inputs["delay"] = data["delay"]
 
+        # Compressed memory (Pi0Config.memory_frames): the camera's older frames, decoded like the window's own.
+        if "memory_image" in data:
+            inputs["memory_image"] = _frames_to_hwc_uint8(data["memory_image"])
+            inputs["memory_mask"] = np.asarray(data["memory_mask"], dtype=bool)
+
+        # Measured-state history (Pi0Config.state_history): the earlier states, raw dims, normalized by the data config.
+        if "state_history" in data:
+            inputs["state_history"] = np.asarray(data["state_history"], dtype=np.float32)
+            inputs["state_history_mask"] = np.asarray(data["state_history_mask"], dtype=bool)
+
         # The vlash conditioning extras (transforms.TemporalOffset cond_now; ConcatVlashCond joins them later).
         for key in ("state_now", "vlash_delta"):
             if key in data:
@@ -341,23 +351,25 @@ class AgilexOutputs(transforms.DataTransformFn):
         return outputs
 
 
+def _frames_to_hwc_uint8(img) -> np.ndarray:
+    """[t, c, h, w] (or one [c, h, w]) frames, float in [0, 1] or uint8, as [t, h, w, c] uint8."""
+    img = np.asarray(img)
+    # Convert to uint8 if using float images.
+    if np.issubdtype(img.dtype, np.floating):
+        img = (255 * img).astype(np.uint8)
+    # Convert from [channel, height, width] to [height, width, channel].
+    if img.ndim == 3:
+        img = img[None]
+    return einops.rearrange(img, "t c h w -> t h w c")
+
+
 def _decode_agilex(data: dict) -> dict:
     # state is [left_arm_joint_angles, left_arm_gripper, right_arm_joint_angles, right_arm_gripper]
     # dim sizes: [6, 1, 6, 1]
     state = np.asarray(data["state"])
 
-    def convert_image(img):
-        img = np.asarray(img)
-        # Convert to uint8 if using float images.
-        if np.issubdtype(img.dtype, np.floating):
-            img = (255 * img).astype(np.uint8)
-        # Convert from [channel, height, width] to [height, width, channel].
-        if img.ndim == 3:
-            img = img[None]
-        return einops.rearrange(img, "t c h w -> t h w c")
-
     images = data["images"]
-    images_dict = {name: convert_image(img) for name, img in images.items()}
+    images_dict = {name: _frames_to_hwc_uint8(img) for name, img in images.items()}
 
     data["images"] = images_dict
     data["state"] = state

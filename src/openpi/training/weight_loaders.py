@@ -9,6 +9,7 @@ import numpy as np
 import openpi.models.dinov2 as _dinov2
 import openpi.models.lora as _lora
 import openpi.models.model as _model
+from openpi.models.pi0_config import MEMORY_PARAMS_REGEX
 from openpi.models.pi0_config import RACE_PARAMS_REGEX
 import openpi.models.siglip as _siglip
 import openpi.shared.array_typing as at
@@ -75,7 +76,7 @@ class CheckpointWeightLoader(WeightLoader):
         # weights (Pi0Config.race), which a base checkpoint does not carry; the latter two start the model as the
         # checkpoint was (zero-initialised outputs).
         return _merge_params(loaded_params, params,
-                             missing_regex=f".*lora.*|.*state_(proj|mlp_in|mlp_out).*|.*dino_proj.*|{RACE_PARAMS_REGEX}")
+                             missing_regex=f".*lora.*|.*state_(proj|mlp_in|mlp_out).*|.*dino_proj.*|{RACE_PARAMS_REGEX}|{MEMORY_PARAMS_REGEX}")
 
 
 @dataclasses.dataclass(frozen=True)

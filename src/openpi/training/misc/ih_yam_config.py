@@ -72,6 +72,14 @@ CAM2_EXTRA_IMAGE_KEY = "base_0_rgb"
 # The recipes that get a `_dino` twin: a frozen DINOv2-base branch added to SigLIP through a zero-initialised projection.
 DINO_TWIN_BASES: tuple[str, ...] = ("pi05_yam_stream5_i20_bagging_right_real",)
 DINO_VARIANT = "base"
+# The recipes that get a `_mem` twin: compressed memory (Pi0Config.memory_frames). 16 frames 4 calls apart, the first 8 calls back
+# (beyond the 5 dense frames), reach 68 calls = 34 s at the 15-frame cadence, a few cycles of a bag; 8 tokens per frame.
+MEM_TWIN_BASES: tuple[str, ...] = ("pi05_yam_stream5_i15_bagging_right_real",)
+MEMORY_FRAMES, MEMORY_STRIDE, MEMORY_TOKENS, MEMORY_DIM = 16, 4, 8, 512
+# The recipes that get a `_hist` twin: the driven arm's measured state at 8 earlier calls (2 to 9 calls back, 1 s to 4.5 s at the
+# 15-frame cadence; the nearest row is skipped) read through the same zero-gated bank.
+HIST_TWIN_BASES: tuple[str, ...] = ("pi05_yam_stream5_i15_bagging_right_real",)
+STATE_HISTORY_ROWS, STATE_HISTORY_FIRST_AGE = 8, 2
 
 
 def yam_repack(cameras: tuple[str, ...] = YAM_CAMERAS, *, vlash_cond_now: bool = False,
@@ -94,6 +102,18 @@ def yam_repack(cameras: tuple[str, ...] = YAM_CAMERAS, *, vlash_cond_now: bool =
 
 
 YAM_REPACK = yam_repack()
+
+
+def with_extra_keys(repack: _transforms.Group, keys: tuple[str, ...]) -> _transforms.Group:
+    """`repack` that also passes the loader's own `keys` through unchanged."""
+    (step,) = repack.inputs
+    structure = {**step.structure, **{key: key for key in keys}}
+    return dataclasses.replace(repack, inputs=[_transforms.RepackTransform(structure)])
+
+
+def with_memory_frames(repack: _transforms.Group) -> _transforms.Group:
+    """`repack` that also passes a memory model's older frames through (transforms.MEMORY_KEYS)."""
+    return with_extra_keys(repack, _transforms.MEMORY_KEYS)
 
 
 def vlash_cond_dims(active_state_dims: tuple[int, ...]) -> tuple[int, ...]:
@@ -125,6 +145,16 @@ def get_ih_yam_configs():
             if self.norm_stats_config is not None:
                 assets_dirs = assets_dirs.parent / self.norm_stats_config
             created = super().create(assets_dirs, model_config)
+            if getattr(model_config, "memory_frames", 0):
+                # The model decides, so a --model.memory-frames override gets its frames and a memory-less one does not.
+                created = dataclasses.replace(created, repack_transforms=with_memory_frames(created.repack_transforms))
+            if getattr(model_config, "state_history", 0):
+                # The earlier states are states: normalized with the state's own statistics (saved with the checkpoint's).
+                norm_stats = (None if created.norm_stats is None else
+                              {**created.norm_stats, _transforms.STATE_HISTORY_NORM_KEY: created.norm_stats["state"]})
+                created = dataclasses.replace(
+                    created, norm_stats=norm_stats,
+                    repack_transforms=with_extra_keys(created.repack_transforms, _transforms.STATE_HISTORY_KEYS))
             if self.race_targets_root is not None:
                 created = dataclasses.replace(created, race_targets_dir=f"{self.race_targets_root}/{created.repo_id}")
             if created.vlash_cond_now:
@@ -157,7 +187,8 @@ def get_ih_yam_configs():
                       race: bool = False, norm_stats_config: str | None = None,
                       expert_lora_rank: int | None = None,
                       image_resolution: tuple[int, int] | None = None,
-                      dino_variant: str | None = None):
+                      dino_variant: str | None = None,
+                      memory_frames: int = 0, state_history: int = 0):
         # A masked camera's tokens are padding, so a recipe may skip decoding and encoding them: the same
         # model, one SigLIP pass per frame instead of three and a third of the prefix. Opt-in per config
         # because it changes the model's input layout (not its weights).
@@ -166,6 +197,8 @@ def get_ih_yam_configs():
         if expert_lora_rank not in EXPERT_LORA_VARIANTS or (expert_lora_rank is not None and not lora):
             raise ValueError(f"{name}: expert_lora_rank must be None or one of "
                              f"{sorted(rank for rank in EXPERT_LORA_VARIANTS if rank)}, and needs lora")
+        if state_history and not active_state_dims:
+            raise ValueError(f"{name}: state_history reads the driven arm's state: the recipe needs active_state_dims")
         cameras = {image_key: camera for camera, image_key in AgilexInputs.IMAGE_KEY_BY_CAMERA.items()}
         image_keys = tuple(key for key in IMAGE_KEYS if not encode_only_active_cameras or key in active_image_keys)
         kept_cameras = tuple(cameras[key] for key in image_keys)
@@ -184,6 +217,10 @@ def get_ih_yam_configs():
             race=race,
             image_resolution=image_resolution or IMAGE_RESOLUTION,
             dino_variant=dino_variant,
+            **({"memory_frames": memory_frames, "memory_stride": MEMORY_STRIDE, "memory_tokens": MEMORY_TOKENS,
+                "memory_dim": MEMORY_DIM} if memory_frames else {}),
+            **({"state_history": state_history, "state_history_first_age": STATE_HISTORY_FIRST_AGE,
+                "state_history_dims": active_state_dims} if state_history else {}),
             # The driven arm's gripper; its loss weight stays 1.0 until a run raises it (--model.gripper-loss-weight).
             gripper_loss_dim=max(active_state_dims) if active_state_dims else None,
         )
@@ -344,6 +381,18 @@ def get_ih_yam_configs():
         # step 0 is the checkpoint. The DINOv2 weights come from Hugging Face on a first run, from the checkpoint after.
         return {**recipe, "name": recipe["name"] + "_dino", "dino_variant": DINO_VARIANT, "norm_stats_config": recipe["name"]}
 
+    def memory_twin(recipe: dict) -> dict:
+        # The recipe with compressed memory, warm-started from a checkpoint of the same recipe: the memory branch's gate
+        # starts closed, so step 0 is the checkpoint. It keeps the recipe's norm stats, like the race twin.
+        return {**recipe, "name": recipe["name"] + "_mem", "memory_frames": MEMORY_FRAMES,
+                "norm_stats_config": recipe["name"]}
+
+    def history_twin(recipe: dict) -> dict:
+        # The recipe with the driven arm's measured-state history, warm-started from a checkpoint of the same recipe: the
+        # read's gate starts closed, so step 0 is the checkpoint. It keeps the recipe's norm stats, like the race twin.
+        return {**recipe, "name": recipe["name"] + "_hist", "state_history": STATE_HISTORY_ROWS,
+                "norm_stats_config": recipe["name"]}
+
     race_twins = [race_twin(recipe) for recipe in recipes if recipe["name"] in RACE_TWIN_BASES]
     xr128_twins = [expert_rank_twin(recipe) for recipe in recipes if recipe["name"] in XR128_TWIN_BASES]
     px336_twins = [px336_twin(recipe) for recipe in recipes if recipe["name"] in PX336_TWIN_BASES]
@@ -351,8 +400,10 @@ def get_ih_yam_configs():
     dino_twins = [dino_twin(recipe) for recipe in recipes if recipe["name"] in DINO_TWIN_BASES]
     cadence_recipes = [{**recipe, "name": recipe["name"].replace("_i20_", "_i15_"), "hist_interval": HIST_INTERVAL_MID}
                        for recipe in recipes if recipe["name"] == "pi05_yam_stream5_i20_bagging_right_real"]
+    mem_twins = [memory_twin(recipe) for recipe in cadence_recipes if recipe["name"] in MEM_TWIN_BASES]
+    hist_twins = [history_twin(recipe) for recipe in cadence_recipes if recipe["name"] in HIST_TWIN_BASES]
     return [stream_config(**recipe) for recipe in
             recipes + [vlash_twin(recipe) for recipe in recipes] + [vlash_reference_twin(recipe) for recipe in recipes]
             + [vlash_measured_twin(recipe) for recipe in recipes] + [vlash_packed_measured_twin(recipe) for recipe in recipes]
             + [vlash_conditioned_twin(recipe) for recipe in recipes] + [vlash_long_conditioned_twin(recipe) for recipe in recipes]
-            + [vlash_packed_twin(recipe) for recipe in recipes] + race_twins + xr128_twins + px336_twins + cam2_twins + dino_twins + cadence_recipes]
+            + [vlash_packed_twin(recipe) for recipe in recipes] + race_twins + xr128_twins + px336_twins + cam2_twins + dino_twins + cadence_recipes + mem_twins + hist_twins]

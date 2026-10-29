@@ -73,6 +73,24 @@ class Pi0Config(_model.BaseModelConfig):
     # SigLIP's, so a model with it starts as the model without it. The backbone is frozen unless dino_trainable.
     dino_variant: str | None = None
     dino_trainable: bool = False
+    # Compressed memory: this many older frames of the one camera, memory_stride calls apart and older than the
+    # hist_horizon frames in the KV cache, are pooled to memory_tokens tokens each (memory_dim wide) and read by the action
+    # expert through a zero-gated branch (gemma.Attention). 0: none. See Pi0.sample_actions for the serving memory.
+    memory_frames: int = 0
+    memory_tokens: int = 4
+    memory_stride: int = 4
+    memory_dim: int = 512
+    # Training only: the chance a sample's whole memory is hidden, as it is for the first calls of a served episode.
+    memory_dropout: float = 0.1
+    # Measured-state history: the state_history_dims of the state at `state_history` consecutive calls, the newest
+    # state_history_first_age calls back (a call is hist_interval frames), each encoded to one token of the same bank the
+    # action expert reads for the memory (memory_dim wide, the same zero gate). The rows nearest the present are skipped
+    # (first_age > 1) and the whole history is hidden with state_history_dropout in training, so the policy cannot
+    # extrapolate its own motion in place of looking. 0: none.
+    state_history: int = 0
+    state_history_first_age: int = 2
+    state_history_dims: tuple[int, ...] = ()
+    state_history_dropout: float = 0.5
 
     def __post_init__(self):
         if self.max_token_len is None:
@@ -101,9 +119,41 @@ class Pi0Config(_model.BaseModelConfig):
             raise ValueError(f"gripper_loss_dim {self.gripper_loss_dim} is outside the {self.action_dim} action dims")
         if self.dino_variant is not None:
             _dinov2.get_config(self.dino_variant)
+        if self.memory_frames or self.state_history:
+            if self.race or self.vlash_branches or not self.pi05:
+                raise ValueError("the memory bank is wired for plain pi0.5, not race or vlash_branches")
+            if min(self.memory_tokens, self.memory_stride, self.memory_dim) < 1 or min(self.memory_frames, self.state_history) < 0:
+                raise ValueError("memory_tokens, memory_stride and memory_dim must be positive")
+        if self.memory_frames:
+            if len(self.image_keys) != 1:
+                raise ValueError("memory_frames is wired for one camera")
+            if not 0.0 <= self.memory_dropout < 1.0:
+                raise ValueError(f"memory_dropout must be in [0, 1), got {self.memory_dropout}")
+        if self.state_history:
+            if self.state_history_first_age < 1:
+                raise ValueError(f"state_history_first_age must be >= 1, got {self.state_history_first_age}")
+            if not self.state_history_dims or not all(0 <= dim < self.action_dim for dim in self.state_history_dims):
+                raise ValueError(f"state_history_dims must name state dims below {self.action_dim}, got {self.state_history_dims}")
+            if not 0.0 <= self.state_history_dropout < 1.0:
+                raise ValueError(f"state_history_dropout must be in [0, 1), got {self.state_history_dropout}")
         height, width = self.image_resolution
         if height != width or height % 14:
             raise ValueError(f"image_resolution must be square and a multiple of 14, got {self.image_resolution}")
+
+    @property
+    def uses_memory_bank(self) -> bool:
+        return bool(self.memory_frames or self.state_history)
+
+    @property
+    def state_history_ages(self) -> tuple[int, ...]:
+        """How many calls back each state-history row is, newest row first."""
+        return tuple(range(self.state_history_first_age, self.state_history_first_age + self.state_history))
+
+    @property
+    def memory_ages(self) -> tuple[int, ...]:
+        """How many calls (one call = one hist_interval of frames) before the current one each memory slot's frame is,
+        newest slot first: memory_stride calls beyond the oldest frame of the KV window, then every memory_stride."""
+        return tuple((self.hist_horizon - 1) + (slot + 1) * self.memory_stride for slot in range(self.memory_frames))
 
     @property
     @override
@@ -133,6 +183,20 @@ class Pi0Config(_model.BaseModelConfig):
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
             )
+        if self.memory_frames:
+            with at.disable_typechecking():
+                observation_spec = dataclasses.replace(
+                    observation_spec,
+                    memory_images=jax.ShapeDtypeStruct([batch_size, self.memory_frames, *self.image_resolution, 3], jnp.float32),
+                    memory_mask=jax.ShapeDtypeStruct([batch_size, self.memory_frames], jnp.bool_),
+                )
+        if self.state_history:
+            with at.disable_typechecking():
+                observation_spec = dataclasses.replace(
+                    observation_spec,
+                    state_history=jax.ShapeDtypeStruct([batch_size, self.state_history, self.action_dim], jnp.float32),
+                    state_history_mask=jax.ShapeDtypeStruct([batch_size, self.state_history], jnp.bool_),
+                )
         action_spec = jax.ShapeDtypeStruct(
             [batch_size, *branch_shape, self.action_horizon, self.action_dim], jnp.float32)
 
@@ -180,6 +244,9 @@ class Pi0Config(_model.BaseModelConfig):
         if self.race:
             # RACE's weights are new and always trained, including the modulation inside the frozen LLM.
             filters.append(nnx.Not(nnx_utils.PathRegex(RACE_PARAMS_REGEX)))
+        if self.uses_memory_bank:
+            # The memory branch's weights are new and always trained, including the read branch inside the frozen LLM.
+            filters.append(nnx.Not(nnx_utils.PathRegex(MEMORY_PARAMS_REGEX)))
         return nnx.All(*filters)
 
 
@@ -187,6 +254,8 @@ class Pi0Config(_model.BaseModelConfig):
 RACE_PARAMS_REGEX = ".*race_.*"
 # The DINOv2 backbone's parameters sit under dino/; its projection into SigLIP's tokens, dino_proj/, always trains.
 DINO_BACKBONE_REGEX = ".*dino/.*"
+# Every compressed-memory parameter's path contains this (Pi0's memory_pool, the action expert's memory_k / memory_v / memory_gate).
+MEMORY_PARAMS_REGEX = ".*memory.*"
 
 
 @dataclasses.dataclass(frozen=True)

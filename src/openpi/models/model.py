@@ -114,6 +114,15 @@ class Observation(Generic[ArrayT]):
     transition_window: at.Float[ArrayT, "#b race_rows"] | None = None
     transition_window_mask: at.Bool[ArrayT, "#b race_rows"] | None = None
 
+    # Compressed memory (Pi0Config.memory_frames): older frames of the driven camera, in [-1, 1], newest first, and which of
+    # them exist (a slot before the episode's start does not).
+    memory_images: at.Float[ArrayT, "#b mem mh mw mc"] | None = None
+    memory_mask: at.Bool[ArrayT, "#b mem"] | None = None
+
+    # Measured-state history (Pi0Config.state_history): the state at earlier calls, newest first, and which of them exist.
+    state_history: at.Float[ArrayT, "#b sh sd"] | None = None
+    state_history_mask: at.Bool[ArrayT, "#b sh"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -135,6 +144,10 @@ class Observation(Generic[ArrayT]):
                 elif data["image"][key].ndim == 5:
                     data["image"][key] = data["image"][key].to(torch.float32).permute(0, 1, 4, 2, 3) / 255.0 * 2.0 - 1.0
 
+        memory_images = data.get("memory_image")
+        if memory_images is not None and memory_images.dtype == np.uint8:
+            memory_images = memory_images.astype(np.float32) / 255.0 * 2.0 - 1.0
+
         return cls(
             images=data["image"],
             image_masks=data["image_mask"],
@@ -145,6 +158,10 @@ class Observation(Generic[ArrayT]):
             token_loss_mask=data.get("token_loss_mask"),
             transition_window=data.get("transition_window"),
             transition_window_mask=data.get("transition_window_mask"),
+            memory_images=memory_images,
+            memory_mask=data.get("memory_mask"),
+            state_history=data.get("state_history"),
+            state_history_mask=data.get("state_history_mask"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -152,6 +169,7 @@ class Observation(Generic[ArrayT]):
         result = dataclasses.asdict(self)
         result["image"] = result.pop("images")
         result["image_mask"] = result.pop("image_masks")
+        result["memory_image"] = result.pop("memory_images")
         return result
 
 
@@ -243,6 +261,27 @@ def preprocess_observation(
 
         out_images[key] = image.reshape(bs, t, image.shape[1], image.shape[2], image.shape[3])
 
+    memory_images = observation.memory_images
+    if memory_images is not None:
+        memory_batch, memory_slots = memory_images.shape[:2]
+        memory = memory_images.reshape(memory_batch * memory_slots, *memory_images.shape[2:])
+        if memory.shape[1:3] != image_resolution:
+            memory = image_tools.resize_with_pad(memory, *image_resolution)
+        if train:
+            # The same augmentation a wrist camera gets, with its own randomness.
+            memory = memory / 2.0 + 0.5
+            memory_transforms = []
+            if wrist_augmentation:
+                height, width = memory.shape[1:3]
+                memory_transforms += [augmax.RandomCrop(int(width * 0.97), int(height * 0.97)), augmax.Resize(width, height)]
+            memory_transforms += [augmax.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5)]
+            memory_rngs = jax.random.split(jax.random.fold_in(rng, 3), memory.shape[0])
+            memory = jax.vmap(augmax.Chain(*memory_transforms))(memory_rngs, memory)
+            if wrist_augmentation:
+                memory = jax.vmap(wrist_degradation)(jax.random.split(jax.random.fold_in(rng, 4), memory.shape[0]), memory)
+            memory = memory * 2.0 - 1.0
+        memory_images = memory.reshape(memory_batch, memory_slots, *memory.shape[1:])
+
     # obtain mask
     out_masks = {}
     for key in out_images:
@@ -262,6 +301,10 @@ def preprocess_observation(
         token_loss_mask=observation.token_loss_mask,
         transition_window=observation.transition_window,
         transition_window_mask=observation.transition_window_mask,
+        memory_images=memory_images,
+        memory_mask=observation.memory_mask,
+        state_history=observation.state_history,
+        state_history_mask=observation.state_history_mask,
     )
 
 

@@ -13,9 +13,9 @@ import openpi.models.gemma as gemma
 WIDTH, BANK_WIDTH, PREFIX, SUFFIX = 64, 24, 3, 2
 
 
-def _llm():
+def _llm(dtype="float32"):
     configs = [gemma.get_config("dummy"), gemma.get_config("dummy")]
-    llm = nnx_bridge.ToNNX(gemma.Module(configs=configs, embed_dtype="float32", adarms=True))
+    llm = nnx_bridge.ToNNX(gemma.Module(configs=configs, embed_dtype=dtype, adarms=True))
     llm.lazy_init(rngs=nnx.Rngs(0), method="init", use_adarms=[False, True], memory_width=BANK_WIDTH)
     return pi0_testing.awaken(llm, jax.random.key(7))
 
@@ -96,3 +96,20 @@ def test_the_read_is_content_based_so_the_bank_order_does_not_matter():
     assert all(np.allclose(a, b, atol=1e-5) for a, b in zip(ordered, shuffled, strict=True))
     different = _run(llm, _bank(seed=11), mask)
     assert not np.allclose(ordered[1], different[1], atol=1e-5)
+
+
+def test_a_bf16_model_stays_bf16_with_the_read_open():
+    mask = jnp.ones((1, 4), bool)
+    reference = _llm()
+    _set_gate(reference, 1.0)
+    expected = _run(reference, _bank(), mask)
+
+    llm = _llm("bfloat16")
+    closed = _run(llm, _bank(), mask)
+    _set_gate(llm, 1.0)
+    opened = _run(llm, _bank(), mask)  # the bank is float32, as the model's pooling produces it
+
+    assert all(out.dtype == jnp.bfloat16 for out in opened)
+    assert not np.allclose(opened[1].astype(np.float32), closed[1].astype(np.float32), atol=0.1)
+    for got, want in zip(opened, expected, strict=True):
+        np.testing.assert_allclose(got.astype(np.float32), want, atol=0.15, rtol=0.1)

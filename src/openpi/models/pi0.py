@@ -36,6 +36,9 @@ RACE_JITTER_FORWARD_PROB = 0.5
 # Folded into the step's rng for the jitter draws, so the base model's noise, time and history-drop draws are
 # the same with and without RACE.
 _RACE_JITTER_STREAM = 0x5ACE
+# Folded into the step's rng for the memory-drop draw, for the same reason.
+_MEMORY_DROP_STREAM = 0x3E30
+_STATE_DROP_STREAM = 0x57A7
 
 
 def make_attn_mask(input_mask, mask_ar):
@@ -112,7 +115,7 @@ class Pi0(_model.BaseModel):
             )
         )
         llm.lazy_init(rngs=rngs, method="init", use_adarms=[False, True] if config.pi05 else [False, False],
-                      race=config.race)
+                      race=config.race, memory_width=config.memory_dim if config.uses_memory_bank else None)
         img = nnx_bridge.ToNNX(
             _siglip.Module(
                 num_classes=paligemma_config.width,
@@ -180,26 +183,60 @@ class Pi0(_model.BaseModel):
             self.dino_proj = nnx.Linear(
                 dino_config.width, paligemma_config.width, use_bias=False, kernel_init=nnx.initializers.zeros_init(), rngs=rngs)
 
+        # Compressed memory (Pi0Config.memory_frames). Created after the DINO branch for the same reason. Every parameter
+        # here has `memory` in its path (the action expert's memory_k / memory_v / memory_gate too), which is what the freeze
+        # filter and the weight loader key on. The read itself is zero-gated in gemma.Attention, so the model is the model
+        # without memory until that gate trains.
+        self.memory_frames = config.memory_frames
+        self.memory_dropout = config.memory_dropout
+        self.memory_ages = config.memory_ages
+        self.state_history = config.state_history
+        self.state_history_ages = config.state_history_ages
+        self.state_history_dims = config.state_history_dims
+        self.state_history_dropout = config.state_history_dropout
+        self.uses_memory_bank = config.uses_memory_bank
+        if config.memory_frames:
+            self.memory_query = nnx.Param(
+                0.02 * jax.random.normal(rngs.params(), (config.memory_tokens, config.memory_dim)))
+            self.memory_slot_embed = nnx.Param(
+                0.02 * jax.random.normal(rngs.params(), (config.memory_frames, config.memory_dim)))
+            self.memory_pool_k = nnx.Linear(paligemma_config.width, config.memory_dim, use_bias=False, rngs=rngs)
+            self.memory_pool_v = nnx.Linear(paligemma_config.width, config.memory_dim, use_bias=False, rngs=rngs)
+            self.memory_pool_norm = nnx.LayerNorm(config.memory_dim, rngs=rngs)
+        if config.state_history:
+            # The state history's encoder: an MLP over the chosen dims of one state, plus a learned embedding of the row's age.
+            self.memory_state_in = nnx.Linear(len(config.state_history_dims), config.memory_dim, rngs=rngs)
+            self.memory_state_out = nnx.Linear(config.memory_dim, config.memory_dim, rngs=rngs)
+            self.memory_state_age = nnx.Param(
+                0.02 * jax.random.normal(rngs.params(), (config.state_history, config.memory_dim)))
+
+    def _encode_images(self, image: at.Float[at.Array, "n h w c"]) -> at.Float[at.Array, "n s emb"]:
+        """SigLIP's tokens for a batch of frames, plus the DINOv2 branch's when the model has one."""
+        image_tokens, _ = self.PaliGemma.img(image, train=False)
+        if self.dino is not None:
+            image_tokens = image_tokens + self.dino_proj(self.dino(image)[:, 1:]).astype(image_tokens.dtype)
+        return image_tokens
+
+    def _frame_tokens(self, obs: _model.Observation) -> dict[str, at.Float[at.Array, "b t s emb"]]:
+        """Each camera's image tokens, one row per frame of the observation's window."""
+        all_image_tokens = {}
+        for name in self.image_keys:
+            image = obs.images[name]
+            bs, T = image.shape[0], image.shape[1]
+            image_tokens = self._encode_images(image.reshape(bs * T, *image.shape[2:]))
+            all_image_tokens[name] = image_tokens.reshape(bs, T, *image_tokens.shape[1:])
+        return all_image_tokens
+
     @at.typecheck
     def embed_prefix(
-        self, obs: _model.Observation,
+        self, obs: _model.Observation, image_tokens: dict | None = None,
     ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"], int, int]:
         input_mask = []
         ar_mask = []
         tokens = []
         # embed images
-        all_image_tokens = dict()
-
-        for name in self.image_keys:
-            image = obs.images[name]
-            bs, T = image.shape[0], image.shape[1]
-            image = image.reshape(bs*T, image.shape[2], image.shape[3], image.shape[4])
-            image_tokens, _ = self.PaliGemma.img(image, train=False)
-            if self.dino is not None:
-                image_tokens = image_tokens + self.dino_proj(self.dino(image)[:, 1:]).astype(image_tokens.dtype)
-            image_tokens = image_tokens.reshape(bs, T, image_tokens.shape[1], image_tokens.shape[2])
-    
-            all_image_tokens[name] = image_tokens
+        all_image_tokens = self._frame_tokens(obs) if image_tokens is None else image_tokens
+        bs, T = obs.images[self.image_keys[-1]].shape[:2]
 
         # add language (aka tokenized inputs)
         if obs.tokenized_prompt is not None:
@@ -390,6 +427,8 @@ class Pi0(_model.BaseModel):
         # # safe_print("x2, x3 = {}", attn_mask[0, 768*2:768*3, 768*3:768*3 + 10].sum())
         # safe_print("x3, x2 = {}", attn_mask[0, 768*3:768*3 + 10, 768*2:768*3].sum())
 
+        memory_bank = self._training_memory_bank(rng, observation, train=train) if self.uses_memory_bank else None
+
         race_cond = None
         if self.race:
             # Sec. 3.3 / alg. 1: the full pass is conditioned on the jittered target (teacher forcing), with
@@ -399,7 +438,7 @@ class Pi0(_model.BaseModel):
 
         (prefix_out, suffix_out), kv_cache = self.PaliGemma.llm(
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond],
-            race_cond=race_cond,
+            race_cond=race_cond, memory_bank=memory_bank,
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
@@ -476,24 +515,14 @@ class Pi0(_model.BaseModel):
 
     @at.typecheck
     def embed_prefix_infer(
-        self, obs: _model.Observation, memory_tokens
+        self, obs: _model.Observation, memory_tokens, image_tokens: dict | None = None
     ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"], int, int]:
         input_mask = []
         ar_mask = []
         tokens = []
         # embed images
-        all_image_tokens = dict()
-
-        for name in self.image_keys:
-            image = obs.images[name]
-            bs, T = image.shape[0], image.shape[1]
-            image = image.reshape(bs*T, image.shape[2], image.shape[3], image.shape[4])
-            image_tokens, _ = self.PaliGemma.img(image, train=False)
-            if self.dino is not None:
-                image_tokens = image_tokens + self.dino_proj(self.dino(image)[:, 1:]).astype(image_tokens.dtype)
-            image_tokens = image_tokens.reshape(bs, T, image_tokens.shape[1], image_tokens.shape[2])
-    
-            all_image_tokens[name] = image_tokens
+        all_image_tokens = self._frame_tokens(obs) if image_tokens is None else image_tokens
+        bs, T = obs.images[self.image_keys[-1]].shape[:2]
 
         # add language (aka tokenized inputs)
         if obs.tokenized_prompt is not None:
@@ -542,7 +571,107 @@ class Pi0(_model.BaseModel):
         memory["memory_kv_cache"] = None
         memory["memory_prefix_mask"] = None
 
-    @at.typecheck
+    def reset_long_memory(self, memory):
+        """Forgets the compressed memory (Pi0Config.memory_frames). reset_memory, which a server runs every hist_horizon
+        calls, leaves it alone: call this when an episode starts."""
+        for key in ("long_frames", "long_valid", "long_states", "long_states_valid"):
+            memory[key] = None
+
+    def _pool_memory(self, image_tokens: at.Float[at.Array, "n s emb"]) -> at.Float[at.Array, "n m d"]:
+        """One frame's tokens pooled to memory_tokens: every learned query attends over the frame's tokens (one head)."""
+        tokens = image_tokens.astype(jnp.float32)
+        keys, values = self.memory_pool_k(tokens), self.memory_pool_v(tokens)
+        logits = jnp.einsum("md,nsd->nms", self.memory_query.value, keys) * keys.shape[-1] ** -0.5
+        pooled = jnp.einsum("nms,nsd->nmd", jax.nn.softmax(logits, axis=-1), values)
+        return self.memory_pool_norm(pooled)
+
+    def _memory_bank(
+        self, pooled: at.Float[at.Array, "b m t d"], valid: at.Bool[at.Array, "b m"]
+    ) -> tuple[at.Float[at.Array, "b mt d"], at.Bool[at.Array, "b mt"]]:
+        """The bank the action expert reads: each frame's pooled tokens plus its slot's learned age embedding, flat."""
+        bank = pooled + self.memory_slot_embed.value[None, :, None, :]
+        return bank.reshape(bank.shape[0], -1, bank.shape[-1]), jnp.repeat(valid, pooled.shape[2], axis=1)
+
+    def _state_bank(
+        self, history: at.Float[at.Array, "b s d"], valid: at.Bool[at.Array, "b s"]
+    ) -> tuple[at.Float[at.Array, "b s e"], at.Bool[at.Array, "b s"]]:
+        """The state history's bank rows: `history` (b, rows, state dims), newest row first, is cut to the chosen dims,
+        encoded one row at a time, and each row gets its age's learned embedding."""
+        chosen = history[..., jnp.asarray(self.state_history_dims)].astype(jnp.float32)
+        encoded = self.memory_state_out(nnx.swish(self.memory_state_in(chosen)))
+        return encoded + self.memory_state_age.value[None], valid
+
+    def _training_memory_bank(self, rng, observation: _model.Observation, *, train: bool):
+        """The bank of a training sample: the memory frames' tokens, without a gradient into the image encoders (the
+        window's own frames train them), pooled by the memory modules, then the state history's rows. `train` also hides a
+        sample's whole image memory with probability memory_dropout and its whole state history with probability
+        state_history_dropout (separately: the policy must work with either, or neither, as the first calls of an
+        episode have)."""
+        banks = []
+        if self.memory_frames:
+            images, valid = observation.memory_images, observation.memory_mask
+            if images is None or valid is None:
+                raise ValueError("a model with memory_frames trains on older frames: train it on a recipe whose data carries "
+                                 "them (the YAM _mem recipes)")
+            if images.shape[1] != self.memory_frames:
+                raise ValueError(f"the observation has {images.shape[1]} memory frames; the model reads {self.memory_frames}")
+            batch, slots = images.shape[:2]
+            tokens = self._encode_images(images.reshape(batch * slots, *images.shape[2:]))
+            pooled = self._pool_memory(jax.lax.stop_gradient(tokens))
+            pooled = pooled.reshape(batch, slots, *pooled.shape[1:])
+            if train and self.memory_dropout > 0:
+                keep = jax.random.bernoulli(jax.random.fold_in(rng, _MEMORY_DROP_STREAM), 1.0 - self.memory_dropout, (batch,))
+                valid = valid & keep[:, None]
+            banks.append(self._memory_bank(pooled, valid))
+        if self.state_history:
+            history, valid = observation.state_history, observation.state_history_mask
+            if history is None or valid is None:
+                raise ValueError("a model with state_history trains on earlier states: train it on a recipe whose data carries "
+                                 "them (the YAM _hist recipes)")
+            if history.shape[1] != self.state_history:
+                raise ValueError(f"the observation has {history.shape[1]} state rows; the model reads {self.state_history}")
+            if train and self.state_history_dropout > 0:
+                keep = jax.random.bernoulli(
+                    jax.random.fold_in(rng, _STATE_DROP_STREAM), 1.0 - self.state_history_dropout, (history.shape[0],))
+                valid = valid & keep[:, None]
+            banks.append(self._state_bank(history, valid))
+        return tuple(jnp.concatenate(parts, axis=1) for parts in zip(*banks, strict=True))
+
+    def _serving_memory_bank(self, observation: _model.Observation, image_tokens: dict, memory: dict):
+        """The bank of a serving call, from rings kept in `memory` like the KV window: the pooled tokens of the frames of
+        earlier calls and the states of earlier calls (newest first). This call's frame and state are pushed after the
+        read. Image slot i reads the frame memory_ages[i] calls back and state row j the state state_history_ages[j] calls
+        back, which is where training decodes them, and each is valid once the episode is that old."""
+        banks = []
+        if self.memory_frames:
+            (name,) = self.image_keys
+            frames = image_tokens[name]
+            if frames.shape[1] != 1:
+                raise ValueError(f"a model with memory_frames reads one new frame per call, got {frames.shape[1]}")
+            current = self._pool_memory(frames[:, 0])
+            ring, filled = self._ring(memory, "long_frames", "long_valid", current, self.memory_ages[-1])
+            slots = jnp.asarray([age - 1 for age in self.memory_ages])
+            banks.append(self._memory_bank(ring[:, slots], filled[:, slots]))
+        if self.state_history:
+            current = observation.state[:, jnp.asarray(self.state_history_dims)].astype(jnp.float32)
+            ring, filled = self._ring(memory, "long_states", "long_states_valid", current, self.state_history_ages[-1])
+            slots = jnp.asarray([age - 1 for age in self.state_history_ages])
+            banks.append(self._state_bank(ring[:, slots], filled[:, slots]))
+        return tuple(jnp.concatenate(parts, axis=1) for parts in zip(*banks, strict=True))
+
+    @staticmethod
+    def _ring(memory: dict, values_key: str, valid_key: str, current, length: int):
+        """The ring under `memory[values_key]` (b, length, ...) as this call reads it, newest first with index i the call
+        i + 1 back, and `memory` updated with `current` pushed in front. A missing ring is empty."""
+        batch = current.shape[0]
+        ring, filled = memory.get(values_key), memory.get(valid_key)
+        if ring is None or filled is None:
+            ring = jnp.zeros((batch, length, *current.shape[1:]), current.dtype)
+            filled = jnp.zeros((batch, length), jnp.bool_)
+        memory[values_key] = jnp.concatenate([current[:, None], ring[:, :-1]], axis=1)
+        memory[valid_key] = jnp.concatenate([jnp.ones((batch, 1), jnp.bool_), filled[:, :-1]], axis=1)
+        return ring, filled
+
     def save_memory(
         self, prefix_tokens: at.Float[at.Array, "b s1 emb"], prefix_mask: at.Bool[at.Array, "b s2"], num_visual_tokens: int, num_text_tokens: int, kv_cache, memory: dict
     ):
@@ -578,8 +707,8 @@ class Pi0(_model.BaseModel):
         if noise is None:
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
-        prefix_mask, kv_cache, prior = self._encode_prefix(observation, noise, memory)
-        x_0 = self._denoise(observation, prefix_mask, kv_cache, noise, num_steps, prior)
+        prefix_mask, kv_cache, prior, memory_bank = self._encode_prefix(observation, noise, memory)
+        x_0 = self._denoise(observation, prefix_mask, kv_cache, noise, num_steps, prior, memory_bank)
         if prior is None:
             return x_0, memory
         # A RACE model also returns the head's scores for the rows of x_0 (Policy.infer: "transition_scores").
@@ -607,23 +736,28 @@ class Pi0(_model.BaseModel):
             noise = jax.random.normal(rng, (batch_size, num_candidates, self.action_horizon, self.action_dim))
         if noise.shape[:2] != (batch_size, num_candidates):
             raise ValueError(f"noise must be (batch, num_candidates, ...) = ({batch_size}, {num_candidates}, ...), got {noise.shape}")
-        prefix_mask, kv_cache, _ = self._encode_prefix(observation, noise[:, 0], memory)
+        prefix_mask, kv_cache, _, memory_bank = self._encode_prefix(observation, noise[:, 0], memory)
+        tiled_bank = jax.tree.map(lambda leaf: jnp.repeat(leaf, num_candidates, axis=0), memory_bank)
         tiled = jax.tree.map(lambda leaf: jnp.repeat(leaf, num_candidates, axis=0), observation)
         tiled_cache = jax.tree.map(lambda leaf: jnp.repeat(leaf, num_candidates, axis=1), kv_cache)
         flat_noise = noise.reshape(batch_size * num_candidates, self.action_horizon, self.action_dim)
-        x_0 = self._denoise(tiled, jnp.repeat(prefix_mask, num_candidates, axis=0), tiled_cache, flat_noise, num_steps, None)
+        x_0 = self._denoise(
+            tiled, jnp.repeat(prefix_mask, num_candidates, axis=0), tiled_cache, flat_noise, num_steps, None, tiled_bank)
         return x_0.reshape(batch_size, num_candidates, self.action_horizon, self.action_dim), memory
 
     def _encode_prefix(self, observation, noise, memory):
         """The prefix pass of a serving call: fills the KV cache, saves it as the client's memory, and (RACE) computes
-        the prior from the noise the denoising loop starts from. Returns (prefix_mask, kv_cache, prior)."""
+        the prior from the noise the denoising loop starts from. Returns (prefix_mask, kv_cache, prior, memory_bank);
+        the bank is None for a model without memory_frames."""
         # first fill KV cache with a forward pass of the prefix
         memory_tokens, memory_kv_cache, memory_prefix_mask = self.fetch_memory(memory)
 
         # if jax.process_index() == 0:
         #     jax.debug.print("x1, {}, {}", memory_kv_cache is None, memory_prefix_mask is None)
 
-        prefix_tokens, prefix_mask, prefix_ar_mask, num_visual_tokens, num_text_tokens = self.embed_prefix_infer(observation, memory_tokens)
+        image_tokens = self._frame_tokens(observation)
+        prefix_tokens, prefix_mask, prefix_ar_mask, num_visual_tokens, num_text_tokens = self.embed_prefix_infer(
+            observation, memory_tokens, image_tokens)
 
         # prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
 
@@ -646,9 +780,10 @@ class Pi0(_model.BaseModel):
         prior = None
         if self.race:
             prior = self.race_prior(observation, prefix_mask, kv_cache, noise, current_prefix_len=prefix_tokens.shape[1])
-        return prefix_mask, kv_cache, prior
+        memory_bank = self._serving_memory_bank(observation, image_tokens, memory) if self.uses_memory_bank else None
+        return prefix_mask, kv_cache, prior, memory_bank
 
-    def _denoise(self, observation, prefix_mask, kv_cache, noise, num_steps, prior):
+    def _denoise(self, observation, prefix_mask, kv_cache, noise, num_steps, prior, memory_bank=None):
         dt = -1.0 / num_steps
         batch_size = noise.shape[0]
 
@@ -656,7 +791,7 @@ class Pi0(_model.BaseModel):
             x_t, time = carry
             time_ = jnp.broadcast_to(time, batch_size)  # (b, )
             race_cond = None if prior is None else self.race_step_conditioning(prior, time, num_steps)
-            v_t, _ = self._suffix_pass(observation, prefix_mask, kv_cache, x_t, time_[:, None], race_cond)
+            v_t, _ = self._suffix_pass(observation, prefix_mask, kv_cache, x_t, time_[:, None], race_cond, memory_bank)
             return x_t + dt * v_t, time + dt
 
         def cond(carry):
@@ -668,7 +803,7 @@ class Pi0(_model.BaseModel):
             x_0, _ = jax.lax.while_loop(cond, step, (noise, jnp.float32(1.0)))
         return x_0
 
-    def _suffix_pass(self, observation, prefix_mask, kv_cache, x_t, timestep, race_cond=None):
+    def _suffix_pass(self, observation, prefix_mask, kv_cache, x_t, timestep, race_cond=None, memory_bank=None):
         """One action-expert pass over a cached prefix: (velocity, the final-layer hidden states of the action
         rows). `observation` is preprocessed; `prefix_mask` (b, cached tokens) covers every cached token."""
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, timestep)
@@ -691,6 +826,7 @@ class Pi0(_model.BaseModel):
             kv_cache=kv_cache,
             adarms_cond=[None, adarms_cond],
             race_cond=race_cond,
+            memory_bank=memory_bank,
         )
         assert prefix_out is None
         hidden = suffix_out[:, -self.action_horizon :]

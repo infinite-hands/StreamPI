@@ -105,6 +105,10 @@ class Policy(BasePolicy):
         is_start = step % self._model.hist_horizon == 0
         if is_start:
             self._model.reset_memory(self.memory)
+            # The compressed memory (Pi0Config.memory_frames, state_history) outlives the KV window: only a new episode, the
+            # client's step counter back at 0, clears it.
+            if step == 0 and hasattr(self._model, "reset_long_memory"):
+                self._model.reset_long_memory(self.memory)
 
         # if jax.process_index() == 0:
         #     jax.debug.print("x2, {}, {}", step, is_start)

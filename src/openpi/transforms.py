@@ -22,6 +22,10 @@ RACE_STORE_ARRAYS = {"episode_index": np.int32, "frame_index": np.int32, "transi
                      "weight": np.float32}
 # The training targets RaceTargets adds to a sample (Observation.transition_window / transition_window_mask).
 RACE_TARGET_KEYS = ("transition_window", "transition_window_mask")
+# Compressed memory (Pi0Config.memory_frames): the sample's older frames of its camera, newest first, and which of them exist.
+MEMORY_KEYS = ("memory_image", "memory_mask")
+# Measured-state history (Pi0Config.state_history): the sample's earlier states, newest first, and which of them exist.
+STATE_HISTORY_KEYS = ("state_history", "state_history_mask")
 # A RACE model's served output: its head's transition score for each returned action row.
 TRANSITION_SCORES_KEY = "transition_scores"
 _RACE_STORES: dict[str, dict[str, np.ndarray]] = {}
@@ -202,6 +206,65 @@ def history_frame_offsets(
     return tuple(sorted({min(0, max(oldest, -slot * hist_interval + jitter)) for slot in range(hist_horizon) for jitter in jitters}))
 
 
+def memory_frame_offsets(
+    hist_horizon: int, hist_interval: int, memory_frames: int, memory_stride: int
+) -> tuple[int, ...]:
+    """The frame offsets from the current frame (oldest first, all older than the history window) a model with
+    `memory_frames` reads: slot i is Pi0Config.memory_ages[i] calls back, a call being hist_interval frames."""
+    return tuple(
+        -((hist_horizon - 1) + (slot + 1) * memory_stride) * hist_interval for slot in reversed(range(memory_frames)))
+
+
+@dataclasses.dataclass(frozen=True)
+class SplitMemoryFrames(DataTransformFn):
+    """Takes the leading `frames` entries of a camera's fetched sequence (memory_frame_offsets, oldest first, then the
+    history window) off as the sample's memory: `memory_image` (newest first, so slot i is row i) and `memory_mask`,
+    False where the frame lies before the episode's start (LeRobot's `<key>_is_pad`; its image is the first frame's).
+    Runs before TemporalJitter, which then sees the window alone."""
+
+    key: str
+    frames: int
+
+    def __call__(self, data: DataDict) -> DataDict:
+        sequence = np.asarray(data[self.key])
+        pad_key = f"{self.key}_is_pad"
+        padded = np.asarray(data[pad_key], dtype=bool) if pad_key in data else np.zeros(len(sequence), dtype=bool)
+        data["memory_image"] = np.ascontiguousarray(sequence[: self.frames][::-1])
+        data["memory_mask"] = np.ascontiguousarray(~padded[: self.frames][::-1])
+        data[self.key] = sequence[self.frames :]
+        if pad_key in data:
+            data[pad_key] = padded[self.frames :]
+        return data
+
+
+def state_history_offsets(hist_interval: int, first_age: int, rows: int) -> tuple[int, ...]:
+    """The frame offsets (oldest first) of a model's state-history rows: row j is the state first_age + j calls back,
+    a call being hist_interval frames (Pi0Config.state_history_ages)."""
+    return tuple(-age * hist_interval for age in reversed(range(first_age, first_age + rows)))
+
+
+@dataclasses.dataclass(frozen=True)
+class SplitStateHistory(DataTransformFn):
+    """Splits the state column fetched at state_history_offsets plus offset 0 (oldest first) into the sample's current state
+    (the last entry, as the column always held) and its history: `state_history` (newest first, so row j is the state
+    first_age + j calls back) and `state_history_mask`, False where the row lies before the episode's start (LeRobot's
+    `<key>_is_pad`; its value is the first state's)."""
+
+    key: str
+    rows: int
+
+    def __call__(self, data: DataDict) -> DataDict:
+        sequence = np.asarray(data[self.key])
+        pad_key = f"{self.key}_is_pad"
+        padded = np.asarray(data[pad_key], dtype=bool) if pad_key in data else np.zeros(len(sequence), dtype=bool)
+        data["state_history"] = np.ascontiguousarray(sequence[: self.rows][::-1])
+        data["state_history_mask"] = np.ascontiguousarray(~padded[: self.rows][::-1])
+        data[self.key] = sequence[self.rows]
+        if pad_key in data:
+            data[pad_key] = padded[self.rows]
+        return data
+
+
 @dataclasses.dataclass(frozen=True)
 class TemporalJitter(DataTransformFn):
     jitter_range: None
@@ -248,15 +311,16 @@ class TemporalJitter(DataTransformFn):
 
 
 NOW_STATE_KEY = "state_now"   # the measured state at the image's frame, beside the state at t + delta
+STATE_HISTORY_NORM_KEY = "state_history"   # the earlier states are normalized with the state's own statistics
 DELTA_KEY = "vlash_delta"     # delta / max_offset: how far the state runs ahead of the image
 
 
 def output_norm_stats(norm_stats):
-    """The norm stats Unnormalize gets: without the input-only NOW_STATE_KEY, which no model output carries
-    (Unnormalize is strict, so leaving it in failed every serve call of a vlash_cond_now config)."""
+    """The norm stats Unnormalize gets: without the input-only NOW_STATE_KEY and STATE_HISTORY_NORM_KEY, which no model
+    output carries (Unnormalize is strict, so leaving the first in failed every serve call of a vlash_cond_now config)."""
     if norm_stats is None:
         return None
-    return {key: value for key, value in norm_stats.items() if key != NOW_STATE_KEY}
+    return {key: value for key, value in norm_stats.items() if key not in (NOW_STATE_KEY, STATE_HISTORY_NORM_KEY)}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -406,6 +470,9 @@ class ResizeImages(DataTransformFn):
                 data["image"][k] = np.stack(images)
             else:
                 raise ValueError
+        if data.get("memory_image") is not None:
+            data["memory_image"] = np.stack(
+                [image_tools.resize_with_pad(frame, self.height, self.width) for frame in data["memory_image"]])
         # import cv2
         # T, H, W, _ = data["image"]["base_0_rgb"].shape
         # frames_list = [data["image"]["base_0_rgb"][i] for i in range(T)]
