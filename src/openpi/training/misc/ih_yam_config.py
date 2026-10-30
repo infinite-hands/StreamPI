@@ -21,7 +21,11 @@ BAGGING_LEFT_REAL_REPO_ID = "local/yam_bagging_left_real_20260924"
 # was held, except in four takes where a left policy ran beside the teleop.
 BAGGING_RIGHT_REAL_REPO_ID = "local/yam_bagging_right_real_20261002"
 BAGGING_PROMPT = "place one part in the bag"
-STATE_DIM = 14                      # [L j0..5, L grip, R j0..5, R grip]
+# The accepted right-arm sort-piles teleop of 2026-10-28 (--leaders right, left arm absent), converted with the overhead
+# and right-wrist cameras only. Every episode carries this one task string; which pile a piece goes to is read from the scene.
+SORT_RIGHT_REAL_REPO_ID = "local/yam_sort_right_real_20261028"
+SORT_PROMPT = "sort the pieces onto their piles"
+STATE_DIM = 14                     # [L j0..5, L grip, R j0..5, R grip]
 LEFT_ARM_DIMS = tuple(range(7))    # [L j0..5, L grip]
 RIGHT_ARM_DIMS = tuple(range(7, 14))  # [R j0..5, R grip]
 # T = 5 frames of temporal context, the setting behind every real-robot result in the paper.
@@ -49,6 +53,13 @@ ACTION_HORIZON = 30
 VLASH_REFERENCE_MAX_OFFSET = 8
 # A longer range for a deploy whose round trip runs past 8 rows (~270 ms at 30 Hz): the `_vlash12mpc` twin.
 VLASH_LONG_MAX_OFFSET = 12
+# The long-chunk sort recipe, for a link whose round trip runs well past 12 rows. The horizon is pi0.5's own base
+# default (50), so the pretrained action expert runs at the length it was trained at; 40 rows are played per call,
+# leaving 10 of margin; and the offsets reach 30 rows, the 1 s of round trip the operator asked it to cover. None of the
+# three has been trained above the 30 / 20 / 12 of the bagging recipes.
+SORT_WIDE_ACTION_HORIZON = 50
+SORT_WIDE_HIST_INTERVAL = 40
+SORT_WIDE_VLASH_OFFSET = 30
 # The YAM LeRobot layout: three cameras, 14-dim state/action [L j0..5, L grip, R j0..5, R grip].
 YAM_CAMERAS = ("cam_high", "cam_left_wrist", "cam_right_wrist")
 # RACE twins (arXiv 2610.05719) read their transition targets from <this>/<dataset repo id> on the misc Volume,
@@ -131,7 +142,7 @@ def get_ih_yam_configs():
             )
 
     def stream_config(name: str, repo_id: str, prompt: str, *, lora: bool,
-                      hist_interval: int = HIST_INTERVAL,
+                      hist_interval: int = HIST_INTERVAL, action_horizon: int = ACTION_HORIZON,
                       active_image_keys: frozenset[str] | None = None,
                       active_state_dims: tuple[int, ...] | None = None,
                       held_action_dims: tuple[int, ...] | None = None,
@@ -150,7 +161,7 @@ def get_ih_yam_configs():
         kept_cameras = tuple(cameras[key] for key in image_keys)
         model = pi0_config.Pi0Config(
             pi05=True,
-            action_horizon=ACTION_HORIZON,
+            action_horizon=action_horizon,
             hist_horizon=HIST_HORIZON,
             paligemma_variant="gemma_2b_lora" if lora else "gemma_2b",
             action_expert_variant="gemma_300m_lora" if lora else "gemma_300m",
@@ -238,6 +249,22 @@ def get_ih_yam_configs():
              active_state_dims=RIGHT_ARM_DIMS,
              held_action_dims=LEFT_ARM_DIMS,
              encode_only_active_cameras=True),
+        # Sort piles, real right-arm teleop. Unlike right-real it keeps the overhead view beside the wrist: the pile a
+        # piece belongs to changes per episode and is read from the scene. The left arm is absent, so it is held.
+        dict(name="pi05_yam_stream5_i20_sort_right_real", repo_id=SORT_RIGHT_REAL_REPO_ID,
+             prompt=SORT_PROMPT, lora=True, hist_interval=HIST_INTERVAL_WIDE,
+             active_image_keys=frozenset({"base_0_rgb", "right_wrist_0_rgb"}),
+             active_state_dims=RIGHT_ARM_DIMS,
+             held_action_dims=LEFT_ARM_DIMS,
+             encode_only_active_cameras=True),
+        # The same data at the long-chunk shape (SORT_WIDE_*): a 50-row horizon played 40 rows per call.
+        dict(name="pi05_yam_stream5_i40_h50_sort_right_real", repo_id=SORT_RIGHT_REAL_REPO_ID,
+             prompt=SORT_PROMPT, lora=True, hist_interval=SORT_WIDE_HIST_INTERVAL,
+             action_horizon=SORT_WIDE_ACTION_HORIZON,
+             active_image_keys=frozenset({"base_0_rgb", "right_wrist_0_rgb"}),
+             active_state_dims=RIGHT_ARM_DIMS,
+             held_action_dims=LEFT_ARM_DIMS,
+             encode_only_active_cameras=True),
     ]
 
     def vlash_twin(recipe: dict) -> dict:
@@ -293,9 +320,16 @@ def get_ih_yam_configs():
         return {**recipe, "name": recipe["name"] + "_race", "race": True, "norm_stats_config": recipe["name"],
                 "encode_only_active_cameras": recipe.get("active_image_keys") is not None}
 
+    def vlash_wide_conditioned_twin(recipe: dict) -> dict:
+        # `_vlash12mpc` with offsets 0-SORT_WIDE_VLASH_OFFSET, one branch per offset: leads up to a second of round trip.
+        return {**vlash_conditioned_twin(recipe), "name": recipe["name"] + f"_vlash{SORT_WIDE_VLASH_OFFSET}mpc",
+                "vlash_max_offset": SORT_WIDE_VLASH_OFFSET, "vlash_branches": SORT_WIDE_VLASH_OFFSET + 1}
+
     race_twins = [race_twin(recipe) for recipe in recipes if recipe["name"] in RACE_TWIN_BASES]
+    wide_twins = [vlash_wide_conditioned_twin(recipe) for recipe in recipes
+                  if recipe.get("hist_interval") == SORT_WIDE_HIST_INTERVAL]
     return [stream_config(**recipe) for recipe in
             recipes + [vlash_twin(recipe) for recipe in recipes] + [vlash_reference_twin(recipe) for recipe in recipes]
             + [vlash_measured_twin(recipe) for recipe in recipes] + [vlash_packed_measured_twin(recipe) for recipe in recipes]
             + [vlash_conditioned_twin(recipe) for recipe in recipes] + [vlash_long_conditioned_twin(recipe) for recipe in recipes]
-            + [vlash_packed_twin(recipe) for recipe in recipes] + race_twins]
+            + [vlash_packed_twin(recipe) for recipe in recipes] + race_twins + wide_twins]
