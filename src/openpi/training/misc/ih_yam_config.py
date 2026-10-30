@@ -25,6 +25,9 @@ BAGGING_PROMPT = "place one part in the bag"
 # and right-wrist cameras only. Every episode carries this one task string; which pile a piece goes to is read from the scene.
 SORT_RIGHT_REAL_REPO_ID = "local/yam_sort_right_real_20261028"
 SORT_PROMPT = "sort the pieces onto their piles"
+# The same episodes retimed to twice their recorded speed (convert_to_lerobot --speed 2.0, gripper-aware): a policy trained on it moves
+# faster than the demonstrator did, so it is a different model and its name and dataset say so.
+SORT_RIGHT_REAL_2X_REPO_ID = "local/yam_sort_right_real_20261028_timecompressed2x"
 STATE_DIM = 14                     # [L j0..5, L grip, R j0..5, R grip]
 LEFT_ARM_DIMS = tuple(range(7))    # [L j0..5, L grip]
 RIGHT_ARM_DIMS = tuple(range(7, 14))  # [R j0..5, R grip]
@@ -265,6 +268,14 @@ def get_ih_yam_configs():
                active_state_dims=RIGHT_ARM_DIMS,
                held_action_dims=LEFT_ARM_DIMS,
                encode_only_active_cameras=True) for interval in SORT_WIDE_VLASH_OFFSET_BY_INTERVAL),
+        # The 50-row horizon played whole, on the time-compressed episodes.
+        dict(name="pi05_yam_stream5_i50_h50_sort_right_real_timecompressed2x", repo_id=SORT_RIGHT_REAL_2X_REPO_ID,
+             prompt=SORT_PROMPT, lora=True, hist_interval=50,
+             action_horizon=SORT_WIDE_ACTION_HORIZON,
+             active_image_keys=frozenset({"base_0_rgb", "right_wrist_0_rgb"}),
+             active_state_dims=RIGHT_ARM_DIMS,
+             held_action_dims=LEFT_ARM_DIMS,
+             encode_only_active_cameras=True),
     ]
 
     def vlash_twin(recipe: dict) -> dict:
