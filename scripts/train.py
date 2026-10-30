@@ -88,6 +88,8 @@ def init_train_state(
     tx = _optimizer.create_optimizer(config.optimizer, config.lr_schedule, weight_decay_mask=None)
     if config.vision_lr_scale != 1.0:
         tx = _optimizer.scale_updates(tx, config.vision_lr_scale, _optimizer.VISION_PARAMS_REGEX)
+    if config.memory_gate_lr_scale != 1.0:
+        tx = _optimizer.scale_updates(tx, config.memory_gate_lr_scale, _optimizer.MEMORY_GATE_PARAMS_REGEX)
 
     def init(rng: at.KeyArrayLike, partial_params: at.Params | None = None) -> training_utils.TrainState:
         rng, model_rng = jax.random.split(rng)

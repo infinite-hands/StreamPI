@@ -678,6 +678,9 @@ class TrainConfig:
     ema_decay: float | None = 0.99
     # Multiplies the vision tower's (SigLIP's) learning rate; 1.0 leaves the optimizer exactly as it was.
     vision_lr_scale: float = 1.0
+    # Multiplies the learning rate of the memory read's zero-initialised gate (one scalar per layer); 1.0 leaves the optimizer
+    # exactly as it was. The gate starts at 0, so at a small warm-start learning rate it cannot travel far from it.
+    memory_gate_lr_scale: float = 1.0
     # Hide the robot state from the model (set it to the normalized midpoint) on this fraction of training samples,
     # and add noise of this std to it on the rest, so the policy has to look at the cameras. Needs a config that
     # carries the state as text.

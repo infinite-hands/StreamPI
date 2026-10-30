@@ -114,6 +114,9 @@ def create_optimizer(
 # SigLIP sits under PaliGemma/img (pi0.py), outside the llm subtree the freeze filter matches.
 VISION_PARAMS_REGEX = ".*PaliGemma/img/.*"
 
+# The zero-initialised scalar that gates the memory read in each attention layer (gemma.Attention).
+MEMORY_GATE_PARAMS_REGEX = ".*memory_gate.*"
+
 
 def _path_labels(path_regex: str):
     pattern = re.compile(path_regex)
