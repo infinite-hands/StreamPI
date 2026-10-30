@@ -42,7 +42,7 @@ HIST_INTERVAL = 10
 # observation half as often. Model shape is untouched -- HIST_HORIZON and ACTION_HORIZON set the
 # token count and KV-cache size -- so fsdp_devices and batch_size below are unchanged.
 HIST_INTERVAL_WIDE = 20
-# A 15-frame cadence (0.5 s) for a serve whose round trip fits it: the right-real recipe only, see cadence_recipes.
+# A 15-frame cadence (0.5 s) for a serve whose round trip fits it: the right-real and left-real recipes, see cadence_recipes.
 HIST_INTERVAL_MID = 15
 ACTION_HORIZON = 30
 # The reference implementation's offset range (mit-han-lab/vlash, examples/train/*/async*.yaml:
@@ -80,6 +80,14 @@ MEMORY_FRAMES, MEMORY_STRIDE, MEMORY_TOKENS, MEMORY_DIM = 16, 4, 8, 512
 # 15-frame cadence; the nearest row is skipped) read through the same zero-gated bank.
 HIST_TWIN_BASES: tuple[str, ...] = ("pi05_yam_stream5_i15_bagging_right_real",)
 STATE_HISTORY_ROWS, STATE_HISTORY_FIRST_AGE = 8, 2
+# The recipes that get the left arm's 15-frame cadence recipe (cadence_recipes), alongside the right-real one.
+CADENCE_RECIPE_BASES: tuple[str, ...] = ("pi05_yam_stream5_i20_bagging_right_real",
+                                         "pi05_yam_stream5_i20_bagging_left_real")
+# The recipes that get a `_combo` twin: a rank-128 expert LoRA, 336 px, a DINOv2 branch, image memory and state history together, on
+# one wrist camera (the image memory is wired for one). Warm-started from a checkpoint of the same 15-frame recipe: every new
+# weight starts at zero or is resampled, so step 0 is near that checkpoint, not equal (the 336 px position embedding is resampled).
+COMBO_TWIN_BASES: tuple[str, ...] = ("pi05_yam_stream5_i15_bagging_left_real",)
+COMBO_SUFFIX = "_xr128_px336_dino_mem_hist"
 
 
 def yam_repack(cameras: tuple[str, ...] = YAM_CAMERAS, *, vlash_cond_now: bool = False,
@@ -393,17 +401,28 @@ def get_ih_yam_configs():
         return {**recipe, "name": recipe["name"] + "_hist", "state_history": STATE_HISTORY_ROWS,
                 "norm_stats_config": recipe["name"]}
 
+    def combo_twin(recipe: dict) -> dict:
+        # The recipe with every opt-in single-camera feature at once, warm-started from a checkpoint of the same recipe. It keeps
+        # the recipe's norm stats, like the other twins.
+        return {**recipe, "name": recipe["name"] + COMBO_SUFFIX, "expert_lora_rank": 128, "image_resolution": PX336_RESOLUTION,
+                "dino_variant": DINO_VARIANT, "memory_frames": MEMORY_FRAMES, "state_history": STATE_HISTORY_ROWS,
+                "norm_stats_config": recipe["name"]}
+
     race_twins = [race_twin(recipe) for recipe in recipes if recipe["name"] in RACE_TWIN_BASES]
     xr128_twins = [expert_rank_twin(recipe) for recipe in recipes if recipe["name"] in XR128_TWIN_BASES]
     px336_twins = [px336_twin(recipe) for recipe in recipes if recipe["name"] in PX336_TWIN_BASES]
     cam2_twins = [two_camera_twin(recipe) for recipe in recipes if recipe["name"] in CAM2_TWIN_BASES]
     dino_twins = [dino_twin(recipe) for recipe in recipes if recipe["name"] in DINO_TWIN_BASES]
-    cadence_recipes = [{**recipe, "name": recipe["name"].replace("_i20_", "_i15_"), "hist_interval": HIST_INTERVAL_MID}
-                       for recipe in recipes if recipe["name"] == "pi05_yam_stream5_i20_bagging_right_real"]
+    # The 15-frame recipe skips the cameras it masks (the same model): the image memory needs exactly one image key, and it is ~3.6x
+    # cheaper to decode. The right-real recipe already does; the left-real one gains it here.
+    cadence_recipes = [{**recipe, "name": recipe["name"].replace("_i20_", "_i15_"), "hist_interval": HIST_INTERVAL_MID,
+                        "encode_only_active_cameras": True}
+                       for recipe in recipes if recipe["name"] in CADENCE_RECIPE_BASES]
     mem_twins = [memory_twin(recipe) for recipe in cadence_recipes if recipe["name"] in MEM_TWIN_BASES]
     hist_twins = [history_twin(recipe) for recipe in cadence_recipes if recipe["name"] in HIST_TWIN_BASES]
+    combo_twins = [combo_twin(recipe) for recipe in cadence_recipes if recipe["name"] in COMBO_TWIN_BASES]
     return [stream_config(**recipe) for recipe in
             recipes + [vlash_twin(recipe) for recipe in recipes] + [vlash_reference_twin(recipe) for recipe in recipes]
             + [vlash_measured_twin(recipe) for recipe in recipes] + [vlash_packed_measured_twin(recipe) for recipe in recipes]
             + [vlash_conditioned_twin(recipe) for recipe in recipes] + [vlash_long_conditioned_twin(recipe) for recipe in recipes]
-            + [vlash_packed_twin(recipe) for recipe in recipes] + race_twins + xr128_twins + px336_twins + cam2_twins + dino_twins + cadence_recipes + mem_twins + hist_twins]
+            + [vlash_packed_twin(recipe) for recipe in recipes] + race_twins + xr128_twins + px336_twins + cam2_twins + dino_twins + cadence_recipes + mem_twins + hist_twins + combo_twins]
