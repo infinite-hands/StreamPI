@@ -90,6 +90,9 @@ DINO_VARIANT = "base"
 # (beyond the 5 dense frames), reach 68 calls = 34 s at the 15-frame cadence, a few cycles of a bag; 8 tokens per frame.
 MEM_TWIN_BASES: tuple[str, ...] = ("pi05_yam_stream5_i15_bagging_right_real",)
 MEMORY_FRAMES, MEMORY_STRIDE, MEMORY_TOKENS, MEMORY_DIM = 16, 4, 8, 512
+# The sort-right memory recipe plays a call every 50 rows, not 15, so the stride counts 1 call: the 16 slots then sit 5 to 20 calls back,
+# 8 to 33 s at 30 Hz, close to the 34 s the 15-row recipe's stride of 4 spans, and inside the median 43 s sort episode.
+SORT_MEMORY_STRIDE = 1
 # The recipes that get a `_hist` twin: the driven arm's measured state at 8 earlier calls (2 to 9 calls back, 1 s to 4.5 s at the
 # 15-frame cadence; the nearest row is skipped) read through the same zero-gated bank.
 HIST_TWIN_BASES: tuple[str, ...] = ("pi05_yam_stream5_i15_bagging_right_real",)
@@ -210,7 +213,7 @@ def get_ih_yam_configs():
                       expert_lora_rank: int | None = None,
                       image_resolution: tuple[int, int] | None = None,
                       dino_variant: str | None = None,
-                      memory_frames: int = 0, state_history: int = 0):
+                      memory_frames: int = 0, state_history: int = 0, memory_stride: int = MEMORY_STRIDE):
         # A masked camera's tokens are padding, so a recipe may skip decoding and encoding them: the same
         # model, one SigLIP pass per frame instead of three and a third of the prefix. Opt-in per config
         # because it changes the model's input layout (not its weights).
@@ -239,7 +242,7 @@ def get_ih_yam_configs():
             race=race,
             image_resolution=image_resolution or IMAGE_RESOLUTION,
             dino_variant=dino_variant,
-            **({"memory_frames": memory_frames, "memory_stride": MEMORY_STRIDE, "memory_tokens": MEMORY_TOKENS,
+            **({"memory_frames": memory_frames, "memory_stride": memory_stride, "memory_tokens": MEMORY_TOKENS,
                 "memory_dim": MEMORY_DIM} if memory_frames else {}),
             **({"state_history": state_history, "state_history_first_age": STATE_HISTORY_FIRST_AGE,
                 "state_history_dims": active_state_dims} if state_history else {}),
@@ -452,6 +455,20 @@ def get_ih_yam_configs():
                 "dino_variant": DINO_VARIANT, "memory_frames": MEMORY_FRAMES, "state_history": STATE_HISTORY_ROWS,
                 "norm_stats_config": recipe["name"]}
 
+    # Sort piles, right wrist only (the image memory is wired for one camera): the whole 50-row chunk played, a rank-128 expert LoRA, 336 px
+    # frames, a DINOv2 branch, image memory, and VLASH offsets 0-49 UNPACKED. Pi0Config refuses the memory bank beside packed vlash_branches
+    # and the loader refuses a state history beside any VLASH offset, so there is neither a `p` nor a `_hist`; state_cond carries the lead
+    # (the measured state at it, the state at the image and the offset). Cold from pi05_base: no checkpoint of this recipe exists to
+    # warm-start from, so it keeps its own norm stats.
+    sort_memory_recipes = [dict(
+        name="pi05_yam_stream5_i50_h50_sort_right_real_wrist_xr128_px336_dino_mem_vlash49mc", repo_id=SORT_RIGHT_REAL_REPO_ID,
+        prompt=SORT_PROMPT, lora=True, hist_interval=50, action_horizon=SORT_WIDE_ACTION_HORIZON,
+        active_image_keys=frozenset({"right_wrist_0_rgb"}), active_state_dims=RIGHT_ARM_DIMS, held_action_dims=LEFT_ARM_DIMS,
+        encode_only_active_cameras=True,
+        vlash_max_offset=SORT_WIDE_VLASH_OFFSET_BY_INTERVAL[50], vlash_branches=0, state_cond=True,
+        vlash_state_source="state", vlash_cond_now=True, num_train_steps=10_000,
+        expert_lora_rank=128, image_resolution=PX336_RESOLUTION, dino_variant=DINO_VARIANT,
+        memory_frames=MEMORY_FRAMES, memory_stride=SORT_MEMORY_STRIDE)]
     race_twins = [race_twin(recipe) for recipe in recipes if recipe["name"] in RACE_TWIN_BASES]
     xr128_twins = [expert_rank_twin(recipe) for recipe in recipes if recipe["name"] in XR128_TWIN_BASES]
     px336_twins = [px336_twin(recipe) for recipe in recipes if recipe["name"] in PX336_TWIN_BASES]
@@ -471,4 +488,4 @@ def get_ih_yam_configs():
             recipes + [vlash_twin(recipe) for recipe in recipes] + [vlash_reference_twin(recipe) for recipe in recipes]
             + [vlash_measured_twin(recipe) for recipe in recipes] + [vlash_packed_measured_twin(recipe) for recipe in recipes]
             + [vlash_conditioned_twin(recipe) for recipe in recipes] + [vlash_long_conditioned_twin(recipe) for recipe in recipes]
-            + [vlash_packed_twin(recipe) for recipe in recipes] + race_twins + xr128_twins + px336_twins + cam2_twins + dino_twins + cadence_recipes + mem_twins + hist_twins + combo_twins + wide_twins]
+            + [vlash_packed_twin(recipe) for recipe in recipes] + race_twins + xr128_twins + px336_twins + cam2_twins + dino_twins + cadence_recipes + mem_twins + hist_twins + combo_twins + wide_twins + sort_memory_recipes]

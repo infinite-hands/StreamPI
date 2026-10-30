@@ -66,3 +66,34 @@ def test_the_time_compressed_recipe_is_the_whole_chunk_recipe_on_its_own_labelle
 def test_bagging_recipes_keep_their_horizon():
     for name in ("pi05_yam_stream5_i20_bagging_right_real", "pi05_yam_stream5_i20_bagging_right_real_vlash12mpc"):
         assert _config.get_config(name).model.action_horizon == ih_yam_config.ACTION_HORIZON == 30
+
+
+MEMORY_RECIPE = "pi05_yam_stream5_i50_h50_sort_right_real_wrist_xr128_px336_dino_mem_vlash49mc"
+
+
+def test_the_memory_recipe_is_one_wrist_camera_with_every_opt_in_feature_but_no_packing_or_state_history():
+    config = _config.get_config(MEMORY_RECIPE)
+    model, data = config.model, config.data
+    assert (model.action_horizon, data.base_config.hist_interval) == (50, 50)
+    assert data.active_image_keys == frozenset({"right_wrist_0_rgb"}) and tuple(model.image_keys) == ("right_wrist_0_rgb",)
+    assert len(data.hist_sequence_keys) == 1, "the image memory is wired for exactly one camera"
+    assert (model.image_resolution, model.dino_variant, model.action_expert_variant) == (
+        ih_yam_config.PX336_RESOLUTION, ih_yam_config.DINO_VARIANT, "gemma_300m_lora_r128")
+    assert (model.memory_frames, model.memory_stride) == (ih_yam_config.MEMORY_FRAMES, ih_yam_config.SORT_MEMORY_STRIDE)
+    assert not model.state_history, "the loader refuses a state history beside any VLASH offset"
+    assert model.vlash_branches == 0 and data.base_config.vlash_branches == 0, "the model refuses the memory bank beside packed branches"
+    base = data.base_config
+    assert (base.vlash_max_offset, base.vlash_state_source, base.vlash_cond_now) == (49, "state", True)
+    assert model.state_cond and model.state_cond_dims == ih_yam_config.vlash_cond_dims(ih_yam_config.RIGHT_ARM_DIMS)
+    assert data.active_state_dims == ih_yam_config.RIGHT_ARM_DIMS and data.held_action_dims == ih_yam_config.LEFT_ARM_DIMS
+    assert data.repo_id == ih_yam_config.SORT_RIGHT_REAL_REPO_ID and data.norm_stats_config is None, "cold start: its own norm stats"
+
+
+def test_the_memory_recipe_leaves_the_gate_learning_rate_alone_because_no_other_value_is_measured():
+    assert _config.get_config(MEMORY_RECIPE).memory_gate_lr_scale == 1.0
+
+
+def test_the_memory_slots_of_the_memory_recipe_span_less_than_a_sort_episode():
+    model = _config.get_config(MEMORY_RECIPE).model
+    rows = [age * 50 for age in model.memory_ages]
+    assert min(rows) / 30 > 8 and max(rows) / 30 < 43, "8 to 33 s back, inside the median 43 s episode"
