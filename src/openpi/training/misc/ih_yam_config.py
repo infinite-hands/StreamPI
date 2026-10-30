@@ -53,13 +53,13 @@ ACTION_HORIZON = 30
 VLASH_REFERENCE_MAX_OFFSET = 8
 # A longer range for a deploy whose round trip runs past 8 rows (~270 ms at 30 Hz): the `_vlash12mpc` twin.
 VLASH_LONG_MAX_OFFSET = 12
-# The long-chunk sort recipe, for a link whose round trip runs well past 12 rows. The horizon is pi0.5's own base
-# default (50), so the pretrained action expert runs at the length it was trained at; 40 rows are played per call,
-# leaving 10 of margin; and the offsets reach 30 rows, the 1 s of round trip the operator asked it to cover. None of the
-# three has been trained above the 30 / 20 / 12 of the bagging recipes.
+# The long-chunk sort recipes, for a link whose round trip runs well past 12 rows. The horizon is pi0.5's own base default
+# (50), so the pretrained action expert runs at the length it was trained at. A lead cannot pass the played window (hist_interval
+# - 1) and the window cannot pass the horizon, so a 50-row horizon allows offsets 0-49 at most, with the whole chunk played; the
+# 40-row window leads up to 30 rows, the 1 s of round trip the operator asked it to cover and leaves 10 rows of margin. Nothing
+# here has been trained above the 30 / 20 / 12 of the bagging recipes.
 SORT_WIDE_ACTION_HORIZON = 50
-SORT_WIDE_HIST_INTERVAL = 40
-SORT_WIDE_VLASH_OFFSET = 30
+SORT_WIDE_VLASH_OFFSET_BY_INTERVAL = {40: 30, 50: 49}   # played rows per call -> the largest lead its `_vlash<N>mpc` twin trains
 # The YAM LeRobot layout: three cameras, 14-dim state/action [L j0..5, L grip, R j0..5, R grip].
 YAM_CAMERAS = ("cam_high", "cam_left_wrist", "cam_right_wrist")
 # RACE twins (arXiv 2610.05719) read their transition targets from <this>/<dataset repo id> on the misc Volume,
@@ -257,14 +257,14 @@ def get_ih_yam_configs():
              active_state_dims=RIGHT_ARM_DIMS,
              held_action_dims=LEFT_ARM_DIMS,
              encode_only_active_cameras=True),
-        # The same data at the long-chunk shape (SORT_WIDE_*): a 50-row horizon played 40 rows per call.
-        dict(name="pi05_yam_stream5_i40_h50_sort_right_real", repo_id=SORT_RIGHT_REAL_REPO_ID,
-             prompt=SORT_PROMPT, lora=True, hist_interval=SORT_WIDE_HIST_INTERVAL,
-             action_horizon=SORT_WIDE_ACTION_HORIZON,
-             active_image_keys=frozenset({"base_0_rgb", "right_wrist_0_rgb"}),
-             active_state_dims=RIGHT_ARM_DIMS,
-             held_action_dims=LEFT_ARM_DIMS,
-             encode_only_active_cameras=True),
+        # The same data at the long-chunk shapes (SORT_WIDE_*): a 50-row horizon played 40 rows per call, and played whole.
+        *(dict(name=f"pi05_yam_stream5_i{interval}_h50_sort_right_real", repo_id=SORT_RIGHT_REAL_REPO_ID,
+               prompt=SORT_PROMPT, lora=True, hist_interval=interval,
+               action_horizon=SORT_WIDE_ACTION_HORIZON,
+               active_image_keys=frozenset({"base_0_rgb", "right_wrist_0_rgb"}),
+               active_state_dims=RIGHT_ARM_DIMS,
+               held_action_dims=LEFT_ARM_DIMS,
+               encode_only_active_cameras=True) for interval in SORT_WIDE_VLASH_OFFSET_BY_INTERVAL),
     ]
 
     def vlash_twin(recipe: dict) -> dict:
@@ -321,13 +321,14 @@ def get_ih_yam_configs():
                 "encode_only_active_cameras": recipe.get("active_image_keys") is not None}
 
     def vlash_wide_conditioned_twin(recipe: dict) -> dict:
-        # `_vlash12mpc` with offsets 0-SORT_WIDE_VLASH_OFFSET, one branch per offset: leads up to a second of round trip.
-        return {**vlash_conditioned_twin(recipe), "name": recipe["name"] + f"_vlash{SORT_WIDE_VLASH_OFFSET}mpc",
-                "vlash_max_offset": SORT_WIDE_VLASH_OFFSET, "vlash_branches": SORT_WIDE_VLASH_OFFSET + 1}
+        # `_vlash12mpc` with offsets 0-N for the N its played window allows (SORT_WIDE_VLASH_OFFSET_BY_INTERVAL), one branch each.
+        offset = SORT_WIDE_VLASH_OFFSET_BY_INTERVAL[recipe["hist_interval"]]
+        return {**vlash_conditioned_twin(recipe), "name": recipe["name"] + f"_vlash{offset}mpc",
+                "vlash_max_offset": offset, "vlash_branches": offset + 1}
 
     race_twins = [race_twin(recipe) for recipe in recipes if recipe["name"] in RACE_TWIN_BASES]
     wide_twins = [vlash_wide_conditioned_twin(recipe) for recipe in recipes
-                  if recipe.get("hist_interval") == SORT_WIDE_HIST_INTERVAL]
+                  if recipe.get("action_horizon") == SORT_WIDE_ACTION_HORIZON]
     return [stream_config(**recipe) for recipe in
             recipes + [vlash_twin(recipe) for recipe in recipes] + [vlash_reference_twin(recipe) for recipe in recipes]
             + [vlash_measured_twin(recipe) for recipe in recipes] + [vlash_packed_measured_twin(recipe) for recipe in recipes]
