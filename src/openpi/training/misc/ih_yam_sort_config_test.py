@@ -11,6 +11,8 @@ LONG_CHUNKS = {interval: f"pi05_yam_stream5_i{interval}_h50_sort_right_real" for
 WIDE_TWINS = {interval: name + f"_vlash{ih_yam_config.SORT_WIDE_VLASH_OFFSET_BY_INTERVAL[interval]}mpc"
               for interval, name in LONG_CHUNKS.items()}
 TIME_COMPRESSED = "pi05_yam_stream5_i50_h50_sort_right_real_timecompressed2x"
+BOTH = "pi05_yam_stream5_i15_h35_sort_both_real"
+BOTH_TWIN = BOTH + "_vlash14mpc"
 
 
 @pytest.mark.parametrize("name", [CHUNK_30, *LONG_CHUNKS.values(), *WIDE_TWINS.values(), CHUNK_30 + "_vlash12mpc"])
@@ -50,7 +52,7 @@ def test_each_wide_twin_leads_as_far_as_its_window_allows(interval):
 def test_wide_twins_exist_only_for_the_long_chunk_recipes():
     wide = {name for name in _config._CONFIGS_DICT if name.startswith("pi05_yam_stream5_") and "mpc" in name
             and name.rsplit("_vlash", 1)[-1] not in ("8mpc", "12mpc")}
-    assert wide == {*WIDE_TWINS.values(), TIME_COMPRESSED + "_vlash49mpc"}
+    assert wide == {*WIDE_TWINS.values(), TIME_COMPRESSED + "_vlash49mpc", BOTH_TWIN}
 
 
 def test_the_time_compressed_recipe_is_the_whole_chunk_recipe_on_its_own_labelled_dataset():
@@ -66,3 +68,27 @@ def test_the_time_compressed_recipe_is_the_whole_chunk_recipe_on_its_own_labelle
 def test_bagging_recipes_keep_their_horizon():
     for name in ("pi05_yam_stream5_i20_bagging_right_real", "pi05_yam_stream5_i20_bagging_right_real_vlash12mpc"):
         assert _config.get_config(name).model.action_horizon == ih_yam_config.ACTION_HORIZON == 30
+
+
+@pytest.mark.parametrize("name", [BOTH, BOTH_TWIN])
+def test_the_two_arm_sort_recipes_read_all_three_cameras_and_hold_nothing(name):
+    config = _config.get_config(name)
+    assert config.data.repo_id == ih_yam_config.SORT_BOTH_REAL_REPO_ID and "tailcut10s" in config.data.repo_id
+    assert config.data.default_prompt == ih_yam_config.SORT_PROMPT
+    assert config.data.active_image_keys is None and set(config.model.image_keys) == {"base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"}
+    assert config.data.active_state_dims is None and config.data.held_action_dims is None, "both arms are trained"
+
+
+@pytest.mark.parametrize("name", [BOTH, BOTH_TWIN])
+def test_the_two_arm_sort_recipes_predict_35_rows_and_play_15(name):
+    config = _config.get_config(name)
+    assert (config.model.action_horizon, config.data.base_config.hist_interval) == (35, 15)
+    assert config.data.base_config.hist_interval <= config.model.action_horizon
+
+
+def test_the_two_arm_plain_recipe_has_no_vlash_and_its_twin_leads_to_the_window_less_one():
+    plain, twin = _config.get_config(BOTH).data.base_config, _config.get_config(BOTH_TWIN).data.base_config
+    assert (plain.vlash_max_offset, plain.vlash_branches) == (0, 0) and not _config.get_config(BOTH).model.state_cond
+    assert (twin.vlash_max_offset, twin.vlash_branches) == (14, 15)
+    assert twin.vlash_max_offset <= twin.hist_interval - 1, "a lead past the played window cannot be asked for"
+    assert twin.vlash_state_source == "state" and twin.vlash_cond_now and _config.get_config(BOTH_TWIN).model.state_cond

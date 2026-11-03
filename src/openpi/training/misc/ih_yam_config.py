@@ -28,6 +28,13 @@ SORT_PROMPT = "sort the pieces onto their piles"
 # The same episodes retimed to twice their recorded speed (convert_to_lerobot --speed 2.0, gripper-aware): a policy trained on it moves
 # faster than the demonstrator did, so it is a different model and its name and dataset say so.
 SORT_RIGHT_REAL_2X_REPO_ID = "local/yam_sort_right_real_20261028_timecompressed2x"
+# The accepted TWO-arm sort-piles teleop of 2026-11-02 (sort_pile_both, both leaders), all three cameras, with the last 10 s of every
+# episode cut off at conversion (convert_to_lerobot --trim-tail-s 10): a policy trained on it never sees how an episode ended.
+SORT_BOTH_REAL_REPO_ID = "local/yam_sort_both_real_20261102_tailcut10s"
+# Its shape: a 35-row horizon with 15 rows played per call (hist_interval 15, the cadence the history is spaced at). The window
+# is within the horizon, so the lead of the `_vlash14mpc` twin (offsets 0-14, one under the window) is within it too.
+SORT_BOTH_ACTION_HORIZON = 35
+SORT_BOTH_HIST_INTERVAL = 15
 STATE_DIM = 14                     # [L j0..5, L grip, R j0..5, R grip]
 LEFT_ARM_DIMS = tuple(range(7))    # [L j0..5, L grip]
 RIGHT_ARM_DIMS = tuple(range(7, 14))  # [R j0..5, R grip]
@@ -276,6 +283,10 @@ def get_ih_yam_configs():
              active_state_dims=RIGHT_ARM_DIMS,
              held_action_dims=LEFT_ARM_DIMS,
              encode_only_active_cameras=True),
+        # Sort piles with both arms: all three cameras, no arm held, a 35-row horizon played 15 rows per call.
+        dict(name=f"pi05_yam_stream5_i{SORT_BOTH_HIST_INTERVAL}_h{SORT_BOTH_ACTION_HORIZON}_sort_both_real",
+             repo_id=SORT_BOTH_REAL_REPO_ID, prompt=SORT_PROMPT, lora=True, hist_interval=SORT_BOTH_HIST_INTERVAL,
+             action_horizon=SORT_BOTH_ACTION_HORIZON),
     ]
 
     def vlash_twin(recipe: dict) -> dict:
@@ -337,6 +348,14 @@ def get_ih_yam_configs():
         return {**vlash_conditioned_twin(recipe), "name": recipe["name"] + f"_vlash{offset}mpc",
                 "vlash_max_offset": offset, "vlash_branches": offset + 1}
 
+    def vlash_window_conditioned_twin(recipe: dict) -> dict:
+        # `_vlash12mpc` with offsets 0-N for N = the played window less one (the most the deploy loop can lead), one branch each.
+        offset = recipe["hist_interval"] - 1
+        return {**vlash_conditioned_twin(recipe), "name": recipe["name"] + f"_vlash{offset}mpc",
+                "vlash_max_offset": offset, "vlash_branches": offset + 1}
+
+    both_twins = [vlash_window_conditioned_twin(recipe) for recipe in recipes
+                  if recipe["repo_id"] == SORT_BOTH_REAL_REPO_ID]
     race_twins = [race_twin(recipe) for recipe in recipes if recipe["name"] in RACE_TWIN_BASES]
     wide_twins = [vlash_wide_conditioned_twin(recipe) for recipe in recipes
                   if recipe.get("action_horizon") == SORT_WIDE_ACTION_HORIZON]
@@ -344,4 +363,4 @@ def get_ih_yam_configs():
             recipes + [vlash_twin(recipe) for recipe in recipes] + [vlash_reference_twin(recipe) for recipe in recipes]
             + [vlash_measured_twin(recipe) for recipe in recipes] + [vlash_packed_measured_twin(recipe) for recipe in recipes]
             + [vlash_conditioned_twin(recipe) for recipe in recipes] + [vlash_long_conditioned_twin(recipe) for recipe in recipes]
-            + [vlash_packed_twin(recipe) for recipe in recipes] + race_twins + wide_twins]
+            + [vlash_packed_twin(recipe) for recipe in recipes] + race_twins + wide_twins + both_twins]
