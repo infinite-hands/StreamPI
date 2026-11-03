@@ -162,6 +162,18 @@ class _DecodeSomeCamerasDataset(lerobot_dataset.LeRobotDataset):
         return super()._query_videos(wanted, ep_idx)
 
 
+LEROBOT_TIMESTAMP_TOLERANCE_S = 1e-4   # LeRobotDataset's own default
+
+
+def timestamp_tolerance_s(dataset_meta) -> float:
+    """The tolerance LeRobot's timestamp-sync check needs for this dataset. Timestamps are stored as float32, whose spacing grows with
+    the value: past 1024 s an episode's consecutive timestamps cannot be told apart from 1/fps to better than ~1.2e-4 s, so the
+    default 1e-4 refuses a long episode that is in sync. Twice that spacing at the longest episode, never less than the default,
+    so any dataset whose episodes are under ~500 s is checked exactly as before."""
+    longest_s = max(episode["length"] for episode in dataset_meta.episodes.values()) / dataset_meta.fps
+    return max(LEROBOT_TIMESTAMP_TOLERANCE_S, 2 * float(np.spacing(np.float32(longest_s))))
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -199,11 +211,13 @@ def create_torch_dataset(
 
     delta_timestamps.update(hist_delta_timestamps)
 
+    tolerance_s = timestamp_tolerance_s(dataset_meta)
     if data_config.decode_only_hist_cameras:
         dataset = _DecodeSomeCamerasDataset(set(data_config.hist_sequence_keys), data_config.repo_id,
-                                            delta_timestamps=delta_timestamps)
+                                            delta_timestamps=delta_timestamps, tolerance_s=tolerance_s)
     else:
-        dataset = lerobot_dataset.LeRobotDataset(data_config.repo_id, delta_timestamps=delta_timestamps)
+        dataset = lerobot_dataset.LeRobotDataset(data_config.repo_id, delta_timestamps=delta_timestamps,
+                                                 tolerance_s=tolerance_s)
     lerobot = dataset
 
     if data_config.prompt_from_task:

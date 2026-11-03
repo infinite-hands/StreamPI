@@ -1,6 +1,8 @@
 import dataclasses
+import types
 
 import jax
+import numpy as np
 
 from openpi.models import pi0_config
 from openpi.training import config as _config
@@ -82,3 +84,26 @@ def test_with_real_dataset():
 
     for _, actions in batches:
         assert actions.shape == (config.batch_size, config.model.action_horizon, config.model.action_dim)
+
+
+def _meta(*lengths, fps=30):
+    return types.SimpleNamespace(fps=fps, episodes={i: {"length": n} for i, n in enumerate(lengths)})
+
+
+def test_the_timestamp_tolerance_is_lerobots_default_for_ordinary_episodes():
+    # A 2 min and a 7.5 min episode: float32 resolves 1/fps far inside 1e-4 s, so the check stays exactly as it was.
+    assert _data_loader.timestamp_tolerance_s(_meta(3600, 13_500)) == _data_loader.LEROBOT_TIMESTAMP_TOLERANCE_S
+
+
+def test_a_long_episodes_float32_timestamps_pass_lerobots_own_sync_check_only_under_the_widened_tolerance():
+    from lerobot.common.datasets.utils import check_timestamps_sync
+
+    frames, fps = 41_106, 30     # the 23 min sort_pile_both episode_0002, whose float32 timestamps are off by 1.1e-4 s
+    timestamps = (np.arange(frames) / fps).astype(np.float32)
+    episodes = {"to": np.array([frames])}
+    indices = np.zeros(frames, dtype=np.int64)
+    assert not check_timestamps_sync(timestamps, indices, episodes, fps, _data_loader.LEROBOT_TIMESTAMP_TOLERANCE_S, raise_value_error=False)
+    tolerance = _data_loader.timestamp_tolerance_s(_meta(frames))
+    assert tolerance > _data_loader.LEROBOT_TIMESTAMP_TOLERANCE_S
+    assert check_timestamps_sync(timestamps, indices, episodes, fps, tolerance)
+    assert tolerance < 1 / fps / 100, "still a small fraction of a frame"
