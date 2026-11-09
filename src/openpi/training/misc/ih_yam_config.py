@@ -35,6 +35,11 @@ SORT_BOTH_REAL_REPO_ID = "local/yam_sort_both_real_20261102_tailcut10s"
 # is within the horizon, so the lead of the `_vlash14mpc` twin (offsets 0-14, one under the window) is within it too.
 SORT_BOTH_ACTION_HORIZON = 35
 SORT_BOTH_HIST_INTERVAL = 15
+# Inspection v2 (left arm picks, right arm receives) with one fixed instruction per phase: every frame's task text is the phase it
+# is in, so the prompt comes from the dataset (prompt_from_task) and there is no default. The sort-both shape, so a sort-both or
+# inspection run1 checkpoint warm-starts it; a driver names the converted takes with --data.repo-id.
+INSPECTION_PHASES_REAL_REPO_ID = "local/yam_inspection_phases_real"
+HISTORY_ABLATION_HORIZON = 1       # one frame, no streaming history: a recipe's `stream1` ablation
 STATE_DIM = 14                     # [L j0..5, L grip, R j0..5, R grip]
 LEFT_ARM_DIMS = tuple(range(7))    # [L j0..5, L grip]
 RIGHT_ARM_DIMS = tuple(range(7, 14))  # [R j0..5, R grip]
@@ -81,9 +86,11 @@ RACE_TWIN_BASES: tuple[str, ...] = ("pi05_yam_stream5_i20_bagging_right_real",
 
 
 def yam_repack(cameras: tuple[str, ...] = YAM_CAMERAS, *, vlash_cond_now: bool = False,
-               race: bool = False) -> _transforms.Group:
+               race: bool = False, prompt: bool = False) -> _transforms.Group:
     extras = {key: key for key in (_transforms.NOW_STATE_KEY, _transforms.DELTA_KEY)} if vlash_cond_now else {}
     race_targets = {key: key for key in _transforms.RACE_TARGET_KEYS} if race else {}
+    # RepackTransform keeps only the keys it maps: without this, PromptFromLeRobotTask's prompt is dropped and the default re-filled.
+    task_prompt = {"prompt": "prompt"} if prompt else {}
     return _transforms.Group(
         inputs=[
             _transforms.RepackTransform(
@@ -93,6 +100,7 @@ def yam_repack(cameras: tuple[str, ...] = YAM_CAMERAS, *, vlash_cond_now: bool =
                     "actions": "action",
                     **extras,
                     **race_targets,
+                    **task_prompt,
                 }
             )
         ]
@@ -115,8 +123,8 @@ def get_ih_yam_configs():
     @dataclasses.dataclass(frozen=True)
     class LeRobotYamStreamDataConfig(LeRobotAgilexDataConfig):
         """The AgileX transforms (14-dim bimanual, three cameras, streaming history on every camera)
-        with a served default prompt: the YAM datasets carry no prompt column, so InjectDefaultPrompt
-        fills it at train and serve time exactly as the openpi fork's YAM configs do."""
+        with a served default prompt that InjectDefaultPrompt fills at train and serve time, or none:
+        a prompt_from_task recipe reads each frame's task text and refuses a request without one."""
 
         repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(default=YAM_REPACK)
         # Load the norm stats of this config instead of this recipe's own (a twin that must normalize exactly as
@@ -151,7 +159,7 @@ def get_ih_yam_configs():
                 use_quantile_norm=True,
             )
 
-    def stream_config(name: str, repo_id: str, prompt: str, *, lora: bool,
+    def stream_config(name: str, repo_id: str, prompt: str | None, *, lora: bool,
                       hist_interval: int = HIST_INTERVAL, action_horizon: int = ACTION_HORIZON,
                       active_image_keys: frozenset[str] | None = None,
                       active_state_dims: tuple[int, ...] | None = None,
@@ -160,19 +168,23 @@ def get_ih_yam_configs():
                       vlash_state_source: str = "action", vlash_cond_now: bool = False,
                       num_train_steps: int = 20_000,
                       encode_only_active_cameras: bool = False,
-                      race: bool = False, norm_stats_config: str | None = None):
+                      race: bool = False, norm_stats_config: str | None = None,
+                      prompt_from_task: bool = False, hist_horizon: int = HIST_HORIZON):
         # A masked camera's tokens are padding, so a recipe may skip decoding and encoding them: the same
         # model, one SigLIP pass per frame instead of three and a third of the prefix. Opt-in per config
         # because it changes the model's input layout (not its weights).
         if encode_only_active_cameras and active_image_keys is None:
             raise ValueError(f"{name}: encode_only_active_cameras needs active_image_keys")
+        # A default beside per-frame prompts would answer a request that lost its prompt with text the recipe never trained on.
+        if (prompt is None) != prompt_from_task:
+            raise ValueError(f"{name}: a recipe has a default prompt or reads its prompt from the dataset's task, exactly one")
         cameras = {image_key: camera for camera, image_key in AgilexInputs.IMAGE_KEY_BY_CAMERA.items()}
         image_keys = tuple(key for key in IMAGE_KEYS if not encode_only_active_cameras or key in active_image_keys)
         kept_cameras = tuple(cameras[key] for key in image_keys)
         model = pi0_config.Pi0Config(
             pi05=True,
             action_horizon=action_horizon,
-            hist_horizon=HIST_HORIZON,
+            hist_horizon=hist_horizon,
             paligemma_variant="gemma_2b_lora" if lora else "gemma_2b",
             action_expert_variant="gemma_300m_lora" if lora else "gemma_300m",
             # With the state out of the prompt, the single-arm recipe's state mask moves to the conditioning.
@@ -192,13 +204,14 @@ def get_ih_yam_configs():
                 active_image_keys=active_image_keys,
                 active_state_dims=active_state_dims,
                 held_action_dims=held_action_dims,
-                repack_transforms=yam_repack(kept_cameras, vlash_cond_now=vlash_cond_now, race=race),
+                repack_transforms=yam_repack(kept_cameras, vlash_cond_now=vlash_cond_now, race=race,
+                                             prompt=prompt_from_task),
                 norm_stats_config=norm_stats_config,
                 race_targets_root=RACE_TARGETS_ROOT if race else None,
                 hist_sequence_keys=tuple(f"observation.images.{camera}" for camera in kept_cameras),
                 base_config=DataConfig(
-                    prompt_from_task=False,
-                    hist_horizon=HIST_HORIZON,
+                    prompt_from_task=prompt_from_task,
+                    hist_horizon=hist_horizon,
                     hist_interval=hist_interval,
                     enable_jitter=True,
                     vlash_max_offset=vlash_max_offset,
@@ -288,6 +301,12 @@ def get_ih_yam_configs():
              repo_id=SORT_BOTH_REAL_REPO_ID, prompt=SORT_PROMPT, lora=True, hist_interval=SORT_BOTH_HIST_INTERVAL,
              action_horizon=SORT_BOTH_ACTION_HORIZON),
     ]
+    # Outside `recipes`: no vlash or RACE twins. The streaming recipe and its history-off ablation.
+    phase_recipes = [
+        dict(name=f"pi05_yam_stream{horizon}_i{SORT_BOTH_HIST_INTERVAL}_h{SORT_BOTH_ACTION_HORIZON}_inspection_phases_real",
+             repo_id=INSPECTION_PHASES_REAL_REPO_ID, prompt=None, prompt_from_task=True, lora=True,
+             hist_interval=SORT_BOTH_HIST_INTERVAL, action_horizon=SORT_BOTH_ACTION_HORIZON, hist_horizon=horizon)
+        for horizon in (HIST_HORIZON, HISTORY_ABLATION_HORIZON)]
 
     def vlash_twin(recipe: dict) -> dict:
         # The offset covers every lead the deploy loop can ask for at this cadence: it plays
@@ -363,4 +382,4 @@ def get_ih_yam_configs():
             recipes + [vlash_twin(recipe) for recipe in recipes] + [vlash_reference_twin(recipe) for recipe in recipes]
             + [vlash_measured_twin(recipe) for recipe in recipes] + [vlash_packed_measured_twin(recipe) for recipe in recipes]
             + [vlash_conditioned_twin(recipe) for recipe in recipes] + [vlash_long_conditioned_twin(recipe) for recipe in recipes]
-            + [vlash_packed_twin(recipe) for recipe in recipes] + race_twins + wide_twins + both_twins]
+            + [vlash_packed_twin(recipe) for recipe in recipes] + race_twins + wide_twins + both_twins + phase_recipes]
