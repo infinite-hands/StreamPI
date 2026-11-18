@@ -8,6 +8,7 @@ from typing_extensions import override
 
 from openpi.models import model as _model
 import openpi.models.gemma as _gemma
+from openpi.models.ttt import TTT_HEAD_DIM
 from openpi.shared import array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
 
@@ -58,6 +59,11 @@ class Pi0Config(_model.BaseModelConfig):
     # Sec. 4.1: "we set lambda_aux = 0.1 and lambda_timing = 0.05".
     race_aux_weight: float = 0.1
     race_timing_weight: float = 0.05
+    # Test-time-training layers (arXiv 2407.04620, openpi.models.ttt): a TTT-Linear branch beside the attention
+    # of every VLM block, whose fast weights take one gradient step per streaming frame and ride in the
+    # streaming memory between calls. This is the layer's inner width; 0: no TTT layers. The branch's output
+    # projection starts at zero, so a checkpoint without these weights starts as the model it was.
+    ttt_width: int = 0
 
     def __post_init__(self):
         if self.max_token_len is None:
@@ -80,6 +86,10 @@ class Pi0Config(_model.BaseModelConfig):
             raise ValueError("race modulates pi0.5's adaptive RMSNorm; pi0 has none")
         if self.race and self.vlash_branches:
             raise ValueError("race is wired for one action chunk per sample, not vlash_branches")
+        if self.ttt_width < 0 or self.ttt_width % TTT_HEAD_DIM:
+            raise ValueError(f"ttt_width must be a multiple of {TTT_HEAD_DIM} (one head each), got {self.ttt_width}")
+        if self.ttt_width and self.vlash_branches:
+            raise ValueError("ttt layers are wired for the plain loss, not vlash_branches")
 
     @property
     @override
@@ -146,11 +156,15 @@ class Pi0Config(_model.BaseModelConfig):
         if self.race:
             # RACE's weights are new and always trained, including the modulation inside the frozen LLM.
             filters.append(nnx.Not(nnx_utils.PathRegex(RACE_PARAMS_REGEX)))
+        if self.ttt_width:
+            # The TTT layers sit inside the frozen LLM and are new: always trained.
+            filters.append(nnx.Not(nnx_utils.PathRegex(TTT_PARAMS_REGEX)))
         return nnx.All(*filters)
 
 
 # Every RACE parameter's path contains this (Pi0's race_* attributes, gemma's race_modulation).
 RACE_PARAMS_REGEX = ".*race_.*"
+TTT_PARAMS_REGEX = f".*{_gemma.TTT_LAYER_NAME}.*"
 
 
 @dataclasses.dataclass(frozen=True)

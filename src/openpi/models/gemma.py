@@ -35,6 +35,7 @@ import jax
 import jax.numpy as jnp
 
 import openpi.models.lora as lora
+import openpi.models.ttt as _ttt
 import openpi.shared.array_typing as at
 import openpi.training.sharding as sharding
 
@@ -295,10 +296,11 @@ class Block(nn.Module):
 
     dropout: float = 0.0
     dropout_bdims: tuple[int, ...] = ()
+    ttt_width: int = 0
 
     @nn.compact
     def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True,  # noqa: FBT002
-                 race_cond=None):
+                 race_cond=None, ttt_state=None, ttt_mask=None):
         xs = sharding.activation_sharding_constraint(xs)
         drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x
 
@@ -318,6 +320,11 @@ class Block(nn.Module):
         post_attn = jax.tree.map(lambda x: drop(x, deterministic), post_attn)
         post_attn = sharding.activation_sharding_constraint(post_attn)
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, post_attn, gates, strict=True)]
+        if ttt_mask is not None and pre_attn[0] is not None:
+            # A second residual branch beside the first expert's attention, reading the same normed tokens.
+            ttt_out, ttt_state = _ttt.TTTLinear(width=self.ttt_width, name=TTT_LAYER_NAME)(
+                pre_attn[0], ttt_mask, ttt_state)
+            xs[0] = xs[0] + ttt_out
         xs = sharding.activation_sharding_constraint(xs)
 
         out = []
@@ -340,8 +347,11 @@ class Block(nn.Module):
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, out, gates, strict=True)]
         xs = sharding.activation_sharding_constraint(xs)
 
-        return xs, kv_cache
+        return xs, (kv_cache, ttt_state)
 
+
+# Every TTT parameter's path contains this.
+TTT_LAYER_NAME = "ttt_layer"
 
 KVCache: TypeAlias = tuple[at.Float[at.Array, "l b _t _k _h"], at.Float[at.Array, "l b _t _v _h"]]
 
@@ -356,6 +366,8 @@ class Module(nn.Module):
     dropout: float = 0.0
     dropout_bdims: tuple[int, ...] = ()  # Every float is dropped independently.
     adarms: bool = False
+    # The inner width of a TTT layer (openpi.models.ttt) in every block of the first expert; 0: none.
+    ttt_width: int = 0
 
     def setup(self):
         # all experts must have the same depth
@@ -383,12 +395,15 @@ class Module(nn.Module):
                 nn.broadcast,
                 nn.broadcast,
                 nn.broadcast,
-            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=deterministic, 5=race_cond
+                0,
+                nn.broadcast,
+            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=deterministic, 5=race_cond, 6=ttt_state, 7=ttt_mask
             length=self.configs[0].depth,
         )(
             configs=self.configs,
             dropout=self.dropout,
             dropout_bdims=self.dropout_bdims,
+            ttt_width=self.ttt_width,
         )
         self.final_norms = [RMSNorm(name=_name("final_norm", i)) for i in range(len(self.configs))]
 
@@ -408,26 +423,39 @@ class Module(nn.Module):
         kv_cache: KVCache | None = None,
         deterministic: bool = True,
         race_cond: at.Float[at.Array, "b _s _d"] | None = None,
-    ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]:
+        ttt_mask: at.Bool[at.Array, "b _f _n"] | None = None,
+        ttt_state: _ttt.TttState | None = None,
+    ) -> (tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]
+          | tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache, _ttt.TttState]):
         """`race_cond` is RACE's token-wise transition feature U (b, suffix tokens, width), added through every
-        adaptive RMSNorm of the expert that has adarms_cond; None runs the expert unmodulated."""
+        adaptive RMSNorm of the expert that has adarms_cond; None runs the expert unmodulated.
+
+        `ttt_mask` (b, frames, tokens per frame; False = padding) runs the first expert's TTT layers over its
+        tokens as that many frames, starting from `ttt_state` (one (W, b) per layer, stacked; None: the learned
+        start), and adds the state after the last frame as a third result. None skips the layers: a pass
+        with no first-expert tokens, or a model without them."""
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
         mask = jnp.asarray(mask)[:, None, :, :]
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
 
-        embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic, race_cond)
+        embedded, (kv_cache, ttt_state) = self.layers(
+            embedded, kv_cache, positions, mask, adarms_cond, deterministic, race_cond, ttt_state, ttt_mask)
 
         assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
 
-        return [
+        outputs = [
             f(e, a, _race_cond_for(a, race_cond))[0] if e is not None else e
             for f, e, a in zip(self.final_norms, embedded, adarms_cond, strict=True)
-        ], kv_cache
+        ]
+        if ttt_mask is None:
+            return outputs, kv_cache
+        return outputs, kv_cache, ttt_state
 
     def init(self, use_adarms: Sequence[bool], race: bool = False):  # noqa: FBT001, FBT002
         """Convenience method for initializing all parameters, necessary due to the quirks of linen. `race`
-        also creates RACE's per-layer modulation weights in every adaptive RMSNorm."""
+        also creates RACE's per-layer modulation weights in every adaptive RMSNorm; a non-zero ttt_width
+        creates the TTT layers."""
         self.embed(jnp.zeros((1, 1), dtype=jnp.int32))
         adarms_width = next((c.width for u, c in zip(use_adarms, self.configs, strict=True) if u), None)
         self(
@@ -436,6 +464,7 @@ class Module(nn.Module):
             jnp.zeros((1, len(self.configs), len(self.configs)), dtype=bool),
             adarms_cond=[jnp.zeros((1, 1, c.width)) if u else None for u, c in zip(use_adarms, self.configs, strict=True)],
             race_cond=jnp.zeros((1, 1, adarms_width)) if race else None,
+            ttt_mask=jnp.ones((1, 1, 1), dtype=bool) if self.ttt_width else None,
         )
 
 
