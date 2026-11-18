@@ -35,6 +35,9 @@ RACE_JITTER_FORWARD_PROB = 0.5
 # Folded into the step's rng for the jitter draws, so the base model's noise, time and history-drop draws are
 # the same with and without RACE.
 _RACE_JITTER_STREAM = 0x5ACE
+# The streaming memory's entry for a TTT model's fast weights: one (W, b) per VLM layer, stacked on a
+# leading layer axis; None until the first frame after a reset.
+TTT_STATE_KEY = "memory_ttt_state"
 
 
 def make_attn_mask(input_mask, mask_ar):
@@ -108,10 +111,12 @@ class Pi0(_model.BaseModel):
                 configs=[paligemma_config, action_expert_config],
                 embed_dtype=config.dtype,
                 adarms=config.pi05,
+                ttt_width=config.ttt_width,
             )
         )
         llm.lazy_init(rngs=rngs, method="init", use_adarms=[False, True] if config.pi05 else [False, False],
                       race=config.race)
+        self.ttt = bool(config.ttt_width)
         img = nnx_bridge.ToNNX(
             _siglip.Module(
                 num_classes=paligemma_config.width,
@@ -372,9 +377,11 @@ class Pi0(_model.BaseModel):
             race_cond = self.race_conditioning(self._race_teacher_prior(rng, observation, train=train),
                                                self._race_gate_for_training(time[:, 0]))
 
-        (prefix_out, suffix_out), kv_cache = self.PaliGemma.llm(
+        # A TTT model steps its fast weights once per history frame, from the learned start; a frame the
+        # history drop masked takes no step, as a serve call that never saw it would not.
+        (prefix_out, suffix_out), kv_cache, *_ttt_state = self.PaliGemma.llm(
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond],
-            race_cond=race_cond,
+            race_cond=race_cond, ttt_mask=self._ttt_mask(input_mask[:, : prefix_tokens.shape[1]], T),
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
@@ -512,6 +519,47 @@ class Pi0(_model.BaseModel):
         memory["memory_tokens"] = None
         memory["memory_kv_cache"] = None
         memory["memory_prefix_mask"] = None
+        if self.ttt:
+            # The fast weights restart with the frames they were learned from.
+            memory[TTT_STATE_KEY] = None
+
+    def _ttt_mask(self, prefix_mask: at.Bool[at.Array, "b s"], frames: int) -> at.Bool[at.Array, "b f n"] | None:
+        """The llm's `ttt_mask` for prefix tokens laid out as `frames` equal frames; None for a model
+        without TTT layers."""
+        if not self.ttt:
+            return None
+        return prefix_mask.reshape(prefix_mask.shape[0], frames, -1)
+
+    def stream_prefix(
+        self, observation: _model.Observation, memory: dict
+    ) -> tuple[at.Bool[at.Array, "b p"], _gemma.KVCache, int]:
+        """One call's streaming prefix pass: embeds the observation's frames, runs them through the VLM behind
+        the cache `memory` holds, and saves the grown cache back. A TTT model also takes its gradient step on
+        each new frame and leaves the stepped weights in `memory`. `observation` is preprocessed. Returns
+        the mask of every cached token (the memory's, then this call's), the cache, and how many of its
+        tokens are this call's."""
+        memory_tokens, memory_kv_cache, memory_prefix_mask = self.fetch_memory(memory)
+        prefix_tokens, prefix_mask, prefix_ar_mask, num_visual_tokens, num_text_tokens = self.embed_prefix_infer(observation, memory_tokens)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        ttt_mask = self._ttt_mask(prefix_mask, next(iter(observation.images.values())).shape[1])
+
+        if memory_prefix_mask is not None:
+            memory_prefix_attn_mask = einops.repeat(memory_prefix_mask, "b p -> b s p", s=prefix_mask.shape[1])
+            prefix_attn_mask = jnp.concatenate([memory_prefix_attn_mask, prefix_attn_mask], axis=-1)
+            prefix_mask = jnp.concatenate([memory_prefix_mask, prefix_mask], axis=-1)
+            positions = jnp.cumsum(prefix_mask, axis=1) - 1
+            positions = positions[..., memory_prefix_mask.shape[-1]:]
+        else:
+            positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        if ttt_mask is None:
+            _, kv_cache = self.PaliGemma.llm(
+                [prefix_tokens, None], mask=prefix_attn_mask, positions=positions, kv_cache=memory_kv_cache)
+        else:
+            _, kv_cache, memory[TTT_STATE_KEY] = self.PaliGemma.llm(
+                [prefix_tokens, None], mask=prefix_attn_mask, positions=positions, kv_cache=memory_kv_cache,
+                ttt_mask=ttt_mask, ttt_state=memory.get(TTT_STATE_KEY))
+        self.save_memory(prefix_tokens, prefix_mask, num_visual_tokens, num_text_tokens, kv_cache, memory)
+        return prefix_mask, kv_cache, prefix_tokens.shape[1]
 
     @at.typecheck
     def save_memory(
@@ -552,35 +600,12 @@ class Pi0(_model.BaseModel):
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
         # first fill KV cache with a forward pass of the prefix
- 
-        memory_tokens, memory_kv_cache, memory_prefix_mask = self.fetch_memory(memory)
-
-        # if jax.process_index() == 0:
-        #     jax.debug.print("x1, {}, {}", memory_kv_cache is None, memory_prefix_mask is None)
-
-        prefix_tokens, prefix_mask, prefix_ar_mask, num_visual_tokens, num_text_tokens = self.embed_prefix_infer(observation, memory_tokens)
-
-        # prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-
-        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
-
-        if memory_prefix_mask is not None:
-            memory_prefix_attn_mask = einops.repeat(memory_prefix_mask, "b p -> b s p", s=prefix_mask.shape[1])
-            prefix_attn_mask = jnp.concatenate([memory_prefix_attn_mask, prefix_attn_mask], axis=-1)
-            prefix_mask = jnp.concatenate([memory_prefix_mask, prefix_mask], axis=-1)
-        # memory_kv_cache = None
-            # import pdb;pdb.set_trace()
-            positions = jnp.cumsum(prefix_mask, axis=1) - 1
-            positions = positions[..., memory_prefix_mask.shape[-1]:] 
-        else:
-            positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions, kv_cache=memory_kv_cache)
-        self.save_memory(prefix_tokens, prefix_mask, num_visual_tokens, num_text_tokens, kv_cache, memory)
+        prefix_mask, kv_cache, current_prefix_len = self.stream_prefix(observation, memory)
 
         # RACE (alg. 2): the prior, once per call, from this call's prefix and the noise the loop starts from.
         prior = None
         if self.race:
-            prior = self.race_prior(observation, prefix_mask, kv_cache, noise, current_prefix_len=prefix_tokens.shape[1])
+            prior = self.race_prior(observation, prefix_mask, kv_cache, noise, current_prefix_len=current_prefix_len)
 
         def step(carry):
             x_t, time = carry

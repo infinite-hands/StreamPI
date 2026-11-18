@@ -83,6 +83,11 @@ RACE_TARGETS_ROOT = "/misc/race-targets"
 # The recipes that get a `_race` twin (race_twin).
 RACE_TWIN_BASES: tuple[str, ...] = ("pi05_yam_stream5_i20_bagging_right_real",
                                    "pi05_yam_stream5_i20_bagging_left_real")
+# The recipes that get a `_ttt` twin (ttt_twin).
+TTT_TWIN_BASES: tuple[str, ...] = (f"pi05_yam_stream5_i{SORT_BOTH_HIST_INTERVAL}_h{SORT_BOTH_ACTION_HORIZON}_sort_both_real",)
+# Our choice: the inner width of a twin's TTT layers (Pi0Config.ttt_width), four heads of the reference's 64. The
+# reference layer is as wide as its transformer; at the VLM's 2048 that is ~300M new weights over 18 blocks, this ~38M.
+TTT_WIDTH = 256
 
 
 def yam_repack(cameras: tuple[str, ...] = YAM_CAMERAS, *, vlash_cond_now: bool = False,
@@ -169,7 +174,7 @@ def get_ih_yam_configs():
                       num_train_steps: int = 20_000,
                       encode_only_active_cameras: bool = False,
                       race: bool = False, norm_stats_config: str | None = None,
-                      prompt_from_task: bool = False, hist_horizon: int = HIST_HORIZON):
+                      prompt_from_task: bool = False, hist_horizon: int = HIST_HORIZON, ttt_width: int = 0):
         # A masked camera's tokens are padding, so a recipe may skip decoding and encoding them: the same
         # model, one SigLIP pass per frame instead of three and a third of the prefix. Opt-in per config
         # because it changes the model's input layout (not its weights).
@@ -194,6 +199,7 @@ def get_ih_yam_configs():
             vlash_branches=vlash_branches,
             image_keys=image_keys,
             race=race,
+            ttt_width=ttt_width,
         )
         return TrainConfig(
             name=name,
@@ -361,6 +367,12 @@ def get_ih_yam_configs():
         return {**recipe, "name": recipe["name"] + "_race", "race": True, "norm_stats_config": recipe["name"],
                 "encode_only_active_cameras": recipe.get("active_image_keys") is not None}
 
+    def ttt_twin(recipe: dict) -> dict:
+        # Test-time-training layers (arXiv 2407.04620) on the recipe a checkpoint was trained under, warm-started
+        # from that checkpoint (--weight-loader.params-path; the layers' output starts at zero, so step 0 is the
+        # checkpoint). It keeps the recipe's norm stats.
+        return {**recipe, "name": recipe["name"] + "_ttt", "ttt_width": TTT_WIDTH, "norm_stats_config": recipe["name"]}
+
     def vlash_wide_conditioned_twin(recipe: dict) -> dict:
         # `_vlash12mpc` with offsets 0-N for the N its played window allows (SORT_WIDE_VLASH_OFFSET_BY_INTERVAL), one branch each.
         offset = SORT_WIDE_VLASH_OFFSET_BY_INTERVAL[recipe["hist_interval"]]
@@ -376,10 +388,11 @@ def get_ih_yam_configs():
     both_twins = [vlash_window_conditioned_twin(recipe) for recipe in recipes
                   if recipe["repo_id"] == SORT_BOTH_REAL_REPO_ID]
     race_twins = [race_twin(recipe) for recipe in recipes if recipe["name"] in RACE_TWIN_BASES]
+    ttt_twins = [ttt_twin(recipe) for recipe in recipes if recipe["name"] in TTT_TWIN_BASES]
     wide_twins = [vlash_wide_conditioned_twin(recipe) for recipe in recipes
                   if recipe.get("action_horizon") == SORT_WIDE_ACTION_HORIZON]
     return [stream_config(**recipe) for recipe in
             recipes + [vlash_twin(recipe) for recipe in recipes] + [vlash_reference_twin(recipe) for recipe in recipes]
             + [vlash_measured_twin(recipe) for recipe in recipes] + [vlash_packed_measured_twin(recipe) for recipe in recipes]
             + [vlash_conditioned_twin(recipe) for recipe in recipes] + [vlash_long_conditioned_twin(recipe) for recipe in recipes]
-            + [vlash_packed_twin(recipe) for recipe in recipes] + race_twins + wide_twins + both_twins + phase_recipes]
+            + [vlash_packed_twin(recipe) for recipe in recipes] + race_twins + ttt_twins + wide_twins + both_twins + phase_recipes]
