@@ -137,7 +137,7 @@ def _joint_prefix_pass(model, obs: _model.Observation):
     obs = _model.preprocess_observation(None, obs, train=False, image_keys=(CAMERA,))
     tokens, mask, ar_mask, _frame_len, frames = model.embed_prefix(obs)
     return model.PaliGemma.llm([tokens, None], mask=_pi0.make_attn_mask(mask, ar_mask),
-                               positions=jnp.cumsum(mask, axis=1) - 1, ttt_mask=model.ttt_mask(mask, frames))
+                               positions=jnp.cumsum(mask, axis=1) - 1, ttt_mask=model._ttt_mask(mask, frames))
 
 
 def _streamed(model, obs: _model.Observation, frames: range, memory: dict) -> dict:
@@ -183,7 +183,7 @@ def test_a_dropped_history_frame_is_a_stream_that_starts_later(models):
     mask = mask & (jnp.arange(mask.shape[1]) >= frame_len)[None, :]
     _, _, dropped_state = live.PaliGemma.llm(
         [tokens, None], mask=_pi0.make_attn_mask(mask, ar_mask), positions=jnp.cumsum(mask, axis=1) - 1,
-        ttt_mask=live.ttt_mask(mask, frames))
+        ttt_mask=live._ttt_mask(mask, frames))
     later = _streamed(live, obs, range(1, HIST), _fresh_memory(live))[_pi0.TTT_STATE_KEY]
     for dropped, streamed in zip(dropped_state, later, strict=True):
         np.testing.assert_allclose(dropped, streamed, rtol=1e-4, atol=1e-5)
