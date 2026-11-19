@@ -39,6 +39,9 @@ SORT_BOTH_HIST_INTERVAL = 15
 # is in, so the prompt comes from the dataset (prompt_from_task) and there is no default. The sort-both shape, so a sort-both or
 # inspection run1 checkpoint warm-starts it; a driver names the converted takes with --data.repo-id.
 INSPECTION_PHASES_REAL_REPO_ID = "local/yam_inspection_phases_real"
+# Inspection with the right arm alone, its takes through 2026-11-19, under the task catalog's inspection prompt.
+INSPECTION_RIGHT_REAL_REPO_ID = "local/yam_inspection_right_real_20261119"
+INSPECTION_PROMPT = "pick up the white roll and inspect"
 HISTORY_ABLATION_HORIZON = 1       # one frame, no streaming history: a recipe's `stream1` ablation
 STATE_DIM = 14                     # [L j0..5, L grip, R j0..5, R grip]
 LEFT_ARM_DIMS = tuple(range(7))    # [L j0..5, L grip]
@@ -307,6 +310,16 @@ def get_ih_yam_configs():
              repo_id=INSPECTION_PHASES_REAL_REPO_ID, prompt=None, prompt_from_task=True, lora=True,
              hist_interval=SORT_BOTH_HIST_INTERVAL, action_horizon=SORT_BOTH_ACTION_HORIZON, hist_horizon=horizon)
         for horizon in (HIST_HORIZON, HISTORY_ABLATION_HORIZON)]
+    # Outside `recipes`: no twins. bagging_right_real's one-arm layout at the sort-both shape, so a sort-both or inspection
+    # checkpoint warm-starts it.
+    inspection_right_recipes = [
+        dict(name=f"pi05_yam_stream5_i{SORT_BOTH_HIST_INTERVAL}_h{SORT_BOTH_ACTION_HORIZON}_inspection_right_real",
+             repo_id=INSPECTION_RIGHT_REAL_REPO_ID, prompt=INSPECTION_PROMPT, lora=True,
+             hist_interval=SORT_BOTH_HIST_INTERVAL, action_horizon=SORT_BOTH_ACTION_HORIZON,
+             active_image_keys=frozenset({"right_wrist_0_rgb"}),
+             active_state_dims=RIGHT_ARM_DIMS,
+             held_action_dims=LEFT_ARM_DIMS,
+             encode_only_active_cameras=True)]
 
     def vlash_twin(recipe: dict) -> dict:
         # The offset covers every lead the deploy loop can ask for at this cadence: it plays
@@ -382,4 +395,5 @@ def get_ih_yam_configs():
             recipes + [vlash_twin(recipe) for recipe in recipes] + [vlash_reference_twin(recipe) for recipe in recipes]
             + [vlash_measured_twin(recipe) for recipe in recipes] + [vlash_packed_measured_twin(recipe) for recipe in recipes]
             + [vlash_conditioned_twin(recipe) for recipe in recipes] + [vlash_long_conditioned_twin(recipe) for recipe in recipes]
-            + [vlash_packed_twin(recipe) for recipe in recipes] + race_twins + wide_twins + both_twins + phase_recipes]
+            + [vlash_packed_twin(recipe) for recipe in recipes] + race_twins + wide_twins + both_twins + phase_recipes
+            + inspection_right_recipes]
