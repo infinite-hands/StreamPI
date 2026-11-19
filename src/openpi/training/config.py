@@ -116,6 +116,10 @@ class DataConfig:
     # meta.json + episode_index/frame_index/transition/weight .npy by global frame index). Frames are then drawn
     # with probability proportional to its weight. None: no RACE targets, uniform sampling.
     race_targets_dir: str | None = None
+    # Per-episode sampling weights (data_loader.check_episode_weights): a JSON sidecar of one weight per episode
+    # of this dataset; every frame of an episode is drawn with probability proportional to its episode's weight
+    # (with replacement, one epoch = the dataset's size in draws). None: uniform sampling. Not combined with RACE.
+    sample_weights_path: str | None = None
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
@@ -223,6 +227,8 @@ class DataConfigFactory(abc.ABC):
     assets: AssetsConfig = dataclasses.field(default_factory=AssetsConfig)
     # Base config that will be updated by the factory.
     base_config: tyro.conf.Suppress[DataConfig | None] = None
+    # DataConfig.sample_weights_path, settable on any recipe (--data.sample-weights-path).
+    sample_weights_path: str | None = None
 
     @abc.abstractmethod
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -237,6 +243,7 @@ class DataConfigFactory(abc.ABC):
             asset_id=asset_id,
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
             use_quantile_norm=model_config.model_type != ModelType.PI0,
+            sample_weights_path=self.sample_weights_path,
         )
 
     def _load_norm_stats(self, assets_dir: epath.Path, asset_id: str | None) -> dict[str, _transforms.NormStats] | None:
