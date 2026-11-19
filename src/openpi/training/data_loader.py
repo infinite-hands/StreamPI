@@ -26,6 +26,8 @@ T_co = TypeVar("T_co", covariant=True)
 VLASH_STATE_KEY = "observation.state"
 # The RACE sidecar format this loader reads (meta.json's "version").
 RACE_TARGETS_VERSION = 1
+# The per-episode sample-weights sidecar format this loader reads (its "version").
+EPISODE_WEIGHTS_VERSION = 1
 
 
 class Dataset(Protocol[T_co]):
@@ -234,6 +236,14 @@ def create_torch_dataset(
             state_key=VLASH_STATE_KEY, state_source=data_config.vlash_state_source,
             branches=data_config.vlash_branches, cond_now=data_config.vlash_cond_now)])
 
+    if data_config.sample_weights_path is not None:
+        if data_config.race_targets_dir is not None:
+            raise ValueError("sample_weights_path and race_targets_dir both set sampling weights; set one")
+        episode_weights = check_episode_weights(data_config.sample_weights_path, repo_id, dataset_meta.total_episodes)
+        _, episode_index_column = _lerobot_frame_columns(lerobot)
+        dataset = TransformedDataset(dataset, [], sample_weights=episode_sample_weights(
+            episode_weights, episode_index_column, data_config.sample_weights_path))
+
     race_model = getattr(model_config, "race", False)
     if data_config.race_targets_dir is not None:
         if not race_model:
@@ -298,6 +308,44 @@ def race_sample_weights(store: dict[str, np.ndarray], frame_index_column: np.nda
     if not np.array_equal(np.asarray(store["episode_index"])[frames], np.asarray(episode_index_column)):
         raise ValueError(f"RACE targets {directory} place frames in other episodes than the dataset does")
     return np.asarray(store["weight"], dtype=np.float64)[frames]
+
+
+def check_episode_weights(path: str, repo_id: str, total_episodes: int) -> np.ndarray:
+    """A per-episode sample-weights sidecar's weights (float64, one per episode in episode_index order), after
+    refusing one that does not fit this dataset. The sidecar is JSON: {"version", "repo_id", "n_episodes",
+    "weights": [...]}; other keys (how the weights were made) are ignored."""
+    sidecar = pathlib.Path(path)
+    if not sidecar.is_file():
+        raise FileNotFoundError(f"sample weights {path} do not exist")
+    meta = json.loads(sidecar.read_text())
+    problems = []
+    if meta.get("version") != EPISODE_WEIGHTS_VERSION:
+        problems.append(f"its version is {meta.get('version')!r}, this loader reads {EPISODE_WEIGHTS_VERSION}")
+    if meta.get("repo_id") != repo_id:
+        problems.append(f"it was written for {meta.get('repo_id')!r}, the dataset is {repo_id!r}")
+    if meta.get("n_episodes") != total_episodes:
+        problems.append(f"it is for {meta.get('n_episodes')} episodes, the dataset has {total_episodes}")
+    raw = meta.get("weights")
+    weights = None
+    if not isinstance(raw, list) or not all(isinstance(w, int | float) and not isinstance(w, bool) for w in raw):
+        problems.append("its weights are not a list of numbers")
+    else:
+        weights = np.asarray(raw, dtype=np.float64)
+        if weights.shape != (total_episodes,):
+            problems.append(f"it holds {weights.shape[0]} weights, the dataset has {total_episodes} episodes")
+        if not (np.isfinite(weights).all() and (weights > 0).all()):
+            problems.append("a weight is not finite and > 0")
+    if problems:
+        raise ValueError(f"sample weights {path} do not fit: " + "; ".join(problems))
+    return weights
+
+
+def episode_sample_weights(episode_weights: np.ndarray, episode_index_column: np.ndarray, path: str) -> np.ndarray:
+    """Each dataset item's sampling weight: its episode's (`episode_index_column` holds every item's episode)."""
+    episodes = np.asarray(episode_index_column, dtype=np.int64)
+    if episodes.min(initial=0) < 0 or episodes.max(initial=0) >= episode_weights.shape[0]:
+        raise ValueError(f"sample weights {path} do not cover every episode of the dataset")
+    return episode_weights[episodes]
 
 
 def _lerobot_frame_columns(dataset: lerobot_dataset.LeRobotDataset) -> tuple[np.ndarray, np.ndarray]:
@@ -396,7 +444,7 @@ def create_distributed_torch_data_loader(
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
     if dataset.sample_weights is not None:
-        raise NotImplementedError("weighted sampling (RACE targets) is not wired for the distributed loader")
+        raise NotImplementedError("weighted sampling (RACE targets or sample weights) is not wired for the distributed loader")
 
     sampler = torch.utils.data.DistributedSampler(dataset, num_replicas=world_size, rank=rank)
     generator = torch.Generator()
@@ -542,6 +590,8 @@ def create_data_loader(
     logging.info(f"data_config: {data_config}")
 
     if data_config.rlds_data_dir is not None:
+        if data_config.sample_weights_path is not None:
+            raise ValueError("sample_weights_path weights LeRobot episodes; the RLDS loader does not read it")
         return create_rlds_data_loader(
             data_config,
             action_horizon=config.model.action_horizon,
@@ -622,7 +672,7 @@ def create_torch_data_loader(
 
     if dataset.sample_weights is not None:
         if sampler is not None:
-            raise NotImplementedError("weighted sampling (RACE targets) is not wired for distributed PyTorch")
+            raise NotImplementedError("weighted sampling (RACE targets or sample weights) is not wired for distributed PyTorch")
         sampler = race_weighted_sampler(dataset.sample_weights, seed)
 
     logging.info(f"local_batch_size: {local_batch_size}")
