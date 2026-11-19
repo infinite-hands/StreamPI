@@ -200,6 +200,17 @@ def create_torch_dataset(
     enable_jitter = data_config.enable_jitter
     step_time = 1.0 / dataset_meta.fps
 
+    # A Titans model (Pi0Config.titans_frames) also reads older frames of its one memory camera: fetched ahead of
+    # that camera's window, and split off below.
+    memory_frames = getattr(model_config, "titans_frames", 0)
+    memory_offsets: tuple[int, ...] = ()
+    if memory_frames:
+        if data_config.memory_sequence_key not in data_config.hist_sequence_keys:
+            raise ValueError(f"a Titans model reads older frames of its memory camera, and DataConfig.memory_sequence_key "
+                             f"({data_config.memory_sequence_key!r}) is not one of the history columns "
+                             f"{tuple(data_config.hist_sequence_keys)}")
+        memory_offsets = _transforms.titans_frame_offsets(hist_interval, memory_frames, model_config.titans_stride)
+
     hist_delta_timestamps = {}
 
     for key in data_config.hist_sequence_keys:
@@ -207,7 +218,8 @@ def create_torch_dataset(
             -1 * t
             for t in range((hist_horizon - 1) * hist_interval, -1, -1)
         ]
-        hist_delta_timestamps[key] = [s * step_time for s in base_steps]
+        older_steps = memory_offsets if key == data_config.memory_sequence_key else ()
+        hist_delta_timestamps[key] = [s * step_time for s in (*older_steps, *base_steps)]
 
     delta_timestamps.update(hist_delta_timestamps)
 
@@ -222,6 +234,9 @@ def create_torch_dataset(
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+
+    if memory_frames:
+        dataset = TransformedDataset(dataset, [_transforms.SplitMemoryFrames(data_config.memory_sequence_key, memory_frames)])
 
     dataset = TransformedDataset(dataset, [_transforms.TemporalJitter(jitter_range, hist_interval, hist_horizon, data_config.hist_sequence_keys, enable_jitter)])
 

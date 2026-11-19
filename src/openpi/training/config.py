@@ -112,6 +112,9 @@ class DataConfig:
     # Decode only the video columns in hist_sequence_keys. A recipe that masks a camera still pays
     # its decode otherwise: LeRobot decodes every video column for every sample.
     decode_only_hist_cameras: bool = False
+    # Titans (Pi0Config.titans_frames): the video column the model's memory camera is, one of hist_sequence_keys. The
+    # loader fetches the memory's older frames of it (transforms.titans_frame_offsets). None: no such model.
+    memory_sequence_key: str | None = None
     # RACE (Pi0Config.race): the directory of this dataset's transition-target sidecar (transforms.RaceTargets;
     # meta.json + episode_index/frame_index/transition/weight .npy by global frame index). Frames are then drawn
     # with probability proportional to its weight. None: no RACE targets, uniform sampling.

@@ -47,6 +47,10 @@ IMAGE_KEYS = (
 # This may need change if we release a small model.
 IMAGE_RESOLUTION = (224, 224)
 
+# Folded into preprocess_observation's rng for the augmentation of Observation.memory_images, so the draws of the
+# window's own frames are the same with and without them.
+_MEMORY_IMAGES_STREAM = 0x7174
+
 
 # Data format
 #
@@ -114,6 +118,11 @@ class Observation(Generic[ArrayT]):
     transition_window: at.Float[ArrayT, "#b race_rows"] | None = None
     transition_window_mask: at.Bool[ArrayT, "#b race_rows"] | None = None
 
+    # Long-term memory (Pi0Config.titans_frames), training only: older frames of the memory's camera, in [-1, 1],
+    # newest first, and which of them exist (a slot before the episode's start does not).
+    memory_images: at.Float[ArrayT, "#b mem mh mw mc"] | None = None
+    memory_mask: at.Bool[ArrayT, "#b mem"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -135,6 +144,10 @@ class Observation(Generic[ArrayT]):
                 elif data["image"][key].ndim == 5:
                     data["image"][key] = data["image"][key].to(torch.float32).permute(0, 1, 4, 2, 3) / 255.0 * 2.0 - 1.0
 
+        memory_images = data.get("memory_image")
+        if memory_images is not None and memory_images.dtype == np.uint8:
+            memory_images = memory_images.astype(np.float32) / 255.0 * 2.0 - 1.0
+
         return cls(
             images=data["image"],
             image_masks=data["image_mask"],
@@ -145,6 +158,8 @@ class Observation(Generic[ArrayT]):
             token_loss_mask=data.get("token_loss_mask"),
             transition_window=data.get("transition_window"),
             transition_window_mask=data.get("transition_window_mask"),
+            memory_images=memory_images,
+            memory_mask=data.get("memory_mask"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -152,6 +167,7 @@ class Observation(Generic[ArrayT]):
         result = dataclasses.asdict(self)
         result["image"] = result.pop("images")
         result["image_mask"] = result.pop("image_masks")
+        result["memory_image"] = result.pop("memory_images")
         return result
 
 
@@ -167,9 +183,12 @@ def preprocess_observation(
     train: bool = False,
     image_keys: Sequence[str] = IMAGE_KEYS,
     image_resolution: tuple[int, int] = IMAGE_RESOLUTION,
+    memory_image_key: str | None = None,
 ) -> Observation:
     """Preprocess the observations by performing image augmentations (if train=True), resizing (if necessary), and
-    filling in a default image mask (if necessary).
+    filling in a default image mask (if necessary). `memory_image_key` names the camera the observation's
+    memory_images are older frames of: they are treated as that camera's frames are. None (a model that does not
+    read them) passes them through untouched.
     """
 
     if not set(image_keys).issubset(observation.images):
@@ -219,6 +238,16 @@ def preprocess_observation(
         else:
             out_masks[key] = jnp.asarray(observation.image_masks[key])
 
+    memory_images = observation.memory_images
+    if memory_images is not None and memory_image_key is not None:
+        # The same resize and augmentation that camera's own frames get, with their own randomness (the frames
+        # stand in as its window).
+        memory_images = preprocess_observation(
+            None if rng is None else jax.random.fold_in(rng, _MEMORY_IMAGES_STREAM),
+            Observation(images={memory_image_key: memory_images}, image_masks={}, state=observation.state),
+            train=train, image_keys=(memory_image_key,), image_resolution=image_resolution,
+        ).images[memory_image_key]
+
     return Observation(
         images=out_images,
         image_masks=out_masks,
@@ -229,6 +258,8 @@ def preprocess_observation(
         token_loss_mask=observation.token_loss_mask,
         transition_window=observation.transition_window,
         transition_window_mask=observation.transition_window_mask,
+        memory_images=memory_images,
+        memory_mask=observation.memory_mask,
     )
 
 

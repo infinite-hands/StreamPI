@@ -11,6 +11,7 @@ from typing_extensions import override
 
 from openpi.models import model as _model
 from openpi.models import pi0_config
+from openpi.models import titans as _titans
 import openpi.models.gemma as _gemma
 import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
@@ -35,6 +36,25 @@ RACE_JITTER_FORWARD_PROB = 0.5
 # Folded into the step's rng for the jitter draws, so the base model's noise, time and history-drop draws are
 # the same with and without RACE.
 _RACE_JITTER_STREAM = 0x5ACE
+
+# Titans (arXiv 2501.00663; openpi.models.titans). The serve memory dict's entry for a client's long-term memory:
+# {"state": the memory's state (titans.State), "calls": how many calls it has seen}. Fixed-shape arrays from the
+# first call on, so it adds no input structure to the jitted sampler.
+LONG_MEMORY_KEY = "long_memory"
+# Folded into the step's rng for the draws that cut a training sample's memory short (cut_memory_short), so the
+# base model's noise, time and history-drop draws are the same with and without the memory.
+_TITANS_CUT_STREAM = 0x7175
+
+
+def cut_memory_short(rng: at.KeyArrayLike, valid: at.Bool[at.Array, "b k"], rate: float) -> at.Bool[at.Array, "b k"]:
+    """Training only. `valid` says which of a sample's older frames exist, newest first. With probability `rate` a
+    sample keeps just its newest n, n uniform in 0..k-1 (0: an empty memory): what the memory holds n writes into a
+    served run, which a sample from the middle of a long episode never shows."""
+    cut_rng, length_rng = jax.random.split(rng)
+    batch, frames = valid.shape
+    cut = jax.random.bernoulli(cut_rng, rate, (batch,))
+    kept = jax.random.randint(length_rng, (batch,), 0, frames)
+    return valid & (~cut[:, None] | (jnp.arange(frames)[None, :] < kept[:, None]))
 
 
 def make_attn_mask(input_mask, mask_ar):
@@ -111,7 +131,7 @@ class Pi0(_model.BaseModel):
             )
         )
         llm.lazy_init(rngs=rngs, method="init", use_adarms=[False, True] if config.pi05 else [False, False],
-                      race=config.race)
+                      race=config.race, memory_width=config.titans_dim if config.titans_frames else None)
         img = nnx_bridge.ToNNX(
             _siglip.Module(
                 num_classes=paligemma_config.width,
@@ -165,9 +185,30 @@ class Pi0(_model.BaseModel):
         self.hist_horizon = config.hist_horizon
         self.image_keys = tuple(config.image_keys)
 
+        # Titans. Created last, so every weight above is drawn as it is for a model without the memory.
+        self.titans_frames = config.titans_frames
+        self.titans_stride = config.titans_stride
+        self.titans_image_key = config.titans_image_key
+        self.titans_dropout = config.titans_dropout
+        self.titans_memory = None
+        if config.titans_frames:
+            self.titans_memory = _titans.TitansMemory(
+                paligemma_config.width, config.titans_dim, config.titans_hidden_dim, config.titans_depth,
+                config.titans_grid, rngs)
+
+    def image_tokens(self, obs: _model.Observation) -> dict[str, at.Float[at.Array, "b t n emb"]]:
+        """SigLIP's tokens for every frame of every camera this model encodes: what embed_prefix and
+        embed_prefix_infer compute for themselves unless they are handed it."""
+        tokens = {}
+        for name in self.image_keys:
+            image = obs.images[name]
+            encoded, _ = self.PaliGemma.img(image.reshape(-1, *image.shape[2:]), train=False)
+            tokens[name] = encoded.reshape(*image.shape[:2], *encoded.shape[1:])
+        return tokens
+
     @at.typecheck
     def embed_prefix(
-        self, obs: _model.Observation,
+        self, obs: _model.Observation, encoded: dict | None = None,
     ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"], int, int]:
         input_mask = []
         ar_mask = []
@@ -178,6 +219,9 @@ class Pi0(_model.BaseModel):
         for name in self.image_keys:
             image = obs.images[name]
             bs, T = image.shape[0], image.shape[1]
+            if encoded is not None:   # SigLIP's tokens, computed by the caller (image_tokens)
+                all_image_tokens[name] = encoded[name]
+                continue
             image = image.reshape(bs*T, image.shape[2], image.shape[3], image.shape[4])
             image_tokens, _ = self.PaliGemma.img(image, train=False)
             image_tokens = image_tokens.reshape(bs, T, image_tokens.shape[1], image_tokens.shape[2])
@@ -319,7 +363,9 @@ class Pi0(_model.BaseModel):
     ):
         """(L_full per row, L_aux per row, L_timing); the last two are None for a model without RACE."""
         preprocess_rng, noise_rng, time_rng, mask_rng = jax.random.split(rng, 4)
-        observation = _model.preprocess_observation(preprocess_rng, observation, train=train, image_keys=self.image_keys)
+        observation = _model.preprocess_observation(
+            preprocess_rng, observation, train=train, image_keys=self.image_keys,
+            memory_image_key=self.titans_image_key if self.titans_frames else None)
 
         b, ah, ad = actions.shape
         batch_shape = actions.shape[:-2]
@@ -330,8 +376,14 @@ class Pi0(_model.BaseModel):
         x_t = time[..., None] * noise + (1 - time[..., None]) * actions
         u_t = noise - actions
 
+        # Titans: the images are encoded once, for the prefix and for the memory's query.
+        image_tokens, memory_bank = None, None
+        if self.titans_frames:
+            image_tokens = self.image_tokens(observation)
+            memory_bank = self.training_memory_bank(rng, observation, image_tokens, train=train)
+
         # one big forward pass of prefix + suffix at once
-        prefix_tokens, prefix_mask, prefix_ar_mask, num_img_tokens, T = self.embed_prefix(observation)
+        prefix_tokens, prefix_mask, prefix_ar_mask, num_img_tokens, T = self.embed_prefix(observation, image_tokens)
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
@@ -374,7 +426,7 @@ class Pi0(_model.BaseModel):
 
         (prefix_out, suffix_out), kv_cache = self.PaliGemma.llm(
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond],
-            race_cond=race_cond,
+            race_cond=race_cond, memory_bank=memory_bank,
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
@@ -449,7 +501,7 @@ class Pi0(_model.BaseModel):
 
     @at.typecheck
     def embed_prefix_infer(
-        self, obs: _model.Observation, memory_tokens
+        self, obs: _model.Observation, memory_tokens, encoded: dict | None = None,
     ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"], int, int]:
         input_mask = []
         ar_mask = []
@@ -460,6 +512,9 @@ class Pi0(_model.BaseModel):
         for name in self.image_keys:
             image = obs.images[name]
             bs, T = image.shape[0], image.shape[1]
+            if encoded is not None:   # SigLIP's tokens, computed by the caller (image_tokens)
+                all_image_tokens[name] = encoded[name]
+                continue
             image = image.reshape(bs*T, image.shape[2], image.shape[3], image.shape[4])
             image_tokens, _ = self.PaliGemma.img(image, train=False)
             image_tokens = image_tokens.reshape(bs, T, image_tokens.shape[1], image_tokens.shape[2])
@@ -512,6 +567,60 @@ class Pi0(_model.BaseModel):
         memory["memory_tokens"] = None
         memory["memory_kv_cache"] = None
         memory["memory_prefix_mask"] = None
+        # The long memory outlives the KV window: only reset_long_memory empties it. It is created here when absent,
+        # so every call of a history hands the sampler the same arrays.
+        if self.titans_frames and LONG_MEMORY_KEY not in memory:
+            self.reset_long_memory(memory)
+
+    def reset_long_memory(self, memory, batch_size: int = 1):
+        """Empties a client's long-term memory (Pi0Config.titans_frames): a new history starts with nothing written.
+        Nothing to do for a model without one."""
+        if self.titans_frames:
+            memory[LONG_MEMORY_KEY] = {
+                "state": self.titans_memory.initial_state(batch_size), "calls": jnp.zeros((), dtype=jnp.int32)}
+
+    def step_long_memory(self, observation: _model.Observation, memory: dict, image_tokens: dict):
+        """One served call of the long-term memory: (the memory bank the action expert reads on this call, `memory`
+        with the long memory advanced); (None, `memory`) for a model without one. The read comes first and the write
+        after, on every titans_stride-th call of the history, so a read holds earlier calls' frames only -- at a
+        write call exactly the frames a training sample's memory_images are. `observation` is preprocessed and
+        `image_tokens` is self.image_tokens(observation)."""
+        if not self.titans_frames:
+            return None, memory
+        held = memory.get(LONG_MEMORY_KEY)
+        if held is None:
+            held = {"state": self.titans_memory.initial_state(observation.state.shape[0]),
+                    "calls": jnp.zeros((), dtype=jnp.int32)}
+        seen = observation.image_masks[self.titans_image_key]
+        frame = self.titans_memory.tokens(image_tokens[self.titans_image_key][:, -1])
+        tokens, counted = self.titans_memory.read(held["state"], frame)
+        turn = held["calls"] % self.titans_stride == 0
+        memory[LONG_MEMORY_KEY] = {
+            "state": self.titans_memory.write(held["state"], frame, seen & turn), "calls": held["calls"] + 1}
+        return (tokens, counted & seen[:, None]), memory
+
+    def training_memory_bank(self, rng: at.KeyArrayLike, observation: _model.Observation, image_tokens: dict, *,
+                             train: bool):
+        """A training sample's memory bank: the memory unrolled over the sample's older frames
+        (Observation.memory_images, newest first, titans_stride calls apart), then read for the window's last frame --
+        what step_long_memory returns on the call that frame is served. No gradient reaches SigLIP from here.
+        `observation` is preprocessed and `image_tokens` is self.image_tokens(observation)."""
+        older, valid = observation.memory_images, observation.memory_mask
+        if older is None or valid is None or older.shape[1] != self.titans_frames:
+            raise ValueError(f"a Titans model trains on {self.titans_frames} older frames of {self.titans_image_key} "
+                             "(Observation.memory_images / memory_mask): the data config must fetch them")
+        batch, frames = valid.shape
+        seen = observation.image_masks[self.titans_image_key]
+        valid = valid & seen[:, None]
+        if train and self.titans_dropout:
+            valid = cut_memory_short(jax.random.fold_in(rng, _TITANS_CUT_STREAM), valid, self.titans_dropout)
+        encoded, _ = self.PaliGemma.img(older.reshape(batch * frames, *older.shape[2:]), train=False)
+        encoded = jax.lax.stop_gradient(encoded).reshape(batch, frames, *encoded.shape[1:])
+        # The writes go oldest first.
+        state = self.titans_memory.unroll(self.titans_memory.tokens(encoded)[:, ::-1], valid[:, ::-1])
+        current = jax.lax.stop_gradient(image_tokens[self.titans_image_key][:, -1])
+        tokens, counted = self.titans_memory.read(state, self.titans_memory.tokens(current))
+        return tokens, counted & seen[:, None]
 
     @at.typecheck
     def save_memory(
@@ -558,7 +667,14 @@ class Pi0(_model.BaseModel):
         # if jax.process_index() == 0:
         #     jax.debug.print("x1, {}, {}", memory_kv_cache is None, memory_prefix_mask is None)
 
-        prefix_tokens, prefix_mask, prefix_ar_mask, num_visual_tokens, num_text_tokens = self.embed_prefix_infer(observation, memory_tokens)
+        # Titans: the images are encoded once, for the prefix and for the long memory's read and write.
+        image_tokens, memory_bank = None, None
+        if self.titans_frames:
+            image_tokens = self.image_tokens(observation)
+            memory_bank, memory = self.step_long_memory(observation, memory, image_tokens)
+
+        prefix_tokens, prefix_mask, prefix_ar_mask, num_visual_tokens, num_text_tokens = self.embed_prefix_infer(
+            observation, memory_tokens, image_tokens)
 
         # prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
 
@@ -586,7 +702,7 @@ class Pi0(_model.BaseModel):
             x_t, time = carry
             time_ = jnp.broadcast_to(time, batch_size)  # (b, )
             race_cond = None if prior is None else self.race_step_conditioning(prior, time, num_steps)
-            v_t, _ = self._suffix_pass(observation, prefix_mask, kv_cache, x_t, time_[:, None], race_cond)
+            v_t, _ = self._suffix_pass(observation, prefix_mask, kv_cache, x_t, time_[:, None], race_cond, memory_bank)
             return x_t + dt * v_t, time + dt
 
         def cond(carry):
@@ -601,9 +717,10 @@ class Pi0(_model.BaseModel):
         # A RACE model also returns the head's scores for the rows of x_0 (Policy.infer: "transition_scores").
         return x_0, memory, prior
 
-    def _suffix_pass(self, observation, prefix_mask, kv_cache, x_t, timestep, race_cond=None):
+    def _suffix_pass(self, observation, prefix_mask, kv_cache, x_t, timestep, race_cond=None, memory_bank=None):
         """One action-expert pass over a cached prefix: (velocity, the final-layer hidden states of the action
-        rows). `observation` is preprocessed; `prefix_mask` (b, cached tokens) covers every cached token."""
+        rows). `observation` is preprocessed; `prefix_mask` (b, cached tokens) covers every cached token;
+        `memory_bank` is the call's long-memory read (step_long_memory), None for a model without one."""
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, timestep)
         # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
         # other
@@ -624,6 +741,7 @@ class Pi0(_model.BaseModel):
             kv_cache=kv_cache,
             adarms_cond=[None, adarms_cond],
             race_cond=race_cond,
+            memory_bank=memory_bank,
         )
         assert prefix_out is None
         hidden = suffix_out[:, -self.action_horizon :]

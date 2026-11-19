@@ -22,6 +22,9 @@ RACE_STORE_ARRAYS = {"episode_index": np.int32, "frame_index": np.int32, "transi
                      "weight": np.float32}
 # The training targets RaceTargets adds to a sample (Observation.transition_window / transition_window_mask).
 RACE_TARGET_KEYS = ("transition_window", "transition_window_mask")
+# Long-term memory (Pi0Config.titans_frames): the sample's older frames of the memory's camera, newest first, and
+# which of them exist (SplitMemoryFrames).
+MEMORY_KEYS = ("memory_image", "memory_mask")
 # A RACE model's served output: its head's transition score for each returned action row.
 TRANSITION_SCORES_KEY = "transition_scores"
 _RACE_STORES: dict[str, dict[str, np.ndarray]] = {}
@@ -190,6 +193,35 @@ class Unnormalize(DataTransformFn):
         if (dim := q01.shape[-1]) < x.shape[-1]:
             return np.concatenate([(x[..., :dim] + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01, x[..., dim:]], axis=-1)
         return (x + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01
+
+
+def titans_frame_offsets(hist_interval: int, frames: int, stride: int) -> tuple[int, ...]:
+    """The frame offsets from the current frame (oldest first) of a Titans model's older frames: `stride`, 2 * `stride`,
+    ..., `frames` * `stride` calls back, a call being hist_interval frames. They are the calls a served run wrote its
+    memory on, seen from a call it writes on (Pi0.step_long_memory)."""
+    return tuple(-slot * stride * hist_interval for slot in range(frames, 0, -1))
+
+
+@dataclasses.dataclass(frozen=True)
+class SplitMemoryFrames(DataTransformFn):
+    """Takes the leading `frames` entries of a camera's fetched sequence (the memory's older frames, oldest first, then
+    the history window) off as the sample's memory: `memory_image` (newest first, so slot i is row i) and `memory_mask`,
+    False where the frame lies before the episode's start (LeRobot's `<key>_is_pad`; its image is the first frame's).
+    Runs before TemporalJitter, which then sees the window alone."""
+
+    key: str
+    frames: int
+
+    def __call__(self, data: DataDict) -> DataDict:
+        sequence = np.asarray(data[self.key])
+        pad_key = f"{self.key}_is_pad"
+        padded = np.asarray(data[pad_key], dtype=bool) if pad_key in data else np.zeros(len(sequence), dtype=bool)
+        data["memory_image"] = np.ascontiguousarray(sequence[: self.frames][::-1])
+        data["memory_mask"] = np.ascontiguousarray(~padded[: self.frames][::-1])
+        data[self.key] = sequence[self.frames :]
+        if pad_key in data:
+            data[pad_key] = padded[self.frames :]
+        return data
 
 
 @dataclasses.dataclass(frozen=True)
@@ -388,6 +420,9 @@ class ResizeImages(DataTransformFn):
                 data["image"][k] = np.stack(images)
             else:
                 raise ValueError
+        if data.get("memory_image") is not None:
+            data["memory_image"] = np.stack(
+                [image_tools.resize_with_pad(frame, self.height, self.width) for frame in data["memory_image"]])
         # import cv2
         # T, H, W, _ = data["image"]["base_0_rgb"].shape
         # frames_list = [data["image"]["base_0_rgb"][i] for i in range(T)]
