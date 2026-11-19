@@ -17,13 +17,14 @@ from openpi.shared import array_typing as at
 
 # Our choice: the initial logits of the three gates, [theta (step size), eta (surprise decay), alpha (forgetting)].
 # Their kernels start at zero, so a new memory's gates are these constants until training makes them depend on the
-# frame (sec. 3.2: "we make these parameters as the functions of tokens"). sigmoid(0) = 0.5; sigmoid(-3) = 0.047.
+# frame (sec. 3.2: "we make these parameters as the functions of tokens"). sigmoid(0) = 0.5; sigmoid(-3) = 0.047, a
+# half-life of about 14 writes, near the frame count a training sample unrolls.
 GATE_INITIAL_LOGITS = (0.0, 0.0, -3.0)
 # Our choice (the paper has no bound): a write's momentary surprise is clipped to this global norm per sample, so one
-# write moves the weights by a bounded amount whatever training has made of the parameters.
+# write moves the weights by a bounded amount whatever training has made of the parameters. Measured on a near-static
+# scene over 2,000 writes it never engaged (median surprise norm 0.07 to 0.18); unclipped, a two-layer memory at
+# extreme gates reached inf within 8 to 23 writes of one frame.
 MAX_SURPRISE_NORM = 1.0
-# Our choice: the standard deviation the learned position of each grid cell starts from.
-POSITION_INITIAL_SCALE = 0.02
 # Inside every norm below, so a zero vector has a finite gradient.
 _NORM_EPSILON = 1e-6
 
@@ -63,13 +64,20 @@ def recall(weights: tuple, keys: at.Float[at.Array, "p d"]) -> at.Float[at.Array
     return hidden
 
 
+def token_weights(keys: at.Float[at.Array, "p d"]) -> at.Float[at.Array, " p"]:
+    """How much each token of a frame counts in its write. Sec. 3.2 SUMS a chunk's gradients (the frame is our chunk);
+    that overshoots when the tokens share their key, as the cells of one camera picture largely do. Our choice: token p
+    counts 1 / sum_q |k_p . k_q| -- the paper's sum when the keys are orthogonal, the mean when they are identical --
+    floored at 1, so near-zero keys cannot magnify a write."""
+    return 1.0 / jnp.maximum(jnp.sum(jnp.abs(keys @ keys.T), axis=-1), 1.0)
+
+
 def associative_loss(weights: tuple, keys, values, step_sizes) -> at.Float[at.Array, ""]:
-    """Eq. 12, ||M(k) - v||^2, over one frame's tokens, each weighted by its own step size theta (eq. 14's theta_t
-    grad l): the gradient of this is the frame's momentary surprise. Sec. 3.2 takes every gradient of a chunk at the
-    chunk's first weights and SUMS them; the frame is our chunk and the mean is our choice, so a write's step does
-    not grow with the token count and tokens that share a key cannot overshoot."""
+    """Eq. 12, ||M(k) - v||^2, summed over one frame's tokens, each weighted by its own step size (eq. 14's theta_t,
+    times token_weights in a write): the gradient of this is the frame's momentary surprise. Every token's gradient is
+    taken at the frame's first weights, as sec. 3.2 takes a chunk's."""
     error = jnp.sum(jnp.square(recall(weights, keys) - values), axis=-1)
-    return jnp.mean(step_sizes * error)
+    return jnp.sum(step_sizes * error)
 
 
 class TitansMemory(nnx.Module):
@@ -82,14 +90,17 @@ class TitansMemory(nnx.Module):
         self.grid = grid
         self.layers = tuple(f"layer_{index}" for index in range(depth))
         normal = nnx.initializers.lecun_normal()
-        # Our choice: what the memory is given. A frame's grid-pooled image tokens, projected to the memory's width,
-        # plus a learned position per grid cell, at unit RMS.
+        # Our choice: what the memory is given. A frame's grid-pooled image tokens, projected to the memory's width, plus
+        # a learned position per grid cell as large as the content, so a key says where in the picture as much as what:
+        # a read can then say what a cell showed before it changed (measured; with positions 50x smaller it cannot).
         self.in_proj = nnx.Linear(token_width, dim, rngs=rngs)
-        self.position = nnx.Param(POSITION_INITIAL_SCALE * jax.random.normal(rngs.params(), (grid * grid, dim)))
-        # Eq. 11 and sec. 3.1: k = x W_K, v = x W_V, q = x W_Q.
+        self.position = nnx.Param(jax.random.normal(rngs.params(), (grid * grid, dim)))
+        # Eq. 11 and sec. 3.1: k = x W_K, v = x W_V, q = x W_Q. Our choice: W_Q starts as a copy of W_K (then trains on its
+        # own), so a read addresses what was written from the first step; with an independent random W_Q, reads after
+        # writing two unrelated scenes were 0.99 alike.
         self.key_proj = nnx.Param(normal(rngs.params(), (dim, dim)))
         self.value_proj = nnx.Param(normal(rngs.params(), (dim, dim)))
-        self.query_proj = nnx.Param(normal(rngs.params(), (dim, dim)))
+        self.query_proj = nnx.Param(jnp.array(self.key_proj.value))
         self.gate_kernel = nnx.Param(jnp.zeros((dim, len(GATE_INITIAL_LOGITS))))
         self.gate_bias = nnx.Param(jnp.asarray(GATE_INITIAL_LOGITS, dtype=jnp.float32))
         # M_0, the weights a run starts from. The paper does not say where they come from; learning them in the outer
@@ -101,8 +112,8 @@ class TitansMemory(nnx.Module):
 
     def tokens(self, image_tokens: at.Float[at.Array, "*b n w"]) -> at.Float[at.Array, "*b cells d"]:
         """One frame's image tokens as the memory's input x, float32."""
-        pooled = grid_pool(image_tokens.astype(jnp.float32), self.grid)
-        return _rms(self.in_proj(pooled) + self.position.value)
+        content = _rms(self.in_proj(grid_pool(image_tokens.astype(jnp.float32), self.grid)))
+        return _rms(content + self.position.value)
 
     def initial_state(self, batch_size: int) -> State:
         """A run's first state: nothing moved, no momentum, nothing written. It does not depend on the parameters."""
@@ -121,7 +132,8 @@ class TitansMemory(nnx.Module):
     def surprise(self, state: State, x: at.Float[at.Array, "b cells d"]) -> at.Float[at.Array, " b"]:
         """Eq. 12 for each sample's memory on one frame, averaged over its tokens: how badly the memory recalls it."""
         keys, values = self._pairs(x)
-        return jax.vmap(associative_loss)(self._weights(state), keys, values, jnp.ones(x.shape[:2], jnp.float32))
+        return jax.vmap(associative_loss)(
+            self._weights(state), keys, values, jnp.full(x.shape[:2], 1.0 / x.shape[1], jnp.float32))
 
     def write(self, state: State, x: at.Float[at.Array, "b cells d"], valid: at.Bool[at.Array, " b"]) -> State:
         """Eq. 13-14 for one frame: S <- eta S - theta grad l(M; x), then the forgetting step. A sample whose `valid`
@@ -134,7 +146,7 @@ class TitansMemory(nnx.Module):
         keys, values = self._pairs(x)
         kernel, bias = self.gate_kernel.value, self.gate_bias.value
         # theta per token; eta and alpha per frame, from its mean token (sec. 3.2 allows one value per chunk).
-        theta = jax.nn.sigmoid(x @ kernel[:, 0] + bias[0])
+        theta = jax.nn.sigmoid(x @ kernel[:, 0] + bias[0]) * jax.vmap(token_weights)(keys)
         frame = jnp.mean(x, axis=-2)
         eta = jax.nn.sigmoid(frame @ kernel[:, 1] + bias[1])[:, None, None]
         alpha = jax.nn.sigmoid(frame @ kernel[:, 2] + bias[2])[:, None, None]

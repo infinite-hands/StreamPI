@@ -59,6 +59,33 @@ def test_grid_pool_refuses_tokens_its_cells_do_not_divide():
         titans.grid_pool(jnp.zeros((1, 16, 4)), 3)
 
 
+def test_a_frame_counts_its_tokens_once_whether_their_keys_differ_or_agree():
+    """Orthogonal keys count 1 each (the paper's sum over a chunk); identical keys share 1 (the mean); keys near zero
+    count at most 1, so they cannot magnify a write."""
+    orthogonal = jnp.eye(4, 8)
+    np.testing.assert_allclose(np.asarray(titans.token_weights(orthogonal)), 1.0)
+    identical = jnp.tile(titans._unit(jnp.arange(1.0, 9.0))[None], (4, 1))
+    np.testing.assert_allclose(np.asarray(titans.token_weights(identical)), 0.25, rtol=1e-6)
+    np.testing.assert_allclose(np.asarray(titans.token_weights(1e-4 * orthogonal)), 1.0)
+    pair = jnp.asarray([[1.0, 0.0], [0.6, 0.8], [0.0, 1.0]])   # unit keys, the middle one between the others
+    np.testing.assert_allclose(np.asarray(titans.token_weights(pair)), [1 / 1.6, 1 / 2.4, 1 / 1.8], rtol=1e-6)
+
+
+def test_the_query_starts_as_the_key_so_a_read_recalls_what_was_written():
+    memory = _memory()
+    np.testing.assert_array_equal(np.asarray(memory.query_proj.value), np.asarray(memory.key_proj.value))
+    assert memory.query_proj is not memory.key_proj, "a copy, trained on its own"
+    frame = _frames(memory, 1)[:, 0]
+    _keys, values = memory._pairs(frame)
+
+    def agreement(state):
+        tokens, _ = memory.read(state, frame)
+        return np.asarray(jnp.mean(jnp.sum(titans._unit(tokens) * values, axis=-1), axis=-1))
+
+    written = memory.write(memory.initial_state(BATCH), frame, jnp.ones((BATCH,), bool))
+    assert (agreement(written) > agreement(memory.initial_state(BATCH)) + 0.05).all()
+
+
 def test_the_memory_is_given_unit_rms_tokens_one_per_cell():
     x = _frames(_memory(), 2)
     assert x.shape == (BATCH, 2, GRID * GRID, DIM)
