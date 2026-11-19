@@ -83,6 +83,13 @@ RACE_TARGETS_ROOT = "/misc/race-targets"
 # The recipes that get a `_race` twin (race_twin).
 RACE_TWIN_BASES: tuple[str, ...] = ("pi05_yam_stream5_i20_bagging_right_real",
                                    "pi05_yam_stream5_i20_bagging_left_real")
+# The recipes that get a `_titans` twin (titans_twin): a Titans long-term memory (arXiv 2501.00663, Pi0Config.titans_frames)
+# on the overhead camera, the one that shows where earlier pieces went. Training unrolls 16 older frames 4 calls apart: at the
+# 15-frame cadence one write every 2 s, reaching 32 s back, a few sort cycles. The frame count and spacing are the memory-bank
+# recipe's (ih/sort-right-combined), so the two can be compared; neither they nor the memory's sizes (Pi0Config's defaults)
+# have been tuned.
+TITANS_TWIN_BASES: tuple[str, ...] = (f"pi05_yam_stream5_i{SORT_BOTH_HIST_INTERVAL}_h{SORT_BOTH_ACTION_HORIZON}_sort_both_real",)
+TITANS_FRAMES, TITANS_STRIDE, TITANS_IMAGE_KEY = 16, 4, "base_0_rgb"
 
 
 def yam_repack(cameras: tuple[str, ...] = YAM_CAMERAS, *, vlash_cond_now: bool = False,
@@ -108,6 +115,14 @@ def yam_repack(cameras: tuple[str, ...] = YAM_CAMERAS, *, vlash_cond_now: bool =
 
 
 YAM_REPACK = yam_repack()
+
+
+def with_memory_frames(repack: _transforms.Group) -> _transforms.Group:
+    """`repack` that also passes a memory model's older frames through (transforms.MEMORY_KEYS): RepackTransform keeps
+    only the keys it maps."""
+    (step,) = repack.inputs
+    structure = {**step.structure, **{key: key for key in _transforms.MEMORY_KEYS}}
+    return dataclasses.replace(repack, inputs=[_transforms.RepackTransform(structure)])
 
 
 def vlash_cond_dims(active_state_dims: tuple[int, ...]) -> tuple[int, ...]:
@@ -139,6 +154,13 @@ def get_ih_yam_configs():
             if self.norm_stats_config is not None:
                 assets_dirs = assets_dirs.parent / self.norm_stats_config
             created = super().create(assets_dirs, model_config)
+            if getattr(model_config, "titans_frames", 0):
+                # The model decides, so a --model.titans-frames override gets its older frames and a model without the
+                # memory does not fetch them.
+                camera = next(camera for camera, image_key in AgilexInputs.IMAGE_KEY_BY_CAMERA.items()
+                              if image_key == model_config.titans_image_key)
+                created = dataclasses.replace(created, memory_sequence_key=f"observation.images.{camera}",
+                                              repack_transforms=with_memory_frames(created.repack_transforms))
             if self.race_targets_root is not None:
                 created = dataclasses.replace(created, race_targets_dir=f"{self.race_targets_root}/{created.repo_id}")
             if created.vlash_cond_now:
@@ -169,7 +191,8 @@ def get_ih_yam_configs():
                       num_train_steps: int = 20_000,
                       encode_only_active_cameras: bool = False,
                       race: bool = False, norm_stats_config: str | None = None,
-                      prompt_from_task: bool = False, hist_horizon: int = HIST_HORIZON):
+                      prompt_from_task: bool = False, hist_horizon: int = HIST_HORIZON,
+                      titans_frames: int = 0):
         # A masked camera's tokens are padding, so a recipe may skip decoding and encoding them: the same
         # model, one SigLIP pass per frame instead of three and a third of the prefix. Opt-in per config
         # because it changes the model's input layout (not its weights).
@@ -178,6 +201,9 @@ def get_ih_yam_configs():
         # A default beside per-frame prompts would answer a request that lost its prompt with text the recipe never trained on.
         if (prompt is None) != prompt_from_task:
             raise ValueError(f"{name}: a recipe has a default prompt or reads its prompt from the dataset's task, exactly one")
+        # The memory is given a camera the recipe shows the model: a masked one is all zeros.
+        if titans_frames and active_image_keys is not None and TITANS_IMAGE_KEY not in active_image_keys:
+            raise ValueError(f"{name}: the Titans memory reads {TITANS_IMAGE_KEY}, which this recipe masks")
         cameras = {image_key: camera for camera, image_key in AgilexInputs.IMAGE_KEY_BY_CAMERA.items()}
         image_keys = tuple(key for key in IMAGE_KEYS if not encode_only_active_cameras or key in active_image_keys)
         kept_cameras = tuple(cameras[key] for key in image_keys)
@@ -194,6 +220,8 @@ def get_ih_yam_configs():
             vlash_branches=vlash_branches,
             image_keys=image_keys,
             race=race,
+            **({"titans_frames": titans_frames, "titans_stride": TITANS_STRIDE, "titans_image_key": TITANS_IMAGE_KEY}
+               if titans_frames else {}),
         )
         return TrainConfig(
             name=name,
@@ -361,6 +389,13 @@ def get_ih_yam_configs():
         return {**recipe, "name": recipe["name"] + "_race", "race": True, "norm_stats_config": recipe["name"],
                 "encode_only_active_cameras": recipe.get("active_image_keys") is not None}
 
+    def titans_twin(recipe: dict) -> dict:
+        # The recipe with a Titans long-term memory, warm-started from a checkpoint of the same recipe
+        # (--weight-loader.params-path): the memory's read starts with its gates closed, so step 0 is the checkpoint. It
+        # keeps the recipe's norm stats, like the race twin.
+        return {**recipe, "name": recipe["name"] + "_titans", "titans_frames": TITANS_FRAMES,
+                "norm_stats_config": recipe["name"]}
+
     def vlash_wide_conditioned_twin(recipe: dict) -> dict:
         # `_vlash12mpc` with offsets 0-N for the N its played window allows (SORT_WIDE_VLASH_OFFSET_BY_INTERVAL), one branch each.
         offset = SORT_WIDE_VLASH_OFFSET_BY_INTERVAL[recipe["hist_interval"]]
@@ -376,10 +411,12 @@ def get_ih_yam_configs():
     both_twins = [vlash_window_conditioned_twin(recipe) for recipe in recipes
                   if recipe["repo_id"] == SORT_BOTH_REAL_REPO_ID]
     race_twins = [race_twin(recipe) for recipe in recipes if recipe["name"] in RACE_TWIN_BASES]
+    titans_twins = [titans_twin(recipe) for recipe in recipes if recipe["name"] in TITANS_TWIN_BASES]
     wide_twins = [vlash_wide_conditioned_twin(recipe) for recipe in recipes
                   if recipe.get("action_horizon") == SORT_WIDE_ACTION_HORIZON]
     return [stream_config(**recipe) for recipe in
             recipes + [vlash_twin(recipe) for recipe in recipes] + [vlash_reference_twin(recipe) for recipe in recipes]
             + [vlash_measured_twin(recipe) for recipe in recipes] + [vlash_packed_measured_twin(recipe) for recipe in recipes]
             + [vlash_conditioned_twin(recipe) for recipe in recipes] + [vlash_long_conditioned_twin(recipe) for recipe in recipes]
-            + [vlash_packed_twin(recipe) for recipe in recipes] + race_twins + wide_twins + both_twins + phase_recipes]
+            + [vlash_packed_twin(recipe) for recipe in recipes] + race_twins + wide_twins + both_twins + phase_recipes
+            + titans_twins]

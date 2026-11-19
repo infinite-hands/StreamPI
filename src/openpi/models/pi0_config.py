@@ -58,6 +58,24 @@ class Pi0Config(_model.BaseModelConfig):
     # Sec. 4.1: "we set lambda_aux = 0.1 and lambda_timing = 0.05".
     race_aux_weight: float = 0.1
     race_timing_weight: float = 0.05
+    # Titans (arXiv 2501.00663): a neural long-term memory (openpi.models.titans) whose weights are written at test
+    # time. Training unrolls its writes over this many older frames of one camera, titans_stride calls apart (a call
+    # is hist_interval frames; Observation.memory_images), and the action expert reads what the memory returns for
+    # the current frame through gemma's zero-gated memory branch, so a checkpoint without these weights starts as
+    # itself. Serving keeps one memory per client and writes the current frame every titans_stride calls
+    # (Pi0.step_long_memory). 0: none.
+    titans_frames: int = 0
+    titans_stride: int = 4
+    # The camera the memory is given, and the cells per side each of its frames is averaged over.
+    titans_image_key: str = "base_0_rgb"
+    titans_grid: int = 4
+    # The memory network: its width, the width of its hidden layers, and its layers (1: a linear memory).
+    titans_dim: int = 256
+    titans_hidden_dim: int = 512
+    titans_depth: int = 2
+    # Training only: the chance a sample keeps just its newest n older frames, n uniform in 0..titans_frames - 1,
+    # as the first calls of a served run see the memory (pi0.cut_memory_short).
+    titans_dropout: float = 0.1
 
     def __post_init__(self):
         if self.max_token_len is None:
@@ -80,6 +98,19 @@ class Pi0Config(_model.BaseModelConfig):
             raise ValueError("race modulates pi0.5's adaptive RMSNorm; pi0 has none")
         if self.race and self.vlash_branches:
             raise ValueError("race is wired for one action chunk per sample, not vlash_branches")
+        if self.titans_frames < 0:
+            raise ValueError(f"titans_frames must be >= 0, got {self.titans_frames}")
+        if self.titans_frames:
+            if not self.pi05:
+                raise ValueError("the Titans memory is wired for pi0.5")
+            if self.race or self.vlash_branches:
+                raise ValueError("the Titans memory is wired for the plain pi0.5 loss, not race or vlash_branches")
+            if self.titans_image_key not in self.image_keys:
+                raise ValueError(f"titans_image_key {self.titans_image_key!r} is not one of image_keys {self.image_keys}")
+            if min(self.titans_stride, self.titans_grid, self.titans_dim, self.titans_hidden_dim, self.titans_depth) < 1:
+                raise ValueError("titans_stride, titans_grid, titans_dim, titans_hidden_dim and titans_depth must be positive")
+            if not 0.0 <= self.titans_dropout < 1.0:
+                raise ValueError(f"titans_dropout must be in [0, 1), got {self.titans_dropout}")
 
     @property
     @override
@@ -101,6 +132,11 @@ class Pi0Config(_model.BaseModelConfig):
         # With branches, the state and the action chunk carry a branch axis behind the one observation.
         branch_shape = [self.vlash_branches] if self.vlash_branches else []
 
+        # A Titans model's older frames of its memory camera, newest first, and which of them exist.
+        memory_spec = {} if not self.titans_frames else {
+            "memory_images": jax.ShapeDtypeStruct(
+                [batch_size, self.titans_frames, *_model.IMAGE_RESOLUTION, 3], jnp.float32),
+            "memory_mask": jax.ShapeDtypeStruct([batch_size, self.titans_frames], jnp.bool_)}
         with at.disable_typechecking():
             observation_spec = _model.Observation(
                 images={key: image_spec for key in self.image_keys},
@@ -108,6 +144,7 @@ class Pi0Config(_model.BaseModelConfig):
                 state=jax.ShapeDtypeStruct([batch_size, *branch_shape, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+                **memory_spec,
             )
         action_spec = jax.ShapeDtypeStruct(
             [batch_size, *branch_shape, self.action_horizon, self.action_dim], jnp.float32)
@@ -146,11 +183,17 @@ class Pi0Config(_model.BaseModelConfig):
         if self.race:
             # RACE's weights are new and always trained, including the modulation inside the frozen LLM.
             filters.append(nnx.Not(nnx_utils.PathRegex(RACE_PARAMS_REGEX)))
+        if self.titans_frames:
+            # The memory's weights are new and always trained, including its read branch inside the frozen LLM.
+            filters.append(nnx.Not(nnx_utils.PathRegex(TITANS_PARAMS_REGEX)))
         return nnx.All(*filters)
 
 
 # Every RACE parameter's path contains this (Pi0's race_* attributes, gemma's race_modulation).
 RACE_PARAMS_REGEX = ".*race_.*"
+# Every parameter a Titans model adds: Pi0's titans_memory, and the action expert's read branch in gemma
+# (memory_k, memory_v, memory_gate).
+TITANS_PARAMS_REGEX = ".*titans_.*|.*memory_(k|v|gate).*"
 
 
 @dataclasses.dataclass(frozen=True)
